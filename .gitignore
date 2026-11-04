@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 构建产物（仓库只收发布用的 Purer.exe，不收中间产物）
+build/
+dist/
+*.spec
+_pycache_/
+
+# 本地备份 / 截图 / 个人配置
+_backup/
+_bak*/
+_screenshots_*/
+*.bak.*
+ffmpeg.ini
+*.log
+
+# 编辑器
+.vscode/
+.idea/

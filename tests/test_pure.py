@@ -366,5 +366,80 @@ class TestFfmpegLocation(unittest.TestCase):
                     os.environ["PURER_FFMPEG_DIR"] = old
 
 
+class TestFfmpegGuide(unittest.TestCase):
+    """没有 ffmpeg 时的兜底：扫盘、目录识别、写 ini。"""
+
+    @staticmethod
+    def _pair(folder: Path, names=("ffmpeg.exe", "ffprobe.exe")) -> Path:
+        folder.mkdir(parents=True, exist_ok=True)
+        for name in names:
+            (folder / name).write_bytes(b"fake")
+        return folder
+
+    def test_scan_finds_nested_pair(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            deep = self._pair(root / "Software" / "Other"
+                              / "ffmpeg-7.1-full_build" / "bin")
+            found = ffmpeg.scan_for_ffmpeg(roots=[root], max_depth=4, budget=5)
+            self.assertEqual(found, deep)
+
+    def test_scan_needs_both_exes(self):
+        """只有 ffmpeg.exe 的地方很多（播放器/下载工具），不能当成命中。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._pair(root / "Free Download Manager", names=("ffmpeg.exe",))
+            self.assertIsNone(ffmpeg.scan_for_ffmpeg(roots=[root], max_depth=3))
+
+    def test_scan_depth_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._pair(root / "a" / "b" / "c" / "d" / "bin")
+            self.assertIsNone(ffmpeg.scan_for_ffmpeg(roots=[root], max_depth=2))
+            self.assertIsNotNone(ffmpeg.scan_for_ffmpeg(roots=[root], max_depth=5))
+
+    def test_check_tool_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            unzipped = root / "ffmpeg-7.1"
+            bin_dir = self._pair(unzipped / "bin")
+            self.assertEqual(ffmpeg.check_tool_dir(bin_dir), bin_dir)
+            self.assertEqual(ffmpeg.check_tool_dir(unzipped), bin_dir)
+            # 选到上一级也能顺着 */bin 找到
+            self.assertEqual(ffmpeg.check_tool_dir(root), bin_dir)
+            empty = root / "empty"
+            empty.mkdir()
+            self.assertIsNone(ffmpeg.check_tool_dir(empty))
+
+    def test_write_ini_roundtrip(self):
+        from vff import config
+        with tempfile.TemporaryDirectory() as tmp:
+            app = Path(tmp) / "app"
+            app.mkdir()
+            bin_dir = self._pair(Path(tmp) / "ffmpeg" / "bin")
+            old_config, old_ff = config.app_dir, ffmpeg.app_dir
+            config.app_dir = lambda: app
+            ffmpeg.app_dir = lambda: app
+            try:
+                ini = ffmpeg.write_ffmpeg_ini(bin_dir)
+                self.assertTrue(ini.is_file())
+                self.assertEqual(config.read_ffmpeg_dir_from_ini(), bin_dir)
+                found, source = ffmpeg.find_tool("ffmpeg")
+                self.assertEqual(found, bin_dir / "ffmpeg.exe")
+                self.assertEqual(source, "ffmpeg.ini")
+            finally:
+                config.app_dir, ffmpeg.app_dir = old_config, old_ff
+
+    def test_refresh_path_keeps_entries(self):
+        before = os.environ.get("PATH", "")
+        after = ffmpeg.refresh_path()
+        self.assertTrue(after)
+        old_items = {p.strip().lower().rstrip("\\")
+                     for p in before.split(os.pathsep) if p.strip()}
+        new_items = {p.strip().lower().rstrip("\\")
+                     for p in after.split(os.pathsep) if p.strip()}
+        self.assertTrue(old_items <= new_items)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

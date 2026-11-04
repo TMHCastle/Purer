@@ -68,16 +68,30 @@ Purer.exe --selftest                               # 无窗口自检
 
 ## ffmpeg 依赖
 
-需要 **ffmpeg / ffprobe**。查找顺序（命中即用）：
+需要 **ffmpeg / ffprobe**（Windows 不自带）。第一次打开如果没找到，程序会直接弹一个引导窗：
+
+![ffmpeg 引导](docs/ffmpeg-guide.png)
+
+- **① 下载**：一键打开 `ffmpeg 官网` / `gyan.dev`（Windows 推荐）/ `BtbN 构建`，
+  也可以复制 `winget install --id Gyan.FFmpeg -e` 直接装。
+- **② 让程序找到它**：点 **「选择 ffmpeg 所在文件夹…」** 指到解压出来的 `bin`
+  （或解压后的根目录），路径会写进程序目录的 `ffmpeg.ini`，以后再打开直接可用；
+  或者点 **「自动搜索本机」**，让它自己扫盘找（限 3 秒，只认 **同时有 ffmpeg + ffprobe**
+  的目录，不会被播放器自带的 ffmpeg 骗到）。
+- 已经装好、刚改过 PATH？点 **「重新检测」**：程序会**重新读注册表里的 PATH**，
+  不用重启也能立刻认出新装的 ffmpeg。直接重开程序当然也可以。
+
+找 ffmpeg 的顺序（命中即用）：
 
 1. 环境变量 `PURER_FFMPEG_DIR` 指向的目录；
 2. 程序同目录的 `ffmpeg.ini`（`[ffmpeg]` 段里写 `dir=D:\你的\ffmpeg\bin`）；
 3. 程序同目录、同目录 `bin\`、`ffmpeg\bin\`；
 4. 系统 `PATH`；
-5. `C:\ffmpeg`、`C:\Program Files\ffmpeg` 下的 `*/bin/`。
+5. WinGet / Chocolatey / Scoop 的常见安装位置、`C:\ffmpeg`、`C:\Program Files\ffmpeg`；
+6. 兜底扫盘（仅当上面全都没命中，最多 3 秒，深度 4 层）。
 
 最省事的两种：把 `ffmpeg.exe`、`ffprobe.exe` 丢到 `Purer.exe` 旁边，
-或者放一个 `ffmpeg.ini`。当前解析结果随时用 `Purer.exe --where` 查看。
+或者用引导窗选一次目录。当前解析结果随时用 `Purer.exe --where` 查看。
 
 ## 从源码运行
 

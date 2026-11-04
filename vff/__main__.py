@@ -126,6 +126,8 @@ def _pop_flag(args: list[str], *names: str) -> bool:
 def cmd_where() -> int:
     Tools.locate()
     _p(Tools.describe())
+    if Tools.ffmpeg is None:
+        _p("（标准位置没找到；启动界面时会自动扫盘，或手动放一个 ffmpeg.ini）")
     _p(f"缓存目录: {cache_root()}")
     _p(f"程序目录: {app_dir()}")
     bundle = bundle_dir()
@@ -135,7 +137,7 @@ def cmd_where() -> int:
 
 
 def cmd_probe(files: list[str]) -> int:
-    if not Tools.locate():
+    if not Tools.locate(deep=True):
         _p("找不到 ffmpeg/ffprobe，先跑 --where 看看")
         return 2
     out = []
@@ -187,7 +189,7 @@ def _extract_one(src: Path, outdir: Path, step: float, long_side: int) -> tuple[
 
 
 def cmd_extract(files: list[str], out_root: Path, step: float, long_side: int) -> int:
-    if not Tools.locate():
+    if not Tools.locate(deep=True):
         _p("找不到 ffmpeg/ffprobe，先跑 --where 看看")
         return 2
     targets: list[Path] = []
@@ -219,7 +221,7 @@ def cmd_extract(files: list[str], out_root: Path, step: float, long_side: int) -
 
 def cmd_export(src: Path, start_rel: float, end_rel: float, out: Path | None,
                exact: bool = True, snap: bool = True) -> int:
-    if not Tools.locate():
+    if not Tools.locate(deep=True):
         _p("找不到 ffmpeg/ffprobe，先跑 --where 看看")
         return 2
     try:
@@ -420,8 +422,9 @@ def main(argv: list[str] | None = None) -> int:
 
     # ---------------- GUI ----------------
     from PySide6.QtCore import QLocale
-    from PySide6.QtWidgets import QApplication, QMessageBox
+    from PySide6.QtWidgets import QApplication
 
+    from .ui.ffmpeg_missing import ensure_ffmpeg
     from .ui.main_window import MainWindow
     from .ui.style import DARK_QSS, dark_palette
 
@@ -437,16 +440,7 @@ def main(argv: list[str] | None = None) -> int:
         from .selftest import run
         return run(app)
 
-    if not Tools.locate():
-        QMessageBox.critical(
-            None, APP_NAME,
-            "没有找到 ffmpeg / ffprobe。\n\n"
-            "任选一种方式：\n"
-            "  1. 把 ffmpeg 所在目录加入 PATH；\n"
-            "  2. 把 ffmpeg.exe、ffprobe.exe 放到本程序同目录（或同目录 bin\\ 下）；\n"
-            "  3. 在本程序同目录建 ffmpeg.ini，内容：\n"
-            "     [ffmpeg]\n"
-            "     dir=D:\\你\\的\\ffmpeg\\bin")
+    if not ensure_ffmpeg():
         return 1
 
     from .cache import clean_cache

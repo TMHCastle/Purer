@@ -14,9 +14,12 @@ import os
 import re
 import shutil
 import subprocess
+import time
+from collections import deque
 from pathlib import Path
 
-from .config import (CREATE_NO_WINDOW, app_dir, bundle_dir, read_ffmpeg_dir_from_ini)
+from .config import (CREATE_NO_WINDOW, app_dir, bundle_dir, ffmpeg_ini,
+                     read_ffmpeg_dir_from_ini)
 from .media import MediaInfo, parse_probe_json
 
 FFMPEG_ENV = "PURER_FFMPEG_DIR"
@@ -45,9 +48,35 @@ def _candidate_dirs() -> list[tuple[Path, str]]:
     return out
 
 
+def _exe_name(name: str) -> str:
+    return name + (".exe" if os.name == "nt" else "")
+
+
+def known_dirs() -> list[tuple[Path, str]]:
+    """常见「装完就有了」的位置（包管理器 / 便携解压的常见落点）。"""
+    home = Path.home()
+    local = os.environ.get("LOCALAPPDATA")
+    progdata = os.environ.get("ProgramData")
+    out: list[tuple[Path, str]] = []
+    if local:
+        out.append((Path(local) / "Microsoft" / "WinGet" / "Links", "WinGet"))
+    if progdata:
+        out.append((Path(progdata) / "chocolatey" / "bin", "Chocolatey"))
+    out += [
+        (home / "scoop" / "shims", "Scoop"),
+        (home / "ffmpeg" / "bin", "用户目录\\ffmpeg\\bin"),
+        (home / "ffmpeg", "用户目录\\ffmpeg"),
+        (Path("C:/ffmpeg"), "C:\\ffmpeg"),
+        (Path("C:/ffmpeg/bin"), "C:\\ffmpeg\\bin"),
+        (Path("C:/Program Files/ffmpeg"), "C:\\Program Files\\ffmpeg"),
+        (Path("C:/Program Files/ffmpeg/bin"), "C:\\Program Files\\ffmpeg\\bin"),
+    ]
+    return out
+
+
 def find_tool(name: str, exe_name: str | None = None) -> tuple[Path | None, str]:
     """找 ffmpeg/ffprobe：环境变量 -> ffmpeg.ini -> 程序目录 -> PATH -> 常见位置。"""
-    exe = exe_name or (name + (".exe" if os.name == "nt" else ""))
+    exe = exe_name or _exe_name(name)
     for root, source in _candidate_dirs():
         try:
             candidate = root / exe
@@ -58,17 +87,164 @@ def find_tool(name: str, exe_name: str | None = None) -> tuple[Path | None, str]
     found = shutil.which(name)
     if found:
         return Path(found), "PATH"
-    # 常见安装位置（不再写死某台机器的路径）
-    for base in (Path("C:/ffmpeg"), Path("C:/Program Files/ffmpeg"),
-                 Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "ffmpeg"):
+    for root, source in known_dirs():
         try:
-            if base.is_dir():
-                for candidate in sorted(base.glob("*/bin/" + exe)):
-                    if candidate.is_file():
-                        return candidate, str(base)
+            if (root / exe).is_file():
+                return root / exe, source
+        except OSError:
+            continue
+    # 便携解压型：<base>/<ffmpeg-版本>/bin/ffmpeg.exe
+    for base in (Path("C:/ffmpeg"), Path("C:/Program Files/ffmpeg"),
+                 Path.home() / "ffmpeg", Path.home() / "Downloads"):
+        try:
+            if not base.is_dir():
+                continue
+            for candidate in sorted(base.glob(f"*/bin/{exe}")):
+                if candidate.is_file():
+                    return candidate, str(base)
         except OSError:
             continue
     return None, "未找到"
+
+
+# 兜底搜索时整棵跳过的目录（系统/缓存/巨量且几乎不会有 ffmpeg）
+_SKIP_DIRS = {
+    "windows", "winsxs", "system32", "syswow64", "$recycle.bin",
+    "system volume information", "recovery", "perflogs", "msocache",
+    "config.msi", "installer", "node_modules", "__pycache__", ".git",
+    "appdata", "programdata", "application data", "windowsapps",
+    "temp", "tmp", "cache", "caches", ".cache", ".venv", "venv",
+    "site-packages", "dist-info", "microsoft", "packages",
+}
+
+
+def drive_roots() -> list[Path]:
+    """当前存在的盘符根目录（C:–H:）。"""
+    roots: list[Path] = []
+    for letter in "CDEFGH":
+        path = Path(f"{letter}:\\")
+        try:
+            if path.is_dir():
+                roots.append(path)
+        except OSError:
+            continue
+    return roots
+
+
+def scan_for_ffmpeg(roots: list[Path] | None = None, exe: str | None = None,
+                    max_depth: int = 4, budget: float = 3.0,
+                    max_dirs: int = 4000) -> Path | None:
+    """标准位置都没找到时的兜底：广度优先扫盘，限深 / 限时 / 限目录数。
+
+    只认「同一个目录里 **同时**有 ffmpeg 和 ffprobe」的位置 ——
+    光有 ffmpeg.exe 的地方很多（播放器、下载工具都会塞一个），拿错了反而更难查。
+    返回该目录（可直接写进 ffmpeg.ini），找不到返回 None。
+    """
+    want = {(exe or _exe_name("ffmpeg")).lower(), _exe_name("ffprobe").lower()}
+    if roots is None:
+        home = Path.home()
+        roots = drive_roots() + [home / "Downloads", home / "Desktop",
+                                 home / "Documents"]
+    started = time.monotonic()
+    visited = 0
+    queue: deque[tuple[Path, int]] = deque((Path(r), 0) for r in roots)
+    while queue:
+        if time.monotonic() - started > budget or visited >= max_dirs:
+            break
+        directory, depth = queue.popleft()
+        visited += 1
+        try:
+            entries = list(os.scandir(directory))
+        except OSError:
+            continue
+        files: set[str] = set()
+        dirs: list[Path] = []
+        for entry in entries:
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    dirs.append(Path(entry.path))
+                elif entry.is_file():
+                    files.add(entry.name.lower())
+            except OSError:
+                continue
+        if want <= files:
+            return directory
+        if depth >= max_depth:
+            continue
+        for path in dirs:
+            name = path.name.lower()
+            if name in _SKIP_DIRS or name.startswith("."):
+                continue
+            queue.append((path, depth + 1))
+    return None
+
+
+def refresh_path() -> str:
+    """把注册表里最新的 PATH 合并进当前进程。
+
+    刚用 winget / 安装器装好 ffmpeg 时，本进程的 PATH 还是启动时的旧值；
+    重新读一遍注册表就能立刻找到，不必重启程序。
+    """
+    if os.name != "nt":
+        return os.environ.get("PATH", "")
+    chunks: list[str] = []
+    try:
+        import winreg
+    except ImportError:
+        winreg = None  # noqa: N806
+    if winreg is not None:
+        for hive, key in ((winreg.HKEY_CURRENT_USER, "Environment"),
+                          (winreg.HKEY_LOCAL_MACHINE,
+                           r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment")):
+            try:
+                with winreg.OpenKey(hive, key) as handle:
+                    value, _ = winreg.QueryValueEx(handle, "Path")
+                    if isinstance(value, str) and value:
+                        chunks.append(os.path.expandvars(value))
+            except OSError:
+                continue
+    chunks.append(os.environ.get("PATH", ""))
+    merged: list[str] = []
+    seen: set[str] = set()
+    for chunk in chunks:
+        for item in chunk.split(os.pathsep):
+            item = item.strip().strip('"')
+            if not item:
+                continue
+            key = item.lower().rstrip("\\")
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+    text = os.pathsep.join(merged)
+    os.environ["PATH"] = text
+    return text
+
+
+def write_ffmpeg_ini(directory: Path) -> Path:
+    """把 ffmpeg 目录写进程序同目录的 ffmpeg.ini（下次启动直接命中）。"""
+    ini = ffmpeg_ini()
+    ini.parent.mkdir(parents=True, exist_ok=True)
+    ini.write_text(f"[ffmpeg]\ndir={Path(directory)}\n", encoding="utf-8")
+    return ini
+
+
+def check_tool_dir(directory: Path) -> Path | None:
+    """用户选的目录是否真的有 ffmpeg.exe：认 `<dir>`、`<dir>/bin`、`<dir>/*/bin`。"""
+    directory = Path(directory)
+    for candidate in (directory, directory / "bin"):
+        try:
+            if (candidate / _exe_name("ffmpeg")).is_file():
+                return candidate
+        except OSError:
+            continue
+    try:
+        for candidate in sorted(directory.glob(f"*/bin/{_exe_name('ffmpeg')}")):
+            if candidate.is_file():
+                return candidate.parent
+    except OSError:
+        pass
+    return None
 
 
 class Tools:
@@ -80,12 +256,31 @@ class Tools:
     ffmpeg_source: str = ""
     ffprobe_source: str = ""
     ffplay_source: str = ""
+    scanned: Path | None = None      # 兜底搜索命中的目录（None = 没扫过 / 没找到）
 
     @classmethod
-    def locate(cls) -> bool:
+    def locate(cls, deep: bool = False) -> bool:
+        """deep=True：标准位置都没命中时，再扫一遍盘（限时 3 秒）。
+
+        用户把 ffmpeg 解压到任意目录、又没加 PATH 时，靠这一步就能直接用。
+        PURER_NO_SCAN=1 可关掉扫盘（磁盘特别大 / 只想手动指定时）。
+        """
         cls.ffmpeg, cls.ffmpeg_source = find_tool("ffmpeg")
         cls.ffprobe, cls.ffprobe_source = find_tool("ffprobe")
         cls.ffplay, cls.ffplay_source = find_tool("ffplay")
+        if deep and os.environ.get("PURER_NO_SCAN") != "1" \
+                and (cls.ffmpeg is None or cls.ffprobe is None):
+            folder = scan_for_ffmpeg()
+            cls.scanned = folder
+            if folder is not None:
+                for name in ("ffmpeg", "ffprobe", "ffplay"):
+                    exe = folder / _exe_name(name)
+                    try:
+                        if exe.is_file():
+                            setattr(cls, name, exe)
+                            setattr(cls, name + "_source", f"自动搜索 {folder}")
+                    except OSError:
+                        continue
         return cls.ffmpeg is not None and cls.ffprobe is not None
 
     @classmethod

@@ -37,7 +37,7 @@ def run(app) -> int:
     log: list[str] = []
     ok = True
     try:
-        found = Tools.locate()
+        found = Tools.locate(deep=True)
         log.append(Tools.describe())
         if not found:
             raise RuntimeError("ffmpeg/ffprobe 未找到")
@@ -96,6 +96,21 @@ def run(app) -> int:
         win.grab().save(str(shot))
         log.append(f"shot={shot} exists={shot.exists()}")
         ok = ok and rows == 5 and shot.exists() and shot.stat().st_size > 5000
+
+        # ---- 缺 ffmpeg 的引导窗（打包后也要能构建） ----
+        from .ui.ffmpeg_missing import FFmpegMissingDialog
+        guide = FFmpegMissingDialog()
+        guide.setAttribute(Qt.WA_DontShowOnScreen, True)
+        guide.show()
+        app.processEvents()
+        from PySide6.QtWidgets import QLabel
+        guide_text = " ".join(w.text() for w in guide.findChildren(QLabel))
+        guide_ok = ("ffmpeg.org" in guide_text and "gyan.dev" in guide_text
+                    and "BtbN" in guide_text and guide.resolved is False)
+        log.append(f"guide window ok={guide_ok}")
+        guide.close()
+        app.processEvents()
+        ok = ok and guide_ok
 
         # ---- 区间导出（关键帧吸附 + 无损复制） ----
         exported = tmp / "clip.mp4"

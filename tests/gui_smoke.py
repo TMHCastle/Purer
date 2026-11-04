@@ -296,6 +296,25 @@ def main() -> int:
         finally:
             QDialog.exec = original_exec
 
+        # ffmpeg 缺失引导窗（0.2：官网/镜像/自动搜索/选目录）
+        from PySide6.QtWidgets import QLabel, QPushButton
+        from vff.ui.ffmpeg_missing import FFmpegMissingDialog
+        guide = FFmpegMissingDialog()
+        guide.setAttribute(Qt.WA_DontShowOnScreen, True)
+        guide.show()
+        app.processEvents()
+        texts = " ".join(w.text() for w in guide.findChildren(QLabel))
+        buttons = [b.text() for b in guide.findChildren(QPushButton)]
+        check("guide dialog links",
+              "ffmpeg.org" in texts and "gyan.dev" in texts and "BtbN" in texts)
+        check("guide dialog buttons",
+              any(t.startswith("选择 ffmpeg") for t in buttons)
+              and any("自动搜索" in t for t in buttons)
+              and any("重新检测" in t for t in buttons), " | ".join(buttons))
+        check("guide dialog not resolved", guide.resolved is False)
+        guide.close()
+        app.processEvents()
+
         win.close()
         app.processEvents()
     finally:

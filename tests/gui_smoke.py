@@ -296,9 +296,9 @@ def main() -> int:
         finally:
             QDialog.exec = original_exec
 
-        # ffmpeg 缺失引导窗（0.2：官网/镜像/自动搜索/选目录）
+        # ffmpeg 缺失引导窗（0.2：官网/镜像/自动搜索/选目录；1.1.2：加国内镜像）
         from PySide6.QtWidgets import QLabel, QPushButton
-        from vff.ui.ffmpeg_missing import FFmpegMissingDialog
+        from vff.ui.ffmpeg_missing import FFmpegMissingDialog, MIRROR_ZIP
         guide = FFmpegMissingDialog()
         guide.setAttribute(Qt.WA_DontShowOnScreen, True)
         guide.show()
@@ -307,11 +307,17 @@ def main() -> int:
         buttons = [b.text() for b in guide.findChildren(QPushButton)]
         check("guide dialog links",
               "ffmpeg.org" in texts and "gyan.dev" in texts and "BtbN" in texts)
+        check("guide dialog domestic mirror",
+              "npmmirror" in texts and MIRROR_ZIP in texts
+              and "registry.npmmirror.com" in texts, MIRROR_ZIP)
         check("guide dialog buttons",
               any(t.startswith("选择 ffmpeg") for t in buttons)
               and any("自动搜索" in t for t in buttons)
-              and any("重新检测" in t for t in buttons), " | ".join(buttons))
+              and any("重新检测" in t for t in buttons)
+              and any("复制镜像链接" in t for t in buttons), " | ".join(buttons))
         check("guide dialog not resolved", guide.resolved is False)
+        guide._copy_mirror()
+        check("copy mirror link", QApplication.clipboard().text() == MIRROR_ZIP)
         guide.close()
         app.processEvents()
 

@@ -72,8 +72,13 @@ Purer.exe --selftest                               # 无窗口自检
 
 ![ffmpeg 引导](docs/ffmpeg-guide.png)
 
-- **① 下载**：一键打开 `ffmpeg 官网` / `gyan.dev`（Windows 推荐）/ `BtbN 构建`，
-  也可以复制 `winget install --id Gyan.FFmpeg -e` 直接装。
+- **① 下载**：默认给的是**国内镜像**（npmmirror 同步的 `KarinJS/FFmpeg-Builds` 静态包，
+  140 MB 直连几十秒下完，2026-11-11 实测 14 MB/s，不用梯子）：
+  `…/ffmpeg-builds/v8.1.3/ffmpeg-8.1.3-win32-x64-gpl.tar.xz`。
+  解压用 Win10/11 自带的 `tar -xJf 文件名`（或 7-Zip），解开后是 `bin\ffmpeg.exe` + `bin\ffprobe.exe`。
+  官方源（`ffmpeg.org` / `gyan.dev` / `BtbN` 的 GitHub Releases）也留在窗口里，但国内实测只有几十 KB/s；
+  GitHub 慢的话，官方地址前面加上 `https://ghfast.top/` 或 `https://gh-proxy.com/` 再打开即可加速。
+  `winget install --id Gyan.FFmpeg -e` 也能用，但它拉的是 gyan.dev 的包，同样慢。
 - **② 让程序找到它**：点 **「选择 ffmpeg 所在文件夹…」** 指到解压出来的 `bin`
   （或解压后的根目录），路径会写进程序目录的 `ffmpeg.ini`，以后再打开直接可用；
   或者点 **「自动搜索本机」**，让它自己扫盘找（限 3 秒，只认 **同时有 ffmpeg + ffprobe**

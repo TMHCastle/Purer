@@ -12,7 +12,7 @@ from pathlib import Path
 APP_NAME = "Purer"
 APP_TAGLINE = "视频抽帧浏览 / 帧精确切片"
 APP_ID = "Purer"
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"
 
 DEFAULT_STEP = 24
 

@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+os.environ["PURER_NO_UPDATE"] = "1"        # 冒烟测试不联网
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -27,9 +28,12 @@ from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from vff import ffmpeg  # noqa: E402
+from vff.config import APP_VERSION  # noqa: E402
 from vff.ffmpeg import Tools  # noqa: E402
 from vff.ui.main_window import MainWindow  # noqa: E402
+from vff.ui.style import OK, WARN  # noqa: E402
 from vff.ui.widgets import LANE_H  # noqa: E402
+from vff.update import CheckResult  # noqa: E402
 
 LOG: list[str] = []
 FAILS: list[str] = []
@@ -77,6 +81,51 @@ def main() -> int:
         win = MainWindow()
         win.resize(1200, 760)
         win.show()
+        app.processEvents()
+
+        # ---- A: 自绘标题栏 + 顶部卡片正中的「检查更新」药丸 ----
+        check("window is frameless", bool(win.windowFlags() & Qt.FramelessWindowHint))
+        titlebar, badge = win.titlebar, win.badge
+        check("titlebar visible on top",
+              titlebar.isVisible() and titlebar.height() > 0
+              and titlebar.y() < win.card.height(),
+              f"h={titlebar.height()} y={titlebar.y()}")
+        check("titlebar shows app + version",
+              "Purer" in titlebar.brand.text() and APP_VERSION in titlebar.ver.text(),
+              f"{titlebar.brand.text()} {titlebar.ver.text()}")
+        offset = badge.geometry().center().x() - titlebar.width() // 2
+        check("badge centered in top card", abs(offset) <= 2,
+              f"dx={offset} badge={badge.geometry().getRect()} tb={titlebar.width()}")
+        check("badge inside titlebar",
+              titlebar.rect().contains(badge.geometry().center()),
+              str(badge.geometry().getRect()))
+
+        win._on_update_result(CheckResult(True, "v999.0.0", "https://example.invalid/r"))
+        check("badge orange when newer",
+              badge.state_name() == "stale" and "999" in badge.label_text()
+              and badge.dot_color() == WARN,
+              f"{badge.state_name()} {badge.label_text()} {badge.dot_color()}")
+        win._on_update_result(CheckResult(True, f"v{APP_VERSION}", ""))
+        check("badge green when latest",
+              badge.state_name() == "latest" and badge.dot_color() == OK,
+              f"{badge.state_name()} {badge.label_text()} {badge.dot_color()}")
+        win._on_update_result(CheckResult(False, "", "", "离线"))
+        check("badge gray when check failed",
+              badge.state_name() == "error"
+              and badge.dot_color() not in (OK, WARN)
+              and "失败" in badge.label_text(),
+              f"{badge.state_name()} {badge.label_text()} {badge.dot_color()}")
+        check("badge stays centered after text change",
+              abs(badge.geometry().center().x() - titlebar.width() // 2) <= 2,
+              str(badge.geometry().getRect()))
+
+        titlebar.btn_max.click()
+        app.processEvents()
+        maximized = win.isMaximized()
+        titlebar.btn_max.click()
+        app.processEvents()
+        check("maximize / restore buttons", maximized and not win.isMaximized(),
+              f"max={maximized} back={win.isMaximized()}")
 
         # ---- 1. 一次拖 3 个：必须串行 ----
         win.add_videos(clips)

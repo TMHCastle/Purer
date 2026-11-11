@@ -89,6 +89,50 @@ def icon_photo(color: str = DIM, size: int = 18) -> QIcon:
     return QIcon(_icon_pix(size, draw))
 
 
+# --------------------------------------------------- 自绘标题栏的窗口按钮图标
+def _win_icon(draw, color: str, size: int = 16) -> QIcon:
+    return QIcon(_icon_pix(size, lambda p: draw(p, QColor(color))))
+
+
+def icon_win_min(color: str = "#C9CFDA", size: int = 16) -> QIcon:
+    """最小化：一条横线。"""
+    def draw(p: QPainter, c: QColor):
+        p.setPen(QPen(c, 1.5))
+        p.drawLine(QPointF(4.0, 8.0), QPointF(12.0, 8.0))
+    return _win_icon(draw, color, size)
+
+
+def icon_win_max(color: str = "#C9CFDA", size: int = 16) -> QIcon:
+    """最大化：一个空心方框。"""
+    def draw(p: QPainter, c: QColor):
+        p.setPen(QPen(c, 1.3))
+        p.setBrush(Qt.NoBrush)
+        p.drawRect(QRectF(4.5, 4.5, 7.0, 7.0))
+    return _win_icon(draw, color, size)
+
+
+def icon_win_restore(color: str = "#C9CFDA", size: int = 16) -> QIcon:
+    """还原：两个错位的方框。"""
+    def draw(p: QPainter, c: QColor):
+        p.setPen(QPen(c, 1.3))
+        p.setBrush(Qt.NoBrush)
+        p.drawRect(QRectF(3.6, 5.4, 6.4, 6.4))
+        p.drawLine(QPointF(5.6, 5.4), QPointF(5.6, 3.6))
+        p.drawLine(QPointF(5.6, 3.6), QPointF(12.0, 3.6))
+        p.drawLine(QPointF(12.0, 3.6), QPointF(12.0, 10.0))
+        p.drawLine(QPointF(12.0, 10.0), QPointF(10.2, 10.0))
+    return _win_icon(draw, color, size)
+
+
+def icon_win_close(color: str = "#C9CFDA", size: int = 16) -> QIcon:
+    """关闭：一个叉。"""
+    def draw(p: QPainter, c: QColor):
+        p.setPen(QPen(c, 1.5))
+        p.drawLine(QPointF(4.4, 4.4), QPointF(11.6, 11.6))
+        p.drawLine(QPointF(11.6, 4.4), QPointF(4.4, 11.6))
+    return _win_icon(draw, color, size)
+
+
 def make_icon() -> QIcon:
     pm = QPixmap(256, 256)
     pm.fill(Qt.transparent)
@@ -123,10 +167,30 @@ QFrame#panel {{
     border:1px solid #2C3240;
     border-radius:{RADIUS_PANEL}px;
 }}
-QFrame#toolbar {{
+/* 顶部卡片 = 自绘标题栏 + 工具栏，一整块（无边框窗口的第一块） */
+QFrame#topcard {{
     background:{TOOLBAR};
     border:1px solid #262B35;
     border-radius:{RADIUS_PANEL}px;
+}}
+QWidget#titlebar {{ background:transparent; }}
+QFrame#toolbar {{
+    background:transparent;
+    border:none;
+    border-radius:0;
+}}
+QPushButton#winBtn, QPushButton#winBtnClose {{
+    background:transparent; border:none; border-radius:6px;
+    padding:0; min-width:36px; max-width:36px;
+    min-height:26px; max-height:26px;
+}}
+QPushButton#winBtn:hover {{ background:#2E3440; }}
+QPushButton#winBtn:pressed {{ background:#262B35; }}
+QPushButton#winBtnClose:hover {{ background:#8E3B42; }}
+QPushButton#winBtnClose:pressed {{ background:#7A3238; }}
+QLabel#verChip {{
+    background:#2C3448; color:#8FA6E8; border-radius:3px;
+    padding:1px 6px; font-family:{MONO}; font-size:8pt;
 }}
 QFrame#vline {{ background:#2E3440; max-width:1px; min-width:1px; border:none; }}
 QFrame#hline {{ background:#2E3440; max-height:1px; min-height:1px; border:none; }}
@@ -215,11 +279,7 @@ QSpinBox:hover, QComboBox:hover {{ border-color:#414B5E; }}
 QSpinBox:focus, QComboBox:focus {{ border-color:{ACCENT}; }}
 QSpinBox::up-button, QSpinBox::down-button {{ width:14px; background:transparent; border:none; }}
 QComboBox::drop-down {{ border:none; width:18px; }}
-QComboBox::down-arrow {{
-    image:none; width:0; height:0;
-    border-left:4px solid transparent; border-right:4px solid transparent;
-    border-top:5px solid {DIM};
-}}
+/* 箭头交给 Fusion 画（以前用 border 拼三角形，Qt 不支持，会渲染成一个方块） */
 QComboBox QAbstractItemView {{
     background:{PANEL}; border:1px solid {BORDER}; border-radius:6px;
     selection-background-color:{PANEL2}; selection-color:{TEXT}; padding:4px; outline:none;

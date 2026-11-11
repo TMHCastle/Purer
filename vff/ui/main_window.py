@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
-"""主窗口：顶部工具栏 + 多标签页 + 拖放 + 抽帧队列。"""
+"""主窗口：自绘标题栏 + 顶部工具栏 + 多标签页 + 拖放 + 抽帧队列。"""
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, Qt
-from PySide6.QtGui import QKeySequence, QShortcut
-from PySide6.QtWidgets import (QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
-                               QMainWindow, QMessageBox, QProgressDialog, QPushButton,
+from PySide6.QtCore import QEvent, QSettings, Qt, QTimer, QUrl
+from PySide6.QtGui import QDesktopServices, QKeySequence, QShortcut
+from PySide6.QtWidgets import (QFileDialog, QFrame, QHBoxLayout, QLabel,
+                               QMessageBox, QProgressDialog, QPushButton,
                                QSizePolicy, QStackedWidget, QTabWidget,
                                QVBoxLayout, QWidget)
 
@@ -20,12 +21,24 @@ from ..config import (APP_NAME, APP_VERSION, DEFAULT_DISPLAY_SIDE, DEFAULT_STEP,
 from ..ffmpeg import probe
 from ..jobs import JobQueue
 from ..media import find_videos, thumb_size_for
+from ..update import RELEASES_PAGE, ReleaseChecker
 from ..util import fmt_tc
+from ..version import normalize
+from ..log import debug, debug_enabled
+from .frameless import FramelessWindow
 from .style import make_icon
+from .titlebar import TitleBar
 from .track_page import TrackPage
-from .widgets import EmptyState, StepCombo
+from .update_badge import UpdateBadge
+from .widgets import ArrowCombo, EmptyState, StepCombo
 
 CUSTOM_INDEX = len(DISPLAY_PRESETS)
+
+
+def update_checks_enabled() -> bool:
+    """``PURER_NO_UPDATE=1`` 时完全不联网（离线机器 / 自动化测试用）。"""
+    flag = os.environ.get("PURER_NO_UPDATE", "").strip().lower()
+    return flag not in ("1", "true", "yes", "on")
 
 
 def _ui_settings() -> QSettings:
@@ -37,7 +50,7 @@ def _ui_settings() -> QSettings:
     return QSettings(str(root / "ui.ini"), QSettings.IniFormat)
 
 
-class MainWindow(QMainWindow):
+class MainWindow(FramelessWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(self._title(DEFAULT_STEP))
@@ -65,9 +78,22 @@ class MainWindow(QMainWindow):
         central = QWidget()
         central.setObjectName("root")
         lay = QVBoxLayout(central)
-        lay.setContentsMargins(12, 10, 12, 10)
+        lay.setContentsMargins(12, 12, 12, 10)
         lay.setSpacing(8)
-        lay.addWidget(self._build_toolbar())
+
+        # 顶部卡片：第一行是自己的标题栏（窗口没有系统边框），第二行是原来的工具栏
+        self.card = QFrame()
+        self.card.setObjectName("topcard")
+        card_lay = QVBoxLayout(self.card)
+        card_lay.setContentsMargins(0, 0, 0, 0)
+        card_lay.setSpacing(0)
+        self.titlebar = TitleBar(self.card)
+        self.badge = UpdateBadge(self.titlebar)
+        self.titlebar.set_center_widget(self.badge)
+        card_lay.addWidget(self.titlebar)
+        card_lay.addWidget(self._hline())
+        card_lay.addWidget(self._build_toolbar())
+        lay.addWidget(self.card)
 
         self.stack = QStackedWidget()
         self.empty = EmptyState()
@@ -85,6 +111,8 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.stack, 1)
         self.setCentralWidget(central)
         self._refresh_stack()
+        self._setup_updater()
+        self.titlebar.sync_max_button()
         QShortcut(QKeySequence("Ctrl+O"), self, activated=self.open_files)
         QShortcut(QKeySequence("Ctrl+W"), self, activated=self._close_current)
         for i in range(len(DISPLAY_PRESETS)):
@@ -97,16 +125,8 @@ class MainWindow(QMainWindow):
         frame.setObjectName("toolbar")
         frame.setFixedHeight(52)
         bar = QHBoxLayout(frame)
-        bar.setContentsMargins(10, 8, 12, 8)
+        bar.setContentsMargins(12, 6, 12, 8)
         bar.setSpacing(8)
-
-        logo = QLabel("🎞")
-        logo.setStyleSheet("font-size:14pt;")
-        brand = QLabel(APP_NAME)
-        brand.setObjectName("title")
-        bar.addWidget(logo)
-        bar.addWidget(brand)
-        bar.addSpacing(6)
 
         btn_open = QPushButton("打开视频…")
         btn_open.setObjectName("primary")
@@ -140,7 +160,7 @@ class MainWindow(QMainWindow):
         self.btn_zoom_out.setFixedWidth(26)
         self.btn_zoom_out.setToolTip("缩小缩略图（Ctrl+滚轮 也可以）")
         self.btn_zoom_out.clicked.connect(lambda: self._zoom(-1))
-        self.combo_size = QComboBox()
+        self.combo_size = ArrowCombo()
         for label, px in DISPLAY_PRESETS:
             self.combo_size.addItem(f"{label} · {px}", px)
         self.combo_size.addItem("自定义", None)
@@ -179,6 +199,78 @@ class MainWindow(QMainWindow):
         line.setObjectName("vline")
         return line
 
+    @staticmethod
+    def _hline() -> QWidget:
+        """顶部卡片里两条行之间的一条细线（左右留白，不顶到圆角）。"""
+        host = QWidget()
+        host.setObjectName("hlineHost")
+        host.setFixedHeight(1)
+        row = QHBoxLayout(host)
+        row.setContentsMargins(12, 0, 12, 0)
+        row.setSpacing(0)
+        line = QFrame()
+        line.setObjectName("hline")
+        row.addWidget(line)
+        return host
+
+    # ------------------------------------------------------------ 检查更新
+    def _setup_updater(self):
+        self.updater = ReleaseChecker(self)
+        self.updater.finished.connect(self._on_update_result)
+        self.badge.clicked.connect(self._on_update_clicked)
+        self.badge.recheckRequested.connect(self.check_updates)
+        self.titlebar.set_subtitle(f"每 {self._step():g} 帧一帧")
+        debug("MainWindow._setup_updater 完成")
+        if debug_enabled():
+            # 只诊断用：每秒记一行，能看出事件循环有没有停
+            self._hb = QTimer(self)
+            self._hb.setInterval(1000)
+            self._hb.timeout.connect(lambda: debug("heartbeat"))
+            self._hb.start()
+        if update_checks_enabled():
+            # 等界面彻底安静下来再查（刚启动时 spawn 子进程太早容易和首帧绘制撞车）
+            QTimer.singleShot(6000, self.check_updates)
+        else:
+            self.badge.set_state("idle", tip="已用 PURER_NO_UPDATE=1 关闭联网检查")
+
+    def check_updates(self):
+        debug("check_updates: 进入")
+        if self.badge.state_name() != "checking":
+            self.badge.set_state("checking",
+                                 tip="正在向 GitHub 查询最新发布版本…")
+        debug("check_updates: 药丸已切到「检查中」")
+        self.updater.check()
+        debug("check_updates: 已交给检查器")
+
+    def _on_update_result(self, result):
+        state = result.state()
+        tag = normalize(result.tag) or result.tag
+        if state == "stale":
+            self.badge.set_state(
+                "stale", tag=tag, url=result.url or RELEASES_PAGE,
+                tip=f"GitHub 上已发布 {tag}\n点击打开发布页下载（右键重新检查）")
+        elif state == "latest":
+            self.badge.set_state(
+                "latest", tag=tag,
+                tip=f"当前已经是最新版本 v{APP_VERSION}\n点击重新检查")
+        else:
+            self.badge.set_state(
+                "error",
+                tip=f"没查到最新版本：{result.error or '网络不可用'}\n点击重试")
+
+    def _on_update_clicked(self):
+        state = self.badge.state_name()
+        if state == "stale":
+            QDesktopServices.openUrl(QUrl(self.badge.url() or RELEASES_PAGE))
+        elif state != "checking":
+            self.check_updates()
+
+    def changeEvent(self, event):
+        """最大化 / 还原时把「□ ↔ ❐」图标换掉。"""
+        if event.type() == QEvent.WindowStateChange:
+            self.titlebar.sync_max_button()
+        super().changeEvent(event)
+
     # ------------------------------------------------------------ 设置
     def _step(self) -> float:
         return float(self.combo_step.value())
@@ -193,6 +285,7 @@ class MainWindow(QMainWindow):
 
     def _on_step_changed(self, v):
         self.setWindowTitle(self._title(v))
+        self.titlebar.set_subtitle(f"每 {float(v):g} 帧一帧")
 
     def _sync_size_combo(self, px: int):
         """把下拉框对齐到当前显示尺寸（不在预设里就显示「自定义 · N」）。"""
@@ -457,4 +550,8 @@ class MainWindow(QMainWindow):
             except Exception:  # noqa: BLE001
                 pass
         self.jobs.cancel_all()
+        try:
+            self.updater.cancel()          # 别把 curl 子进程留在后台
+        except (AttributeError, RuntimeError):
+            pass
         super().closeEvent(e)

@@ -12,7 +12,9 @@ from pathlib import Path
 APP_NAME = "Purer"
 APP_TAGLINE = "视频抽帧浏览 / 帧精确切片"
 APP_ID = "Purer"
-APP_VERSION = "1.1.3"
+APP_VERSION = "1.1.4"
+# 「检查更新」查的是这里（公开仓库，只读 API，不需要 token）
+GITHUB_REPO = "TMHCastle/Purer"
 
 DEFAULT_STEP = 24
 

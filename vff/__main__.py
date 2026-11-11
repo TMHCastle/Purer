@@ -24,6 +24,7 @@ from .ffmpeg import (Tools, build_extract_variants, build_normalize_args,
                      build_probe_args, command_rejected, probe, read_keyframes,
                      run_hidden, snap_before, stream_progress)
 from .media import find_videos, parse_probe_json, thumb_size_for
+from .log import install_crash_log, start_debug_watchdog
 from .util import fmt_tc, parse_time_arg, safe_filename
 
 USAGE = """Purer {ver} · 视频抽帧浏览 / 帧精确切片
@@ -432,6 +433,10 @@ def main(argv: list[str] | None = None) -> int:
     from .ui.ffmpeg_missing import ensure_ffmpeg
     from .ui.main_window import MainWindow
     from .ui.style import DARK_QSS, dark_palette
+
+    # 窗口版没有控制台：未捕获异常（含 Qt 槽函数里的）落到 %TEMP%\Purer_cache\error.log
+    install_crash_log()
+    start_debug_watchdog()
 
     # 本机默认 locale 是 zh_HK，Qt 会把 24 格式化成「〢〤」（苏州码子），强制普通数字
     QLocale.setDefault(QLocale.c())

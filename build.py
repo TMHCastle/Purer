@@ -19,7 +19,8 @@ EXCLUDES = [
     "tkinter", "numpy", "pandas", "matplotlib", "PIL", "scipy",
     "PySide6.QtQml", "PySide6.QtQuick", "PySide6.QtQuickWidgets",
     "PySide6.QtWebEngineCore", "PySide6.QtWebEngineWidgets", "PySide6.QtWebEngineQuick",
-    "PySide6.QtMultimedia", "PySide6.QtMultimediaWidgets", "PySide6.QtNetwork",
+    "PySide6.QtMultimedia", "PySide6.QtMultimediaWidgets",
+    "PySide6.QtNetwork",        # 检查更新走 curl / urllib（见 vff/update.py），不用 Qt 网络
     "PySide6.QtSql", "PySide6.QtTest", "PySide6.QtDesigner", "PySide6.QtUiTools",
     "PySide6.QtOpenGL", "PySide6.QtOpenGLWidgets", "PySide6.QtPdf", "PySide6.QtPdfWidgets",
     "PySide6.QtSvgWidgets", "PySide6.QtHelp", "PySide6.QtCharts",

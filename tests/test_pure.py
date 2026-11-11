@@ -24,6 +24,8 @@ from vff import cache, ffmpeg  # noqa: E402
 from vff.media import find_videos, parse_probe_json, rate, thumb_size_for  # noqa: E402
 from vff.util import (fmt_tc, fmt_tc_compact, human_size, parse_time_arg,  # noqa: E402
                       safe_filename)
+from vff.version import is_newer, normalize, parse_version, state_for  # noqa: E402
+from vff.update import CheckResult, curl_path, pick_proxy  # noqa: E402
 
 
 class TestTimecode(unittest.TestCase):
@@ -403,6 +405,65 @@ class TestFfmpegLocation(unittest.TestCase):
                     os.environ.pop("PURER_FFMPEG_DIR", None)
                 else:
                     os.environ["PURER_FFMPEG_DIR"] = old
+
+
+class TestVersions(unittest.TestCase):
+    """检查更新：只比数字；查不到绝不能报「已是最新」。"""
+
+    def test_parse(self):
+        self.assertEqual(parse_version("v1.1.4"), (1, 1, 4))
+        self.assertEqual(parse_version("Purer.1.2"), (1, 2))
+        self.assertEqual(parse_version("1.1.4-beta.2"), (1, 1, 4))
+        self.assertEqual(parse_version("  v9 "), (9,))
+        self.assertEqual(parse_version(""), ())
+        self.assertEqual(parse_version(None), ())
+        self.assertEqual(parse_version("latest"), ())
+
+    def test_normalize(self):
+        self.assertEqual(normalize("Purer.1.1.4"), "v1.1.4")
+        self.assertEqual(normalize("v1.1.3"), "v1.1.3")
+        self.assertEqual(normalize("无聊"), "")
+
+    def test_is_newer(self):
+        self.assertTrue(is_newer("v1.1.4", "1.1.3"))
+        self.assertTrue(is_newer("v1.10.0", "1.9.9"))
+        self.assertFalse(is_newer("v1.1.3", "1.1.3"))
+        self.assertFalse(is_newer("1.1.4", "1.1.4.0"))     # 缺位按 0 补齐
+        self.assertFalse(is_newer("v1.0.9", "1.1.0"))
+        self.assertFalse(is_newer("", "1.1.3"))
+        self.assertFalse(is_newer("oops", "1.1.3"))
+
+    def test_state_for_three_colors(self):
+        self.assertEqual(state_for(True, "v1.2.0", "1.1.4"), "stale")
+        self.assertEqual(state_for(True, "v1.1.4", "1.1.4"), "latest")
+        self.assertEqual(state_for(True, "v1.1.3", "1.1.4"), "latest")
+        self.assertEqual(state_for(False, "", "1.1.4"), "error")
+        self.assertEqual(state_for(True, "", "1.1.4"), "error")      # 拿不到 tag
+        self.assertEqual(state_for(False, "v9.9", "1.1.4"), "error")
+
+
+class TestUpdateRoutes(unittest.TestCase):
+    """检查更新：代理串解析 + 三色状态映射（传输层不打网络）。"""
+
+    def test_pick_proxy(self):
+        self.assertEqual(pick_proxy("127.0.0.1:7897"), "127.0.0.1:7897")
+        self.assertEqual(pick_proxy("http=10.0.0.1:8080;https=10.0.0.2:8443"),
+                         "10.0.0.2:8443")
+        self.assertEqual(pick_proxy("http=10.0.0.1:8080"), "10.0.0.1:8080")
+        self.assertEqual(pick_proxy("socks=10.0.0.3:1080"), "10.0.0.3:1080")
+        self.assertEqual(pick_proxy(""), "")
+        self.assertEqual(pick_proxy(None), "")
+
+    def test_result_state(self):
+        self.assertEqual(CheckResult(True, "v2.0.0").state("1.1.4"), "stale")
+        self.assertEqual(CheckResult(True, "v1.1.4").state("1.1.4"), "latest")
+        self.assertEqual(CheckResult(False, "", "", "断网").state("1.1.4"), "error")
+        self.assertEqual(CheckResult(True, "").state("1.1.4"), "error")
+
+    def test_curl_is_wired(self):
+        """Windows 自带 curl，是「检查更新」的首选通道。"""
+        path = curl_path()
+        self.assertTrue(path.lower().endswith("curl.exe"), path)
 
 
 class TestFfmpegGuide(unittest.TestCase):

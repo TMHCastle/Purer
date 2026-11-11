@@ -5,8 +5,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from PySide6.QtCore import (QAbstractListModel, QLocale, QModelIndex, QPoint, QRect,
-                            QRectF, QSize, Qt, Signal)
+from PySide6.QtCore import (QAbstractListModel, QLocale, QModelIndex, QPoint, QPointF,
+                            QRect, QRectF, QSize, Qt, Signal)
 from PySide6.QtGui import (QColor, QDoubleValidator, QFont, QPainter, QPainterPath, QPen,
                            QPixmap)
 from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QHBoxLayout, QLabel,
@@ -26,7 +26,32 @@ LANE_H = 8        # 时间轴专用窄带高度（画刻度 / 范围条 / 入出
 # --------------------------------------------------------------------------- #
 # 抽帧间隔：预设 + 任意输入
 # --------------------------------------------------------------------------- #
-class StepCombo(QComboBox):
+class ArrowCombo(QComboBox):
+    """下拉框：自己补一个三角箭头。
+
+    Qt 的样式表里用 ``border-left/right/top`` 拼三角形**不生效**（Qt 不支持这种
+    CSS 技巧），会渲染成一个灰色小方块；``image:none`` 又会把箭头彻底抹掉。
+    所以箭头这里用 QPainter 画（矢量、跟主题同色）。
+    """
+
+    def paintEvent(self, event):      # noqa: N802
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        pen = QPen(QColor(DIM), 1.4)
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        painter.setPen(pen)
+        half_w, half_h = 4.0, 2.4
+        center_x = self.width() - 13.0
+        center_y = self.height() / 2.0
+        painter.drawPolyline([QPointF(center_x - half_w, center_y - half_h),
+                              QPointF(center_x + half_w, center_y - half_h),
+                              QPointF(center_x, center_y + half_h)])
+        painter.end()
+
+
+class StepCombo(ArrowCombo):
     """抽帧间隔下拉框：常用预设 + 手输（支持 23.98 这种小数）。
 
     小数间隔不是「每 N 帧」的整数取模，抽取时改走 `fps=源fps/step`（按时间均匀取），

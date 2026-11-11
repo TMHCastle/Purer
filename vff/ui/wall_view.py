@@ -4,7 +4,9 @@
 除了显示，这里还负责**入点/出点手柄的拖动**：
   * 蓝条严格按入点/出点的精确 x 画，不再取整到格子；
   * 两端各有一个小旗子（入点朝右、出点朝左），按住就能拖；
-  * 拖动时只发信号，由 TrackPage 决定怎么更新（拖动过程不做重解码）。
+  * 横向拖 = 同一行里微调帧号；**纵向拖 = 跳到别的行**（自动吸附到离鼠标
+    最近的那条时间轴，不用精确对准），所以一次能跳很远；
+  * 拖动时只发信号，由 TrackPage 决定怎么更新（预览与光标都跟着被拖的那一帧）。
 """
 
 from __future__ import annotations
@@ -155,6 +157,39 @@ class WallView(QListView):
                 return bucket, rects
         return None
 
+    def _nearest_row(self, y: int):
+        """拖动用：离鼠标纵向最近的那一行（自动吸附，不要求对准窄带）。
+
+        `_row_at_y` 是「命中判定」（要精确落在窄带 ±9px 内）；
+        拖动时如果还要求精确，鼠标一旦离开窄带就再也拖不动了 ——
+        而纵向拖动本来就该一路跨行，所以这里取最近的一行。
+        """
+        best = None
+        for _top, bucket in self._visible_rows():
+            rects = [self._row_rect(i) for i in bucket]
+            rects = [r for r in rects if r is not None]
+            if not rects:
+                continue
+            line_y = max(r.bottom() for r in rects) - LANE_H // 2
+            dist = abs(y - line_y)
+            if best is None or dist < best[0]:
+                best = (dist, bucket, rects)
+        if best is None:
+            return None
+        return best[1], best[2]
+
+    def _frame_in_row(self, bucket, rects, x: float) -> int | None:
+        """把 x 换算成帧号，并限制在**这一行**的帧范围内。
+
+        不夹的话，鼠标拖到行尾外侧会算出下一行的帧号，旗子就画到别的行去了。
+        """
+        frame = self._frame_at_x(bucket, rects, x)
+        if frame is None:
+            return None
+        lo = bucket[0] * self.step
+        hi = (bucket[-1] + 1) * self.step - 1
+        return int(max(lo, min(hi, frame)))
+
     def _handle_at(self, pos: QPoint):
         """命中入/出点手柄就返回 "in"/"out"。"""
         if self.in_frame is None and self.out_frame is None:
@@ -185,7 +220,7 @@ class WallView(QListView):
                     self._drag = kind
                     self._drag_bucket, self._drag_rects = hit
                     self._hover = kind
-                    self.viewport().setCursor(Qt.SizeHorCursor)
+                    self.viewport().setCursor(Qt.ClosedHandCursor)
                     self.viewport().update()
                     event.accept()
                     return
@@ -193,10 +228,17 @@ class WallView(QListView):
 
     def mouseMoveEvent(self, event):
         pos = event.position().toPoint()
-        if self._drag and self._drag_bucket:
-            frame = self._frame_at_x(self._drag_bucket, self._drag_rects, pos.x())
+        if self._drag:
+            # 横竖都能拖：纵向自动吸附到最近的那一行，横向决定这一行里的帧号
+            hit = self._nearest_row(pos.y())
+            if hit is None:
+                event.accept()
+                return
+            self._drag_bucket, self._drag_rects = hit
+            frame = self._frame_in_row(self._drag_bucket, self._drag_rects, pos.x())
             if frame is not None:
                 self.rangeMoved.emit(self._drag, frame)
+            self.viewport().setCursor(Qt.ClosedHandCursor)
             event.accept()
             return
         kind = self._handle_at(pos)

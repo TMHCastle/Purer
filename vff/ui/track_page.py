@@ -90,6 +90,18 @@ class TrackPage(QWidget):
         self._play_timer.setInterval(int(1000 / PLAY_FPS))
         self._play_timer.timeout.connect(self._play_tick)
 
+        # 拖动入点/出点时的预览节流：先给近似帧（墙上的缩略图，毫秒级），
+        # 停手 140ms 后再补一张精确帧（走 FilmStrip 异步解码，不卡）。
+        self._drag_frame: int | None = None
+        self._drag_tick = QTimer(self)
+        self._drag_tick.setSingleShot(True)
+        self._drag_tick.setInterval(50)
+        self._drag_tick.timeout.connect(self._on_drag_preview)
+        self._drag_settle = QTimer(self)
+        self._drag_settle.setSingleShot(True)
+        self._drag_settle.setInterval(140)
+        self._drag_settle.timeout.connect(self._on_drag_settle)
+
         self.queue.jobStarted.connect(self._on_job_started)
 
     # ------------------------------------------------------------------ UI
@@ -469,7 +481,7 @@ class TrackPage(QWidget):
     def _hide_card(self):
         return
 
-    def _update_card(self):
+    def _update_card(self, approx: bool = False):
         frame = self.cursor_frame
         if frame is None:
             return
@@ -489,7 +501,8 @@ class TrackPage(QWidget):
             path = self.strip.path_for(frame)
             if path is not None:
                 pixmap = QPixmap(str(path))
-            else:
+            elif not approx:
+                # approx=True（拖动中）不在这里取帧：每移动一次就杀一次 ffmpeg 会卡
                 self.strip.ensure(frame)
         if pixmap is None or pixmap.isNull():
             # 先用墙上的缩略图占位，避免空白
@@ -499,6 +512,19 @@ class TrackPage(QWidget):
                 if ref is not None:
                     pixmap = QPixmap(ref.path)
         self.side.set_frame(pixmap, title)
+
+    # ------------------------------------------------- 拖动中的预览跟随
+    def _on_drag_preview(self):
+        """拖动过程中刷新预览（近似帧：墙上的缩略图，立刻出来）。"""
+        if not self._alive or self._player_open or self._drag_frame is None:
+            return
+        self._update_card(approx=True)
+
+    def _on_drag_settle(self):
+        """停在某处不动了：补一张精确帧。"""
+        if not self._alive or self._player_open or self._drag_frame is None:
+            return
+        self._update_card()
 
     def _update_player(self):
         if self.playclip is None or self.cursor_frame is None:
@@ -630,10 +656,11 @@ class TrackPage(QWidget):
             if first is not None and last is not None:
                 self.in_frame = min(first.frame, last.frame)
                 self.out_frame = max(first.frame, last.frame)
-                if self.cursor_frame is None:
-                    self.cursor_frame = self.in_frame
+                # 选区一变，预览就跳到入点（用户刚定的起点），不要停在旧光标上
+                self.cursor_frame = self.in_frame
                 self.view.set_markers(self.in_frame, self.out_frame, self.cursor_frame)
                 self._refresh_range()
+                self._update_card()
 
     def set_in_point(self, frame: int | None = None):
         self._stop_playback_if_playing()
@@ -643,6 +670,7 @@ class TrackPage(QWidget):
         self.in_frame = frame
         if self.out_frame is not None and self.out_frame <= frame:
             self.out_frame = None
+        self.cursor_frame = frame          # 预览跟着刚设的入点
         self._clear_drag_hint()
         self._refresh_range()
         self._update_card()
@@ -655,6 +683,7 @@ class TrackPage(QWidget):
         self.out_frame = frame
         if self.in_frame is not None and self.in_frame >= frame:
             self.in_frame = None
+        self.cursor_frame = frame          # 预览跟着刚设的出点
         self._clear_drag_hint()
         self._refresh_range()
         self._update_card()
@@ -670,7 +699,11 @@ class TrackPage(QWidget):
 
     # ------------------------------------------------- 拖动入点/出点手柄
     def _on_range_drag(self, kind: str, frame: int):
-        """拖动过程中：只更新标记与文字，不做预览解码（否则会卡）。"""
+        """拖动过程中：标记、光标三角、右侧预览都跟着「正在拖的那一帧」。
+
+        预览策略见 `_on_drag_preview` / `_on_drag_settle`：
+        移动时先出墙上的缩略图（毫秒级），停手 140ms 再补精确帧。
+        """
         self._stop_playback_if_playing()
         total = max(1, int(self.info.frames or 0))
         frame = max(0, min(total - 1, int(frame)))
@@ -682,10 +715,20 @@ class TrackPage(QWidget):
             if self.in_frame is not None:
                 frame = max(frame, self.in_frame + 1)
             self.out_frame = min(total - 1, frame)
+        self.cursor_frame = frame        # 预览/三角跟着被拖的那一端，而不是停在旧光标
+        self._drag_frame = frame
         self._refresh_range()
+        if not self._drag_tick.isActive():
+            # 第一次移动立刻出图（手感跟手），后续 50ms 合一次，拖快了也不卡
+            self._on_drag_preview()
+            self._drag_tick.start()
+        self._drag_settle.start()
 
     def _end_range_drag(self, kind: str):
-        """松手后把光标挪到刚拖的那一端，让预览跟上。"""
+        """松手后把光标落到刚拖的那一端，让预览变成精确帧。"""
+        self._drag_tick.stop()
+        self._drag_settle.stop()
+        self._drag_frame = None
         frame = self.in_frame if kind == "in" else self.out_frame
         if frame is not None:
             self._set_cursor(frame, sync_wall=True)
@@ -802,7 +845,7 @@ class TrackPage(QWidget):
             tip = (f"入点 #{self.in_frame} {fmt_tc(t1)}\n"
                    f"出点 #{self.out_frame} {fmt_tc(t2)}\n"
                    f"{count} 帧 · {count / max(fps, 1e-6):.2f} 秒（含出点那一帧）\n"
-                   f"提示：拖动时间轴上的两个蓝色旗子可以微调")
+                   f"提示：拖时间轴上的蓝色旗子 —— 左右微调帧号，上下可跳到别的行（自动吸附）")
         elif self.in_frame is not None:
             main = f"入点 {fmt_tc(self.in_frame / max(fps, 1e-6))} · 再按 O 设出点"
             sub, tip = "", ""
@@ -810,7 +853,7 @@ class TrackPage(QWidget):
             main = f"出点 {fmt_tc(self.out_frame / max(fps, 1e-6))} · 再按 I 设入点"
             sub, tip = "", ""
         else:
-            main = "←/→ 逐帧 · I/O 设点 · 拖动蓝条两端微调"
+            main = "←/→ 逐帧 · I/O 设点 · 拖蓝旗：左右微调 / 上下跳行"
             sub, tip = "", ""
         self.side.set_range(main, sub)
         self.side.lbl_range.setToolTip(tip)
@@ -1507,6 +1550,8 @@ class TrackPage(QWidget):
             self._batch_abort("shutdown")
         try:
             self._timer.stop()
+            self._drag_tick.stop()
+            self._drag_settle.stop()
         except RuntimeError:
             pass
         if self.job is not None:

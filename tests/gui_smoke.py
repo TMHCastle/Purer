@@ -22,13 +22,14 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from PySide6.QtCore import QItemSelection, QItemSelectionModel, Qt  # noqa: E402
+from PySide6.QtCore import QItemSelection, QItemSelectionModel, QPoint, Qt  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from vff import ffmpeg  # noqa: E402
 from vff.ffmpeg import Tools  # noqa: E402
 from vff.ui.main_window import MainWindow  # noqa: E402
+from vff.ui.widgets import LANE_H  # noqa: E402
 
 LOG: list[str] = []
 FAILS: list[str] = []
@@ -133,6 +134,127 @@ def main() -> int:
               page.in_frame == 25 and page.out_frame == 30,
               f"{page.in_frame},{page.out_frame}")
         check("wall markers kept", page.view.in_frame == 25 and page.view.out_frame == 30)
+
+        # ---- B2: 时间轴手柄「垂直拖动」+ 预览跟随被拖的帧 ----
+        total = max(1, int(page.info.frames or 0))
+        page.set_display_side(320)          # 放大缩略图 → 墙折成多行，才能测纵向拖动
+        win.resize(760, 760)
+        app.processEvents()
+        page.in_frame, page.out_frame, page.cursor_frame = None, None, None
+        page.set_in_point(24)
+        page.set_out_point(total - 1)
+        app.processEvents()
+        view = page.view
+        rows = view._visible_rows()
+        check("wall wraps into rows", len(rows) >= 2, f"rows={len(rows)}")
+
+        def lane_of(row):
+            rects = [view._row_rect(i) for i in row[1]]
+            rects = [r for r in rects if r is not None]
+            return max(r.bottom() for r in rects) - LANE_H // 2, rects
+
+        if len(rows) >= 2:
+            target_row = rows[-1]
+            lane_y, target_rects = lane_of(target_row)
+            in_row = None
+            for row in rows:
+                if int(page.in_frame / page.step) in row[1]:
+                    in_row = row
+                    break
+            start_lane, rects0 = lane_of(in_row or rows[0])
+            x_in = view._x_for_frame((in_row or rows[0])[1], rects0, page.in_frame)
+        else:
+            x_in = None
+        if x_in is not None and len(rows) >= 2:
+            # 按在柄上 → 一路拖到最后一行 → 松手
+            QTest.mousePress(view.viewport(), Qt.LeftButton,
+                             pos=QPoint(int(x_in + 1), start_lane))
+            QTest.mouseMove(view.viewport(),
+                            QPoint(int(target_rects[0].center().x()), lane_y))
+            app.processEvents()
+            dragged = page.in_frame
+            release_cursor = page.cursor_frame
+            shown = wait(app, lambda: f"第 {dragged} 帧" in page.side.lbl_frame.text(), 2)
+            check("vertical drag moves in point",
+                  dragged is not None and dragged != 24, f"in={dragged}")
+            check("vertical drag follows dragged frame",
+                  release_cursor == dragged and shown,
+                  f"cursor={release_cursor} side={page.side.lbl_frame.text()}")
+            check("vertical drag lands on target row",
+                  target_row[1][0] * page.step <= dragged
+                  <= (target_row[1][-1] + 1) * page.step - 1,
+                  f"in={dragged} row={target_row[1][0]}..{target_row[1][-1]}")
+            QTest.mouseRelease(view.viewport(), Qt.LeftButton,
+                               pos=QPoint(int(target_rects[0].center().x()), lane_y))
+            app.processEvents()
+            check("in point kept after release", page.in_frame == dragged,
+                  f"{page.in_frame} vs {dragged}")
+        else:
+            check("vertical drag moves in point", False)
+            check("vertical drag follows dragged frame", False)
+            check("vertical drag lands on target row", False)
+            check("in point kept after release", False)
+
+        # ---- B3: 出点手柄同样能垂直拖；纯横向拖动仍然正常 ----
+        page.set_in_point(0)
+        page.set_out_point(30)
+        app.processEvents()
+        rows = view._visible_rows()
+        if len(rows) >= 2:
+            out_row = next((r for r in rows
+                            if int(page.out_frame / page.step) in r[1]), None)
+            last_row = rows[-1]
+            moved_out = page.out_frame
+            if out_row is not None and last_row[1] != out_row[1]:
+                o_lane, o_rects = lane_of(out_row)
+                t_lane, t_rects = lane_of(last_row)
+                ox = view._x_for_frame(out_row[1], o_rects, page.out_frame)
+                if ox is not None:
+                    QTest.mousePress(view.viewport(), Qt.LeftButton,
+                                     pos=QPoint(int(ox - 1), o_lane))
+                    QTest.mouseMove(view.viewport(),
+                                    QPoint(int(t_rects[0].center().x()), t_lane))
+                    app.processEvents()
+                    moved_out = page.out_frame
+                    QTest.mouseRelease(view.viewport(), Qt.LeftButton,
+                                       pos=QPoint(int(t_rects[0].center().x()), t_lane))
+                    app.processEvents()
+            check("vertical drag moves out point",
+                  moved_out > 30 and page.cursor_frame == moved_out, f"out={moved_out}")
+
+            # 横向：同一行里按到下一个格子，帧号跟着变（老的微调行为没坏）
+            page.set_display_side(200)
+            win.resize(1100, 760)
+            app.processEvents()
+            rows = view._visible_rows()
+            two = next((r for r in rows if len(r[1]) >= 2), None)
+            if two is not None:
+                lane2, rects2 = lane_of(two)
+                page.set_in_point(two[1][0] * page.step)
+                app.processEvents()
+                x0 = view._x_for_frame(two[1], rects2, page.in_frame)
+                if x0 is not None:
+                    QTest.mousePress(view.viewport(), Qt.LeftButton,
+                                     pos=QPoint(int(x0 + 1), lane2))
+                    QTest.mouseMove(view.viewport(),
+                                    QPoint(int(rects2[1].center().x()), lane2))
+                    app.processEvents()
+                    horiz = page.in_frame
+                    QTest.mouseRelease(view.viewport(), Qt.LeftButton,
+                                       pos=QPoint(int(rects2[1].center().x()), lane2))
+                    app.processEvents()
+                    check("horizontal drag still works",
+                          horiz == two[1][1] * page.step, f"in={horiz}")
+                else:
+                    check("horizontal drag still works", False)
+            else:
+                check("horizontal drag still works", False)
+        else:
+            check("vertical drag moves out point", False)
+            check("horizontal drag still works", False)
+        page.set_display_side(160)
+        win.resize(1200, 760)
+        app.processEvents()
 
         # ---- C: 选区回放（8fps，不解码） ----
         page.set_in_point(24)

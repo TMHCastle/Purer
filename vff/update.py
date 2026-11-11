@@ -49,9 +49,16 @@ class CheckResult(NamedTuple):
     url: str = ""
     error: str = ""
     source: str = ""            # "curl+代理" / "curl+直连"
+    asset_url: str = ""         # 新版 exe 的下载地址
+    asset_size: int = 0         # 字节数（GitHub 给的就是这个）
+    digest: str = ""            # "sha256:…"（GitHub 的资产校验值）
 
     def state(self, current: str = APP_VERSION) -> str:
         return state_for(self.ok, self.tag, current)
+
+    def can_install(self) -> bool:
+        """能不能自己下载安装（要 exe 地址 + 大小；有 digest 更放心）。"""
+        return bool(self.asset_url and self.asset_size > 0)
 
 
 # --------------------------------------------------------------------------- #
@@ -118,18 +125,56 @@ def curl_args(url: str, proxy: str, timeout: int, want_url: bool = False) -> lis
     return args
 
 
+def asset_from_json(data) -> dict:
+    """从 release JSON 里挑出「给 Windows 用的 exe」资产。
+
+    优先 ``Purer.exe`` 同名，其次第一个 ``.exe``；没有就返回空 dict。
+    """
+    best = {}
+    for item in (data.get("assets") or []) if isinstance(data, dict) else []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").lower()
+        if not name.endswith(".exe"):
+            continue
+        if name == "purer.exe":
+            best = item
+            break
+        if not best:
+            best = item
+    if not best:
+        return {}
+    return {
+        "url": str(best.get("browser_download_url") or ""),
+        "size": int(best.get("size") or 0),
+        "digest": str(best.get("digest") or ""),
+    }
+
+
 def tag_from_json(body: str):
-    """release JSON → ``(tag, html_url, 失败原因)``。"""
+    """release JSON → ``(tag, html_url, 失败原因)``（不含资产信息）。"""
+    result = result_from_json(body)
+    if not result.ok:
+        return "", "", result.error
+    return result.tag, result.url, ""
+
+
+def result_from_json(body: str) -> CheckResult:
+    """release JSON → 完整 ``CheckResult``（含新版 exe 的下载地址 / 大小 / 校验值）。"""
     try:
         data = json.loads(body)
     except ValueError as exc:
-        return "", "", f"JSON 解析失败：{exc}"
+        return CheckResult(False, "", "", f"JSON 解析失败：{exc}")
     if not isinstance(data, dict):
-        return "", "", "接口返回的不是对象"
+        return CheckResult(False, "", "", "接口返回的不是对象")
     tag = str(data.get("tag_name") or "").strip()
     if not tag:
-        return "", "", "接口返回里没有 tag_name"
-    return tag, str(data.get("html_url") or "").strip() or RELEASES_PAGE, ""
+        return CheckResult(False, "", "", "接口返回里没有 tag_name")
+    url = str(data.get("html_url") or "").strip() or RELEASES_PAGE
+    asset = asset_from_json(data)
+    return CheckResult(True, tag, url, "", "",
+                       asset.get("url", ""), asset.get("size", 0),
+                       asset.get("digest", ""))
 
 
 def tag_from_url(final: str) -> str:
@@ -307,13 +352,13 @@ class ReleaseChecker(QObject):
                 return
             self._finish(CheckResult(True, tag, text, "", step["label"]))
             return
-        tag, url, reason = tag_from_json(text)
-        if not tag:
+        result = result_from_json(text)
+        if not result.ok:
             # 接口连得上但内容不对（被网关改写之类）→ 换跳转那条路
-            self._errors.append(f"{step['label']}: {reason}")
+            self._errors.append(f"{step['label']}: {result.error}")
             self._next()
             return
-        self._finish(CheckResult(True, tag, url, "", step["label"]))
+        self._finish(result._replace(source=step["label"]))
 
     def _step_failed(self, step: dict):
         """这条路线确认不通：同一代理上的下一条也不用试了。"""

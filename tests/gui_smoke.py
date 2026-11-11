@@ -119,6 +119,23 @@ def main() -> int:
               abs(badge.geometry().center().x() - titlebar.width() // 2) <= 2,
               str(badge.geometry().getRect()))
 
+        # ---- 自动更新用的两个新状态（下载中 / 已下载待装） ----
+        badge.set_state("downloading", tag="v1.1.5", detail="42%")
+        check("badge downloading shows percent",
+              badge.state_name() == "downloading" and "42%" in badge.label_text(),
+              badge.label_text())
+        badge.set_progress(77)
+        check("badge progress updates text", "77%" in badge.label_text(),
+              badge.label_text())
+        badge.set_state("ready", tag="v1.1.5")
+        check("badge ready asks to restart",
+              badge.state_name() == "ready" and "重启安装" in badge.label_text()
+              and badge.label_text().find("v1.1.5") >= 0,
+              badge.label_text())
+        from vff.selfupdate import can_self_update
+        allowed, _why = can_self_update()
+        check("self-update refused in source run", not allowed, _why)
+
         titlebar.btn_max.click()
         app.processEvents()
         maximized = win.isMaximized()

@@ -25,6 +25,7 @@ from .ffmpeg import (Tools, build_extract_variants, build_normalize_args,
                      run_hidden, snap_before, stream_progress)
 from .media import find_videos, parse_probe_json, thumb_size_for
 from .log import install_crash_log, start_debug_watchdog
+from .selfupdate import cleanup_old
 from .util import fmt_tc, parse_time_arg, safe_filename
 
 USAGE = """Purer {ver} · 视频抽帧浏览 / 帧精确切片
@@ -457,6 +458,11 @@ def main(argv: list[str] | None = None) -> int:
     clean_cache()
 
     win = MainWindow()
+    # 上一次自更新留下的旧 exe（Purer.exe.old）到这里已经确认新版本能跑起来，删掉
+    try:
+        cleanup_old()
+    except Exception:      # noqa: BLE001  删不掉不影响使用
+        pass
     screen = app.primaryScreen()
     if screen is not None:
         g = screen.availableGeometry()

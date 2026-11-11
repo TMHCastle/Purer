@@ -25,7 +25,10 @@ from vff.media import find_videos, parse_probe_json, rate, thumb_size_for  # noq
 from vff.util import (fmt_tc, fmt_tc_compact, human_size, parse_time_arg,  # noqa: E402
                       safe_filename)
 from vff.version import is_newer, normalize, parse_version, state_for  # noqa: E402
-from vff.update import CheckResult, curl_path, pick_proxy  # noqa: E402
+from vff.update import (CheckResult, asset_from_json, curl_path,  # noqa: E402
+                        pick_proxy, result_from_json, tag_from_json)
+from vff.selfupdate import (apply_update, backup_path, cleanup_old,  # noqa: E402
+                            digest_of, download_path, parse_digest, verify_file)
 
 
 class TestTimecode(unittest.TestCase):
@@ -464,6 +467,105 @@ class TestUpdateRoutes(unittest.TestCase):
         """Windows 自带 curl，是「检查更新」的首选通道。"""
         path = curl_path()
         self.assertTrue(path.lower().endswith("curl.exe"), path)
+
+
+class TestSelfUpdate(unittest.TestCase):
+    """自更新：校验、替换、回滚（都在临时目录里做，不碰真 exe）。"""
+
+    def test_parse_digest(self):
+        self.assertEqual(parse_digest("sha256:ABCdef"), ("sha256", "abcdef"))
+        self.assertEqual(parse_digest("abc123"), ("sha256", "abc123"))
+        self.assertEqual(parse_digest(""), ("", ""))
+        self.assertEqual(parse_digest("md5:zz")[0], "md5")
+
+    def test_verify_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "a.bin"
+            target.write_bytes(b"hello purer")
+            size = target.stat().st_size
+            digest = digest_of(target)
+            self.assertEqual(len(digest), 64)
+            self.assertTrue(verify_file(target, size, f"sha256:{digest}")[0])
+            self.assertTrue(verify_file(target, size, "")[0])       # 没给校验值就只比大小
+            bad, why = verify_file(target, size + 1, "")
+            self.assertFalse(bad)
+            self.assertIn("大小", why)
+            bad, why = verify_file(target, size, "sha256:" + "0" * 64)
+            self.assertFalse(bad)
+            self.assertIn("sha256", why)
+            missing, _why = verify_file(Path(tmp) / "nope", 0, "")
+            self.assertFalse(missing)
+
+    def test_apply_update_moves_and_backs_up(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            exe = root / "Purer.exe"
+            exe.write_bytes(b"old")
+            new = root / "dl" / "Purer-v9.exe"
+            new.parent.mkdir()
+            new.write_bytes(b"new-build")
+            ok, why = apply_update(new, exe)
+            self.assertTrue(ok, why)
+            self.assertEqual(exe.read_bytes(), b"new-build")
+            old = backup_path(exe)
+            self.assertEqual(old.read_bytes(), b"old")
+            self.assertFalse(new.exists())
+            self.assertTrue(cleanup_old(exe))
+            self.assertFalse(old.exists())
+
+    def test_apply_update_refuses_bad_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            exe = root / "Purer.exe"
+            exe.write_bytes(b"old")
+            ok, why = apply_update(root / "missing.exe", exe)
+            self.assertFalse(ok)
+            self.assertIn("找不到", why)
+            ok, _why = apply_update(exe, root / "no_such.exe")
+            self.assertFalse(ok)
+            self.assertEqual(exe.read_bytes(), b"old")      # 失败不该动原文件
+
+    def test_download_path_is_tidy(self):
+        path = download_path("v1.1.5")
+        self.assertTrue(path.name.endswith(".exe"))
+        self.assertNotIn("/", path.name)
+        self.assertIn("v1.1.5", path.name)
+
+
+class TestReleaseJson(unittest.TestCase):
+    BODY = json.dumps({
+        "tag_name": "v1.2.0",
+        "html_url": "https://github.com/TMHCastle/Purer/releases/tag/v1.2.0",
+        "assets": [
+            {"name": "notes.txt", "size": 10},
+            {"name": "Purer.exe", "size": 12345, "digest": "sha256:ab",
+             "browser_download_url": "https://example.invalid/Purer.exe"},
+            {"name": "other.exe", "size": 1, "browser_download_url": "x"},
+        ],
+    })
+
+    def test_result_carries_asset(self):
+        result = result_from_json(self.BODY)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.tag, "v1.2.0")
+        self.assertEqual(result.asset_url, "https://example.invalid/Purer.exe")
+        self.assertEqual(result.asset_size, 12345)
+        self.assertEqual(result.digest, "sha256:ab")
+        self.assertTrue(result.can_install())
+        self.assertEqual(result.state("1.1.4"), "stale")
+        self.assertEqual(result.state("1.2.0"), "latest")
+
+    def test_asset_missing(self):
+        body = json.dumps({"tag_name": "v1.2.0", "assets": []})
+        result = result_from_json(body)
+        self.assertTrue(result.ok)
+        self.assertFalse(result.can_install())          # 没有 exe → 只能打开发布页
+        self.assertEqual(asset_from_json({"assets": []}), {})
+
+    def test_bad_json(self):
+        self.assertFalse(result_from_json("not json").ok)
+        self.assertFalse(result_from_json('{"assets": []}').ok)   # 没 tag_name
+        self.assertEqual(tag_from_json(self.BODY)[0], "v1.2.0")
 
 
 class TestFfmpegGuide(unittest.TestCase):

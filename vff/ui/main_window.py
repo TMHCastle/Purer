@@ -6,9 +6,9 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QSettings, Qt, QTimer, QUrl
+from PySide6.QtCore import QEvent, QProcess, QSettings, Qt, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices, QKeySequence, QShortcut
-from PySide6.QtWidgets import (QFileDialog, QFrame, QHBoxLayout, QLabel,
+from PySide6.QtWidgets import (QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel,
                                QMessageBox, QProgressDialog, QPushButton,
                                QSizePolicy, QStackedWidget, QTabWidget,
                                QVBoxLayout, QWidget)
@@ -18,9 +18,12 @@ from ..config import (APP_NAME, APP_VERSION, DEFAULT_DISPLAY_SIDE, DEFAULT_STEP,
                       DISPLAY_MAX, DISPLAY_MIN, DISPLAY_PRESETS, DISPLAY_STEP,
                       EXTRACT_LONG_SIDE, JOBS_MAX_CONCURRENT, MAX_THUMBS_WARN,
                       STEP_PRESETS, STEP_PRESETS_FRACTIONAL, VIDEO_EXTS)
+from ..download import UpdateDownloader
 from ..ffmpeg import probe
 from ..jobs import JobQueue
 from ..media import find_videos, thumb_size_for
+from ..selfupdate import (app_exe, apply_update, auto_install_enabled,
+                          can_self_update, download_path, verify_file)
 from ..update import RELEASES_PAGE, ReleaseChecker
 from ..util import fmt_tc
 from ..version import normalize
@@ -217,6 +220,11 @@ class MainWindow(FramelessWindow):
     def _setup_updater(self):
         self.updater = ReleaseChecker(self)
         self.updater.finished.connect(self._on_update_result)
+        self.downloader = UpdateDownloader(self)
+        self.downloader.progress.connect(self._on_download_progress)
+        self.downloader.finished.connect(self._on_download_finished)
+        self._update_result = None          # 最近一次「有新版本」的结果
+        self._pending_exe = ""              # 已下载并校验通过的新 exe
         self.badge.clicked.connect(self._on_update_clicked)
         self.badge.recheckRequested.connect(self.check_updates)
         self.titlebar.set_subtitle(f"每 {self._step():g} 帧一帧")
@@ -235,10 +243,12 @@ class MainWindow(FramelessWindow):
 
     def check_updates(self):
         debug("check_updates: 进入")
+        if self.downloader.busy():
+            return
         if self.badge.state_name() != "checking":
             self.badge.set_state("checking",
                                  tip="正在向 GitHub 查询最新发布版本…")
-        debug("check_updates: 药丸已切到「检查中」")
+        self._update_result = None
         self.updater.check()
         debug("check_updates: 已交给检查器")
 
@@ -246,9 +256,14 @@ class MainWindow(FramelessWindow):
         state = result.state()
         tag = normalize(result.tag) or result.tag
         if state == "stale":
+            self._update_result = result
+            if result.can_install() and auto_install_enabled():
+                hint = "点击下载并自动安装（右键重新检查）"
+            else:
+                hint = "点击打开发布页下载（右键重新检查）"
             self.badge.set_state(
                 "stale", tag=tag, url=result.url or RELEASES_PAGE,
-                tip=f"GitHub 上已发布 {tag}\n点击打开发布页下载（右键重新检查）")
+                tip=f"GitHub 上已发布 {tag}\n{hint}")
         elif state == "latest":
             self.badge.set_state(
                 "latest", tag=tag,
@@ -260,10 +275,114 @@ class MainWindow(FramelessWindow):
 
     def _on_update_clicked(self):
         state = self.badge.state_name()
+        if state == "downloading":
+            return
         if state == "stale":
-            QDesktopServices.openUrl(QUrl(self.badge.url() or RELEASES_PAGE))
+            self._ask_download()
+        elif state == "ready":
+            self._ask_install()
         elif state != "checking":
             self.check_updates()
+
+    # -------------------------------------------------- 下载 → 校验 → 替换重启
+    def _ask_download(self):
+        result = self._update_result
+        if result is None or not result.can_install() or not auto_install_enabled():
+            QDesktopServices.openUrl(QUrl(self.badge.url() or RELEASES_PAGE))
+            return
+        ok, why = can_self_update()
+        if not ok:
+            self.badge.set_state("stale", tag=normalize(result.tag) or result.tag,
+                                 url=result.url or RELEASES_PAGE,
+                                 tip=f"{why}\n已改为打开发布页，手动下载即可")
+            QDesktopServices.openUrl(QUrl(result.url or RELEASES_PAGE))
+            return
+        tag = normalize(result.tag) or result.tag
+        size = f"{result.asset_size / 1048576:.1f} MB" if result.asset_size else "未知大小"
+        answer = QMessageBox.question(
+            self, "下载并安装更新",
+            f"最新版本 {tag}（{size}）\n\n"
+            "现在下载吗？下载完会先校验 sha256，然后关闭本程序、"
+            "替换 exe 并自动重启。\n\n（下载期间可以继续剪片子）",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if answer == QMessageBox.Yes:
+            self._start_download(result)
+
+    def _start_download(self, result) -> bool:
+        tag = normalize(result.tag) or result.tag
+        dest = download_path(result.tag)
+        self.badge.set_state("downloading", tag=tag, detail="0%",
+                             tip=f"正在下载 {tag}（{result.asset_size} 字节）")
+        started = self.downloader.start(result.asset_url, result.asset_size,
+                                        result.digest, dest)
+        if not started:
+            self.badge.set_state("error", tip="下载没能开始，点击重试")
+        return started
+
+    def _on_download_progress(self, pct: int, got: int, total: int):
+        self.badge.set_progress(pct if pct >= 0 else 0)
+
+    def _on_download_finished(self, ok: bool, path: str, error: str):
+        result = self._update_result
+        tag = normalize(result.tag) if result is not None else ""
+        if not ok:
+            self.badge.set_state(
+                "error", tip=f"下载失败：{error}\n点击重试（右键重新检查）")
+            return
+        self._pending_exe = path
+        self.badge.set_state(
+            "ready", tag=tag,
+            tip=f"新版本 {tag} 已下载并校验通过\n点击立即安装并重启")
+        answer = QMessageBox.question(
+            self, "更新已就绪",
+            f"新版本 {tag} 已下载完成，sha256 校验通过。\n\n"
+            "现在重启安装吗？（会关闭本程序再启动新版本）",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if answer == QMessageBox.Yes:
+            self._install_update()
+
+    def _ask_install(self):
+        if not self._pending_exe:
+            self.check_updates()
+            return
+        tag = self.badge.tag() or "新版本"
+        answer = QMessageBox.question(
+            self, "安装更新",
+            f"现在安装 {tag} 并重启吗？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if answer == QMessageBox.Yes:
+            self._install_update()
+
+    def _install_update(self) -> bool:
+        """把下载好的 exe 换掉自己，然后重启新版本。"""
+        if not self._pending_exe:
+            return False
+        exe = app_exe()
+        if exe is None:
+            QMessageBox.information(self, "安装更新",
+                                    "源码运行时不能自更新。")
+            return False
+        ok, why = verify_file(self._pending_exe, 0,
+                              (self._update_result.digest
+                               if self._update_result else ""))
+        if not ok:
+            QMessageBox.warning(self, "安装更新", f"安装包校验失败：{why}")
+            QDesktopServices.openUrl(QUrl(RELEASES_PAGE))
+            return False
+        ok, why = apply_update(self._pending_exe, exe)
+        if not ok:
+            QMessageBox.warning(
+                self, "安装更新",
+                f"{why}\n\n可以到发布页手动下载，或把 Purer 放到有写权限的目录再试。")
+            QDesktopServices.openUrl(QUrl(RELEASES_PAGE))
+            return False
+        started = QProcess.startDetached(str(exe))
+        started_ok = started[0] if isinstance(started, tuple) else bool(started)
+        if not started_ok:
+            QMessageBox.information(self, "安装更新",
+                                    "新版本已就位，请手动重新打开 Purer。")
+        QApplication.quit()
+        return True
 
     def changeEvent(self, event):
         """最大化 / 还原时把「□ ↔ ❐」图标换掉。"""
@@ -550,8 +669,9 @@ class MainWindow(FramelessWindow):
             except Exception:  # noqa: BLE001
                 pass
         self.jobs.cancel_all()
-        try:
-            self.updater.cancel()          # 别把 curl 子进程留在后台
-        except (AttributeError, RuntimeError):
-            pass
+        for worker in ("updater", "downloader"):
+            try:
+                getattr(self, worker).cancel()      # 别把 curl 子进程留在后台
+            except (AttributeError, RuntimeError):
+                pass
         super().closeEvent(e)

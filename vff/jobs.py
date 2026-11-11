@@ -13,7 +13,8 @@ from __future__ import annotations
 
 from PySide6.QtCore import QObject, QProcess, QTimer, Signal
 
-from .ffmpeg import Tools, format_command, parse_progress_line
+from .ffmpeg import (Tools, command_rejected, format_command,
+                     parse_progress_line)
 
 STDERR_MAX_LINES = 5000
 
@@ -28,15 +29,19 @@ class Job(QObject):
     finished = Signal(bool)         # True = 正常结束
 
     def __init__(self, args=None, duration: float | None = None, label: str = "",
-                 stages: list[dict] | None = None, parent=None):
+                 stages: list[dict] | None = None, parent=None,
+                 alts: list[list[str]] | None = None):
         super().__init__(parent)
         if stages:
             self.stages = [dict(stage) for stage in stages]
         else:
+            # alts = 同一阶段的备选命令（ffmpeg 构建差异时依次重试），见 ffmpeg.build_*_variants
             self.stages = [{"args": list(args or []), "duration": duration,
-                            "label": label}]
+                            "label": label,
+                            "alts": [list(a) for a in (alts or [])]}]
         for stage in self.stages:
             stage["args"] = [str(a) for a in stage.get("args") or []]
+            stage["alts"] = [[str(a) for a in alt] for alt in stage.get("alts") or []]
             stage["duration"] = float(stage.get("duration") or 0.0)
         self.args = self.stages[0]["args"]
         self.label = label or self.stages[0].get("label", "")
@@ -49,6 +54,7 @@ class Job(QObject):
         self.state = "idle"          # idle / running / done
         self._index = 0
         self._done_duration = 0.0
+        self._retries = 0
         self._proc: QProcess | None = None
         self._out_buf = ""
         self._err_buf = ""
@@ -182,9 +188,13 @@ class Job(QObject):
 
         ok = (code == 0 and status == QProcess.NormalExit and not self.cancelled)
         if not ok:
+            if not self.cancelled and self._retry_stage():
+                return
             if not self.cancelled and not self.error:
                 tail = [ln for ln in self._stderr_lines if ln.strip()]
                 self.error = tail[-1] if tail else f"ffmpeg 退出码 {code}"
+                if self._retries:
+                    self.error += f"（已换 {self._retries + 1} 种命令写法）"
             self.failed_command = self.command_line
             self.finalize(False)
             return
@@ -196,6 +206,27 @@ class Job(QObject):
             return
         self.progress.emit(100)
         self.finalize(True)
+
+    def _retry_stage(self) -> bool:
+        """当前阶段被这个 ffmpeg 拒了？换下一种写法重跑同一阶段。
+
+        只对「命令写法/版本不兼容」重试（ffmpeg.command_rejected），
+        真正的解码失败、磁盘满、文件损坏一律不重试（白等一遍没意义）。
+        """
+        if self._index >= len(self.stages):
+            return False
+        stage = self.stages[self._index]
+        alts = stage.get("alts") or []
+        if not alts or not command_rejected(self.stderr_text):
+            return False
+        stage["args"] = alts.pop(0)
+        self._retries += 1
+        self.logLine.emit(f"[重试 {self._retries}] 这个 ffmpeg 不接受上一条命令，换写法重跑："
+                          f"{format_command(stage['args'], program=self._program())}")
+        self._stderr_lines = []
+        self.error = ""
+        self._start_stage()
+        return True
 
     def finalize(self, ok: bool):
         if self.state == "done":

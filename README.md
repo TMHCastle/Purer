@@ -93,6 +93,23 @@ Purer.exe --selftest                               # 无窗口自检
 最省事的两种：把 `ffmpeg.exe`、`ffprobe.exe` 丢到 `Purer.exe` 旁边，
 或者用引导窗选一次目录。当前解析结果随时用 `Purer.exe --where` 查看。
 
+### 不同 ffmpeg 构建的兼容性（v1.1.1 起）
+
+各家的 ffmpeg 对 `select` 过滤链的解析规则并不一致：有的构建会把
+`select='not(mod(n\,24))'` 里的反斜杠原样留在表达式里 → 抽帧一开就报
+`Error while parsing expression` / `Error initializing filters`。
+
+所以抽帧命令默认改成**单引号保护逗号**（`select='not(mod(n,24))'`，不带任何转义字符），
+并在出错时自动按顺序换写法重试，只有「命令被这个 ffmpeg 拒绝」才重试（解码失败、磁盘满不重试）：
+
+1. 单引号保护逗号（默认）；
+2. 反斜杠转义逗号（早期写法）；
+3. `fps=` 兜底（整条链没有逗号/转义，CFR 源取到的帧与 1 等价）；
+4. 老 ffmpeg（< 5.1）不认 `-fps_mode` 时，以上三种再用 `-vsync 0` 各跑一遍。
+
+界面上的报错会写明「已换 N 种命令写法」；`Purer.exe --selftest` 的
+`extract ... variant=N` 也能看到这次实际用的是第几种（0 = 首选）。
+
 ## 从源码运行
 
 ```

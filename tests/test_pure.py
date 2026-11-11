@@ -145,12 +145,51 @@ class TestArgBuilders(unittest.TestCase):
         args = ffmpeg.build_extract_args(Path("C:/v/a.mp4"), 24, 320, 180,
                                          Path("C:/out"), threads=4)
         joined = " ".join(args)
-        self.assertIn("select='not(mod(n\\,24))'", joined)
+        # 默认写法用单引号保护逗号，**不留反斜杠**：
+        # 有些 ffmpeg 构建会把 `\,` 原样塞进表达式 → "Missing ')'" → 抽帧全失败
+        self.assertIn("select='not(mod(n,24))'", joined)
+        self.assertNotIn("\\", args[args.index("-vf") + 1])
         self.assertIn("scale=320:180:force_original_aspect_ratio=decrease", joined)
         self.assertIn("-threads 4", joined)
         self.assertIn("-map 0:v:0", joined)
         self.assertEqual(args[-1], "C:\\out\\f_%06d.jpg")
         self.assertIn("-progress pipe:1", joined)
+
+    def test_extract_variants_are_ordered_and_deduped(self):
+        path, out = Path("C:/v/a.mp4"), Path("C:/out")
+        variants = ffmpeg.build_extract_variants(path, 24, 320, 180, out, threads=4)
+        self.assertEqual(variants[0],
+                         ffmpeg.build_extract_args(path, 24, 320, 180, out, threads=4))
+        self.assertGreater(len(variants), 1)
+        self.assertEqual(len({tuple(v) for v in variants}), len(variants))
+        joined = [" ".join(v) for v in variants]
+        # 备选里既有「反斜杠转义」写法，也有「fps 兜底」写法（完全不含转义/逗号）
+        self.assertTrue(any("not(mod(n\\,24))" in j for j in joined))
+        self.assertTrue(any("fps=" in j for j in joined))
+        # 老 ffmpeg 不认 -fps_mode 时退到 -vsync 0
+        self.assertTrue(any("-vsync 0" in j for j in joined))
+        for args in variants:
+            self.assertEqual(args[-1], "C:\\out\\f_%06d.jpg")
+
+    def test_fractional_step_uses_fps_filter(self):
+        args = ffmpeg.build_extract_args(Path("a.mp4"), 23.98, 320, 180, Path("C:/out"),
+                                         src_fps=23.976)
+        joined = " ".join(args)
+        self.assertIn("fps=0.999833", joined)
+        self.assertNotIn("select=", joined)
+
+    def test_command_rejected_only_for_syntax_problems(self):
+        # 某电脑上格式工厂自带 ffmpeg 的真实报错（2026-11-11）
+        bad = ("[Parsed_select_0 @ 1] [Eval @ 2] Missing ')' or too many args in "
+               "'mod(n\\,24))'\n[Parsed_select_0 @ 1] Error while parsing expression "
+               "'not(mod(n\\,24))'\n[AVFilterGraph @ 3] Error initializing filters")
+        self.assertTrue(ffmpeg.command_rejected(bad))
+        self.assertTrue(ffmpeg.command_rejected("Unrecognized option 'fps_mode'."))
+        self.assertTrue(ffmpeg.command_rejected("No such filter: '24))'"))
+        # 内容本身的问题不重试
+        self.assertFalse(ffmpeg.command_rejected("Invalid data found when processing input"))
+        self.assertFalse(ffmpeg.command_rejected("No space left on device"))
+        self.assertFalse(ffmpeg.command_rejected(""))
 
     def test_preview_args_clamps_negative_time(self):
         args = ffmpeg.build_preview_args(Path("a.mp4"), -3.0, Path("p.jpg"))

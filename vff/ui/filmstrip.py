@@ -138,6 +138,8 @@ class PlayClip(QObject):
         self.stride = 1
         self._proc: QProcess | None = None
         self._alive = True
+        self._variants: list[list[str]] = []     # 备选命令（ffmpeg 构建差异兜底）
+        self._err = ""
 
     # ---------------- 准备 ----------------
     def prepare(self, start_frame: int, end_frame: int):
@@ -164,14 +166,28 @@ class PlayClip(QObject):
             self.failed.emit(f"无法创建回放缓存：{e}")
             return
         t = max(0.0, (start - 0.5) * self.info.frame_duration)
-        args = ffmpeg.build_play_cache_args(self.src, t, count, stride, self.dir)
+        self._variants = ffmpeg.build_play_cache_variants(self.src, t, count, stride,
+                                                          self.dir)
+        self.start, self.count, self.stride = start, count, stride
+        self._launch()
+
+    def _launch(self):
+        args = self._variants.pop(0)
+        self._err = ""
         proc = QProcess(self)
         proc.setProgram(str(ffmpeg.Tools.ffmpeg))
         proc.setArguments(args)
-        proc.finished.connect(lambda code, status: self._done(code, status))
+        proc.setProcessChannelMode(QProcess.SeparateChannels)
+        proc.readyReadStandardError.connect(lambda p=proc: self._read_err(p))
+        proc.finished.connect(lambda code, status, p=proc: self._done(p, code, status))
         self._proc = proc
-        self.start, self.count, self.stride = start, count, stride
         proc.start()
+
+    def _read_err(self, proc):
+        try:
+            self._err += bytes(proc.readAllStandardError()).decode("utf-8", "replace")
+        except RuntimeError:          # 进程已销毁
+            pass
 
     def _files_ok(self, count: int) -> bool:
         if count <= 0:
@@ -184,12 +200,19 @@ class PlayClip(QObject):
         except OSError:
             return False
 
-    def _done(self, code, status):
+    def _done(self, proc, code, status):
+        if proc is not self._proc:        # 已被新的启动 / 取消顶掉
+            return
         self._proc = None
         if not self._alive:
             return
         try:
-            if code == 0 and status == QProcess.NormalExit and self._files_ok(self.count):
+            ok = (code == 0 and status == QProcess.NormalExit
+                  and self._files_ok(self.count))
+            if not ok and self._variants and ffmpeg.command_rejected(self._err):
+                self._launch()            # 换一种写法再试（第一次是首选）
+                return
+            if ok:
                 self.ready.emit()
             else:
                 self.failed.emit("回放缓存生成失败")
@@ -213,13 +236,13 @@ class PlayClip(QObject):
 
     # ---------------- 收尾 ----------------
     def _kill(self):
-        if self._proc is not None:
+        proc, self._proc = self._proc, None
+        if proc is not None:
             try:
-                self._proc.kill()
-                self._proc.waitForFinished(800)
+                proc.kill()
+                proc.waitForFinished(800)
             except Exception:  # noqa: BLE001
                 pass
-            self._proc = None
 
     def stop(self):
         self._alive = False

@@ -61,10 +61,18 @@ def run(app) -> int:
         # ---- 抽帧 ----
         out = tmp / "thumbs"
         out.mkdir()
-        args = ffmpeg.build_extract_args(src, 24, 320, 180, out)
-        result = run_hidden([str(Tools.ffmpeg)] + args, timeout=120)
+        variants = ffmpeg.build_extract_variants(src, 24, 320, 180, out)
+        result = None
+        used = 0
+        for index, args in enumerate(variants):
+            result = run_hidden([str(Tools.ffmpeg)] + args, timeout=120)
+            used = index
+            stderr_text = result.stderr.decode("utf-8", "replace")
+            if result.returncode == 0 or not ffmpeg.command_rejected(stderr_text):
+                break
         files = sorted(out.glob("f_*.jpg"))
         log.append(f"extract rc={result.returncode} thumbs={len(files)} "
+                   f"variant={used} "
                    f"err={result.stderr.decode('utf-8', 'replace')[:200]}")
         from PySide6.QtGui import QPixmap
         pm = QPixmap(str(files[0])) if files else QPixmap()

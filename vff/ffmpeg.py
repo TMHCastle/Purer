@@ -467,29 +467,114 @@ def build_probe_args(path: Path) -> list[str]:
             "-of", "json", str(path)]
 
 
+# --------------------------------------------------------------------------- #
+# filter 过滤链的写法（跨 ffmpeg 构建兼容）
+# --------------------------------------------------------------------------- #
+# 同一条 `select` 过滤链在不同 ffmpeg 构建里**解析规则并不一致**：
+#   * "quote"：select='not(mod(n,24))'   —— 逗号靠单引号保护（推荐：没有任何转义字符）
+#   * "comma"：select='not(mod(n\,24))'  —— 逗号靠反斜杠转义（早期写法）
+# 2026-11-11 实测（某电脑上格式工厂自带的 ffmpeg）：反斜杠原样留在了表达式里 →
+#   [Eval] Missing ')' or too many args in 'mod(n\,24))'
+#   [AVFilterGraph] Error initializing filters → 抽帧全失败。
+# 所以默认一律出 "quote"，其余写法留进 variants，由调用方在「命令被拒绝」时依次重试。
+SELECT_DIALECTS = ("quote", "comma", "fps")
+# -fps_mode 是 ffmpeg 5.1 才有的；更老的构建要用 -vsync 0
+FPS_FLAGS = ("fps_mode", "vsync")
+
+# 这些错误说明「这条命令这个 ffmpeg 不认」，换一种写法才可能过；
+# 解码失败 / 磁盘满 / 文件损坏不在此列（重试没有意义，只会白等）。
+_REJECT_HINTS = (
+    "error while parsing expression",
+    "error initializing filters",
+    "error reinitializing filters",
+    "no such filter",
+    "unrecognized option",
+    "option not found",
+    "error setting option",
+)
+
+
+def command_rejected(stderr: str) -> bool:
+    """ffmpeg 是否「拒绝这条命令」（语法/版本差异），而不是文件本身有问题。"""
+    text = (stderr or "").lower()
+    return any(hint in text for hint in _REJECT_HINTS)
+
+
+def select_expr(stride: int, dialect: str = "quote") -> str:
+    stride = max(1, int(stride))
+    if dialect == "comma":
+        return f"select='not(mod(n\\,{stride}))'"
+    return f"select='not(mod(n,{stride}))'"
+
+
+def fps_flag_args(flag: str = "fps_mode") -> list[str]:
+    return ["-vsync", "0"] if flag == "vsync" else ["-fps_mode", "passthrough"]
+
+
+def extract_vf(step: float, tw: int, th: int, src_fps: float | None = None,
+               dialect: str = "quote") -> str:
+    """抽帧的 -vf 表达式（step 为小数时按时间取，见 build_extract_args）。"""
+    step = float(step)
+    whole = int(round(step))
+    scale = f"scale={tw}:{th}:force_original_aspect_ratio=decrease"
+    if abs(step - whole) < 1e-6 and dialect != "fps":
+        return f"{select_expr(whole, dialect)},{scale}"
+    fps_in = float(src_fps) if src_fps and src_fps > 0 else 25.0
+    out_fps = max(0.01, fps_in / step)
+    return f"fps={out_fps:.6f},{scale}"
+
+
+def _dedup_args(variants: list[list[str]]) -> list[list[str]]:
+    seen: set[tuple[str, ...]] = set()
+    out: list[list[str]] = []
+    for args in variants:
+        key = tuple(args)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(args)
+    return out
+
+
 def build_extract_args(path: Path, step: float, tw: int, th: int, outdir: Path,
                        threads: int | None = None,
-                       src_fps: float | None = None) -> list[str]:
+                       src_fps: float | None = None,
+                       dialect: str = "quote",
+                       fps_flag: str = "fps_mode") -> list[str]:
     """每 step 帧取一帧；缩略图按视频自身比例输出（不补黑边）。
 
     step 允许小数（如 23.98 = 23.98fps 视频的 1 秒）：
       * 整数 -> `select='not(mod(n,N))'`，按帧号精确取（原路径，字节不变）；
       * 小数 -> `fps=源fps/step`，按**时间**均匀取（帧号无法整除，只能这样做）。
     """
-    step = float(step)
-    whole = int(round(step))
-    scale = f"scale={tw}:{th}:force_original_aspect_ratio=decrease"
-    if abs(step - whole) < 1e-6:
-        vf = f"select='not(mod(n\\,{whole}))',{scale}"
-    else:
-        fps_in = float(src_fps) if src_fps and src_fps > 0 else 25.0
-        out_fps = max(0.01, fps_in / step)
-        vf = f"fps={out_fps:.6f},{scale}"
     return ["-hide_banner", "-nostats", "-loglevel", "error", "-progress", "pipe:1",
             "-threads", str(threads if threads is not None else threads_for()),
-            "-i", str(path), "-map", "0:v:0", "-vf", vf,
-            "-fps_mode", "passthrough", "-q:v", "3", "-start_number", "1", "-y",
+            "-i", str(path), "-map", "0:v:0",
+            "-vf", extract_vf(step, tw, th, src_fps, dialect),
+            *fps_flag_args(fps_flag),
+            "-q:v", "3", "-start_number", "1", "-y",
             str(outdir / "f_%06d.jpg")]
+
+
+def build_extract_variants(path: Path, step: float, tw: int, th: int, outdir: Path,
+                           threads: int | None = None,
+                           src_fps: float | None = None) -> list[list[str]]:
+    """抽帧命令的备选写法（**第一个是首选**，其余按顺序兜底）。
+
+    只在 command_rejected() 成立时才值得往下试：
+      1. 单引号保护逗号（默认）；
+      2. 反斜杠转义逗号（早期写法，个别构建能过）；
+      3. `fps=` 兜底 —— 整条链里**没有任何逗号/转义**，CFR 源取到的帧与 1 等价，
+         至少能保证缩略图出得来。
+    每种写法先配 `-fps_mode passthrough`，老 ffmpeg（<5.1）不认时再退到 `-vsync 0`。
+    """
+    variants: list[list[str]] = []
+    for fps_flag in FPS_FLAGS:
+        for dialect in SELECT_DIALECTS:
+            variants.append(build_extract_args(path, step, tw, th, outdir,
+                                               threads=threads, src_fps=src_fps,
+                                               dialect=dialect, fps_flag=fps_flag))
+    return _dedup_args(variants)
 
 
 def build_preview_args(path: Path, t_abs: float, out: Path, max_width: int = 1280) -> list[str]:
@@ -631,19 +716,31 @@ def build_concat_args(list_path: Path, out: Path) -> list[str]:
 
 
 def build_play_cache_args(src: Path, t_start: float, count: int, stride: int,
-                          outdir: Path) -> list[str]:
+                          outdir: Path, dialect: str = "quote",
+                          fps_flag: str = "fps_mode") -> list[str]:
     """为「选区回放」一次抽出整段（按 stride 抽稀），播放时只读图片。
 
     低配机上实时解码会卡，所以播放不碰解码器；抽 8fps 的图，一秒钟只要 8 张。
     """
-    vf = f"select='not(mod(n\\,{max(1, stride)}))',scale='min(1280,iw)':-2"
+    vf = f"{select_expr(stride, dialect)},scale='min(1280,iw)':-2"
     return ["-hide_banner", "-nostats", "-loglevel", "error",
             "-ss", f"{max(0.0, t_start):.6f}",
             "-i", str(src),
-            "-vf", vf, "-fps_mode", "passthrough",
+            "-vf", vf, *fps_flag_args(fps_flag),
             "-frames:v", str(max(1, count)),
             "-q:v", "4", "-start_number", "0", "-y",
             str(outdir / "p_%05d.jpg")]
+
+
+def build_play_cache_variants(src: Path, t_start: float, count: int, stride: int,
+                              outdir: Path) -> list[list[str]]:
+    """回放缓存命令的备选写法（同 build_extract_variants，但没有 fps 兜底）。"""
+    variants: list[list[str]] = []
+    for fps_flag in FPS_FLAGS:
+        for dialect in ("quote", "comma"):
+            variants.append(build_play_cache_args(src, t_start, count, stride, outdir,
+                                                  dialect=dialect, fps_flag=fps_flag))
+    return _dedup_args(variants)
 
 
 def build_normalize_args(src: Path, out: Path) -> list[str]:

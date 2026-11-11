@@ -20,9 +20,9 @@ from pathlib import Path
 from . import APP_NAME, APP_VERSION, smartcut
 from .cache import cache_root
 from .config import EXTRACT_LONG_SIDE, DEFAULT_STEP, app_dir, bundle_dir
-from .ffmpeg import (Tools, build_extract_args, build_normalize_args,
-                     build_probe_args, probe, read_keyframes, run_hidden,
-                     snap_before, stream_progress)
+from .ffmpeg import (Tools, build_extract_variants, build_normalize_args,
+                     build_probe_args, command_rejected, probe, read_keyframes,
+                     run_hidden, snap_before, stream_progress)
 from .media import find_videos, parse_probe_json, thumb_size_for
 from .util import fmt_tc, parse_time_arg, safe_filename
 
@@ -171,7 +171,7 @@ def _extract_one(src: Path, outdir: Path, step: float, long_side: int) -> tuple[
         return False, 0, str(e)
     tw, th = thumb_size_for(info.width, info.height, long_side)
     outdir.mkdir(parents=True, exist_ok=True)
-    args = build_extract_args(src, step, tw, th, outdir, src_fps=info.fps)
+    variants = build_extract_variants(src, step, tw, th, outdir, src_fps=info.fps)
     last = [-1.0]
 
     def on_progress(pct: float):
@@ -179,8 +179,13 @@ def _extract_one(src: Path, outdir: Path, step: float, long_side: int) -> tuple[
             last[0] = pct
             _p(f"  {pct * 100:5.1f}%  {src.name}")
 
-    code, stderr = stream_progress(args, on_progress=on_progress, timeout=None,
-                                   duration=info.duration)
+    code, stderr = 0, ""
+    for args in variants:      # 第一个是首选；被这个 ffmpeg 拒了才换下一种写法
+        last[0] = -1.0
+        code, stderr = stream_progress(args, on_progress=on_progress, timeout=None,
+                                       duration=info.duration)
+        if code == 0 or not command_rejected(stderr):
+            break
     count = len(list(outdir.glob("f_*.jpg")))
     if code != 0:
         tail = [ln for ln in stderr.strip().splitlines() if ln.strip()]

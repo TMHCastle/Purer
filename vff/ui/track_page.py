@@ -235,9 +235,11 @@ class TrackPage(QWidget):
         self._launch()
 
     def _launch(self):
-        args = ffmpeg.build_extract_args(self.path, self.step, self.tw, self.th,
-                                         self.out_dir, src_fps=self.info.fps)
-        job = Job(args, duration=self.info.duration, label=f"抽帧 {self.path.name}")
+        # 第一个是首选写法，其余是「这个 ffmpeg 不认时」的兜底（构建之间 filter 语法不一致）
+        variants = ffmpeg.build_extract_variants(
+            self.path, self.step, self.tw, self.th, self.out_dir, src_fps=self.info.fps)
+        job = Job(variants[0], duration=self.info.duration,
+                  label=f"抽帧 {self.path.name}", alts=variants[1:])
         self.job = job
         job.progress.connect(self._on_extract_progress)
         job.status.connect(self._on_extract_status)
@@ -1393,11 +1395,11 @@ class TrackPage(QWidget):
 
     # ------------------------------------------------------------- 操作
     def _show_extract_command(self):
-        args = ffmpeg.build_extract_args(
+        variants = ffmpeg.build_extract_variants(
             self.path, self.step, self.tw, self.th,
             self.out_dir or cache_dir_for(self.path, self.step, self.tw, self.th),
             src_fps=self.info.fps)
-        cmd = ffmpeg.format_command(args)
+        cmd = ffmpeg.format_command(variants[0])
         detail = (f"视频：{self.path}\n"
                   f"缓存目录：{self.out_dir}\n\n"
                   f"同样的命令可以在命令行里手动重跑，用来排查问题。")

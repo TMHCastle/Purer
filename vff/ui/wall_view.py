@@ -15,6 +15,7 @@ from PySide6.QtCore import QPoint, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPen, QPolygon
 from PySide6.QtWidgets import QListView
 
+from ..timeline import StepTimeline, Timeline
 from .widgets import LANE_H
 
 LINE_COLOR = QColor("#2E3442")
@@ -37,13 +38,23 @@ class WallView(QListView):
         self.in_frame: int | None = None
         self.out_frame: int | None = None
         self.cursor_frame: int | None = None
-        self.step = 24
+        self.timeline: Timeline = StepTimeline(24)
         self._drag: str | None = None
         self._drag_bucket: list[int] | None = None
         self._drag_rects: list = []
         self._hover: str | None = None
 
     # ---------------- 外部设置 ----------------
+    def set_timeline(self, timeline: Timeline):
+        """换坐标系（每 N 帧 / 按镜头），几何与绘制全部跟着走。"""
+        self.timeline = timeline
+        self.viewport().update()
+
+    @property
+    def step(self) -> float:
+        """兼容旧代码：等距时是真间隔，按镜头时是平均间隔。"""
+        return self.timeline.guess_step()
+
     def set_markers(self, in_frame=None, out_frame=None, cursor_frame=None):
         self.in_frame = in_frame
         self.out_frame = out_frame
@@ -112,37 +123,45 @@ class WallView(QListView):
     # ---------------- 几何：帧 <-> x ----------------
     def _x_for_frame(self, bucket, rects, frame: int) -> float | None:
         """某一帧在这一行上的精确 x（可能落在两个格子中间）。"""
-        if not rects or self.step <= 0:
+        timeline = self.timeline
+        if not rects or timeline.count() <= 0:
             return None
         centers = {item: r.center().x() for item, r in zip(bucket, rects)}
-        pos = frame / max(1, self.step)
-        item = int(pos)
-        frac = pos - item
-        cur = centers.get(item)
-        nxt = centers.get(item + 1)
-        prev = centers.get(item - 1)
-        if cur is not None and nxt is not None:
+        timeline = self.timeline
+        index, frac = timeline.index_of(frame)
+        cur = centers.get(index)
+        nxt = centers.get(index + 1)
+        if cur is None:
+            return None
+        if nxt is not None:
             return cur + frac * (nxt - cur)
-        if cur is not None and prev is not None:
-            return cur + frac * (cur - prev)
-        return cur
+        return float(cur)          # 这一行里没有下一格：钉在格心（避免画到行外）
 
     def _frame_at_x(self, bucket, rects, x: float) -> int | None:
+        timeline = self.timeline
         centers = [r.center().x() for r in rects]
-        if not centers or self.step <= 0:
+        if not centers or timeline.count() <= 0:
             return None
         if len(centers) == 1:
-            return int(round(bucket[0] * self.step))
+            # 一行只有一格（按镜头只抽到 1 张，或最后一行只剩一张）：
+            # 按格内位置映射到这一格覆盖的帧范围，否则拖不动蓝旗
+            lo, hi = timeline.span(bucket[0])
+            rect = rects[0]
+            frac = (x - rect.left()) / max(1.0, float(rect.width()))
+            return int(round(lo + min(1.0, max(0.0, frac)) * max(0.0, hi - lo)))
         if x <= centers[0]:
             gap = max(1, centers[1] - centers[0])
-            return int(round((bucket[0] + (x - centers[0]) / gap) * self.step))
+            f0, f1 = timeline.frame_at(bucket[0]), timeline.frame_at(bucket[1])
+            return int(round(f0 + (x - centers[0]) / gap * (f1 - f0)))
         if x >= centers[-1]:
             gap = max(1, centers[-1] - centers[-2])
-            return int(round((bucket[-2] + (x - centers[-2]) / gap) * self.step))
+            f0, f1 = timeline.frame_at(bucket[-2]), timeline.frame_at(bucket[-1])
+            return int(round(f1 + (x - centers[-1]) / gap * (f1 - f0)))
         for i in range(len(centers) - 1):
             if centers[i] <= x <= centers[i + 1]:
                 gap = max(1, centers[i + 1] - centers[i])
-                return int(round((bucket[i] + (x - centers[i]) / gap) * self.step))
+                f0, f1 = timeline.frame_at(bucket[i]), timeline.frame_at(bucket[i + 1])
+                return int(round(f0 + (x - centers[i]) / gap * (f1 - f0)))
         return None
 
     def _row_at_y(self, y: int):
@@ -186,8 +205,8 @@ class WallView(QListView):
         frame = self._frame_at_x(bucket, rects, x)
         if frame is None:
             return None
-        lo = bucket[0] * self.step
-        hi = (bucket[-1] + 1) * self.step - 1
+        lo = self.timeline.frame_at(bucket[0])
+        hi = self.timeline.span(bucket[-1])[1]
         return int(max(lo, min(hi, frame)))
 
     def _handle_at(self, pos: QPoint):
@@ -304,8 +323,8 @@ class WallView(QListView):
         if self.in_frame is not None and self.out_frame is not None:
             lo = min(self.in_frame, self.out_frame)
             hi = max(self.in_frame, self.out_frame)
-            row_start = bucket[0] * self.step
-            row_end = (bucket[-1] + 1) * self.step
+            row_start = self.timeline.frame_at(bucket[0])
+            row_end = self.timeline.span(bucket[-1])[1]
             if hi >= row_start and lo <= row_end:
                 x1 = self._x_for_frame(bucket, rects, lo)
                 x2 = self._x_for_frame(bucket, rects, hi)
@@ -329,13 +348,11 @@ class WallView(QListView):
 
         # 当前帧：精确位置的小三角
         if self.cursor_frame is not None:
-            pos = self.cursor_frame / max(1, self.step)
-            item = int(pos)
+            index, frac = self.timeline.index_of(self.cursor_frame)
             offsets = {idx: rects[n] for n, idx in enumerate(bucket) if n < len(rects)}
-            if item in offsets:
-                frac = max(0.0, pos - item)
-                x = offsets[item].center().x()
-                nxt = offsets.get(item + 1)
+            if index in offsets:
+                x = offsets[index].center().x()
+                nxt = offsets.get(index + 1)
                 if nxt is not None:
                     x += frac * (nxt.center().x() - x)
                 painter.setPen(QPen(CURSOR_COLOR, 1))
@@ -366,10 +383,10 @@ class WallView(QListView):
         painter.drawPolygon(poly)
 
     def _item_for_frame(self, frame: int) -> int | None:
-        if not self.model() or self.step <= 0:
+        if not self.model() or self.timeline.count() <= 0:
             return None
         count = self.model().rowCount()
-        item = int(round(frame / self.step))
+        item = self.timeline.index_of(frame)[0]
         if item < 0 or item >= count:
             return None
         return item

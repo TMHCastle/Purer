@@ -18,6 +18,8 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ["PURER_NO_UPDATE"] = "1"        # 冒烟测试不联网
+# 用独立缓存目录：别读到你自己 ui.ini 里的 抽帧方式/显示尺寸（否则结果不可复现）
+os.environ["PURER_CACHE_DIR"] = tempfile.mkdtemp(prefix="purer_smoke_cache_")
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -82,6 +84,13 @@ def main() -> int:
         win.resize(1200, 760)
         win.show()
         app.processEvents()
+
+        # 冒烟测试固定用「每 N 帧」，不读机器上的 ui.ini
+        for i in range(win.combo_mode.count()):
+            if win.combo_mode.itemData(i) == "step":
+                win.combo_mode.setCurrentIndex(i)
+                break
+        check("extract mode is step", win._extract_mode == "step", win._extract_mode)
 
         # ---- A: 自绘标题栏 + 顶部卡片正中的「检查更新」药丸 ----
         check("window is frameless", bool(win.windowFlags() & Qt.FramelessWindowHint))
@@ -320,6 +329,54 @@ def main() -> int:
             check("horizontal drag still works", False)
         page.set_display_side(160)
         win.resize(1200, 760)
+        app.processEvents()
+
+        # ---- B4: 按镜头（坐标不规则）时，时间轴仍要精确到帧 ----
+        from PySide6.QtCore import QSize
+        from vff.timeline import SceneTimeline
+        from vff.ui.wall_view import WallView
+        from vff.ui.widgets import FrameDelegate, FrameModel, FrameRef
+        view2 = WallView()
+        view2.setViewMode(WallView.IconMode)
+        view2.setFlow(WallView.LeftToRight)
+        view2.setWrapping(True)
+        view2.setResizeMode(WallView.Adjust)
+        view2.setUniformItemSizes(True)
+        model2 = FrameModel()
+        view2.setModel(model2)
+        view2.setItemDelegate(FrameDelegate(120, 68, view2))
+        view2.setGridSize(QSize(130, 92))
+        view2.resize(1000, 260)
+        view2.show()
+        frames2 = [0, 75, 90, 240, 241, 600]
+        model2.append([FrameRef("x", f / 25.0, f) for f in frames2])
+        timeline2 = SceneTimeline(frames2, 750)
+        view2.set_timeline(timeline2)
+        app.processEvents()
+        rows2 = view2._visible_rows()
+        if rows2:
+            _top2, bucket2 = rows2[0]
+            rects2 = [r for r in (view2._row_rect(i) for i in bucket2) if r is not None]
+            bucket2 = bucket2[:len(rects2)]
+            mid = 80                      # 落在镜头 75 与 90 之间
+            x_mid = view2._x_for_frame(bucket2, rects2, mid)
+            back = view2._frame_at_x(bucket2, rects2, x_mid) if x_mid is not None else None
+            centers2 = [r.center().x() for r in rects2]
+            i1, i2 = bucket2.index(1), bucket2.index(2)
+            check("scene timeline interpolates",
+                  x_mid is not None and centers2[i1] < x_mid < centers2[i2]
+                  and back is not None and abs(back - mid) <= 1,
+                  f"x={x_mid} back={back}")
+            far = view2._frame_in_row(bucket2, rects2, 10 ** 6)
+            check("scene drag clamps to shot span",
+                  far == int(timeline2.span(bucket2[-1])[1]), str(far))
+            check("scene timeline kind", timeline2.kind == "scene"
+                  and timeline2.count() == len(frames2))
+        else:
+            check("scene timeline interpolates", False)
+            check("scene drag clamps to shot span", False)
+            check("scene timeline kind", False)
+        view2.close()
         app.processEvents()
 
         # ---- C: 选区回放（8fps，不解码） ----

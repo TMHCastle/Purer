@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 from pathlib import Path
 
@@ -20,9 +21,10 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QFileDialog, QMe
 from .. import ffmpeg, smartcut
 from ..cache import cache_dir_for
 from ..config import (DEFAULT_DISPLAY_SIDE, DISPLAY_MAX, DISPLAY_MIN, DISPLAY_STEP,
-                      cache_root)
+                      SCENE_MIN_GAP, cache_root)
 from ..jobs import Job, JobQueue
 from ..media import MediaInfo, thumb_size_for
+from ..timeline import SceneTimeline, StepTimeline
 from ..util import fmt_tc, fmt_tc_compact, human_size, safe_filename
 from .dialogs import ask_export, show_log
 from .filmstrip import PLAY_FPS, FilmStrip, PlayClip
@@ -37,10 +39,17 @@ class TrackPage(QWidget):
     display_side_changed = Signal(int)
 
     def __init__(self, path: Path, step: int, tw: int, th: int, info: MediaInfo,
-                 queue: JobQueue, parent=None, display_side: int | None = None):
+                 queue: JobQueue, parent=None, display_side: int | None = None,
+                 scene_threshold: float | None = None):
         super().__init__(parent)
         self.path = Path(path)
         self.step = float(step)
+        # 抽取方式：scene_threshold 有值 = 按镜头（阈值），否则 = 每 step 帧一张
+        self.threshold = float(scene_threshold) if scene_threshold else 0.0
+        self.mode = "scene" if scene_threshold else "step"
+        self.scene_times: list[float] = []      # 场景检测出来的切点（秒，已合并）
+        self._scene_live: list[float] = []      # 抽取过程中边收边显示（未合并）
+        self.timeline = StepTimeline(self.step, max(0, int(info.frames or 0)))
         self.tw, self.th = int(tw), int(th)          # 抽取尺寸（磁盘上的 jpg）
         self.display_side = int(display_side or DEFAULT_DISPLAY_SIDE)
         self.disp_w, self.disp_h = thumb_size_for(info.width, info.height,
@@ -127,7 +136,7 @@ class TrackPage(QWidget):
         self.view.setWordWrap(False)
         self.view.setSpacing(0)
         self.view.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.view.step = self.step
+        self.view.set_timeline(self.timeline)
         self.model = FrameModel(self)
         self.view.setModel(self.model)
         self.view.setItemDelegate(FrameDelegate(self.disp_w, self.disp_h, self.view))
@@ -214,18 +223,50 @@ class TrackPage(QWidget):
 
     # ------------------------------------------------------------- 抽帧
     def _step_int(self) -> int:
-        """PageUp/PageDown 用：跳一个抽取格（小数间隔取整）。"""
-        return max(1, int(round(self.step)))
+        """PageUp/PageDown 用：跳一个抽取格（按镜头时用平均镜头长度）。"""
+        return max(1, int(round(self.timeline.guess_step())))
+
+    def _fps(self) -> float:
+        return float(self.info.fps or 25.0)
+
+    def _frame_for_index(self, index: int) -> int | None:
+        """第 index 张缩略图（0 起）对应源视频的哪一帧。"""
+        if self.mode != "scene":
+            return int(round(index * self.step))
+        times = self.scene_times or self._scene_live
+        if 0 <= index < len(times):
+            return int(round(times[index] * self._fps()))
+        return None
+
+    def _sync_timeline(self):
+        """把「第几张 = 哪一帧」同步给图墙（按镜头时帧号不规则）。"""
+        if self.mode != "scene":
+            self.timeline = StepTimeline(self.step, max(0, int(self.info.frames or 0)))
+        else:
+            frames = [self.model.item(i).frame for i in range(self.model.rowCount())
+                      if self.model.item(i) is not None]
+            self.timeline = SceneTimeline(frames, max(0, int(self.info.frames or 0)))
+        self.view.set_timeline(self.timeline)
 
     def start(self):
         i = self.info
-        est = max(1, int(round(i.frames / self.step))) if i.frames else 1
-        self.total = est
-        self.side.set_video_info(
-            f"{i.resolution} · {i.fps:.4g} FPS · {fmt_tc(i.duration)}",
-            f"共 {i.frames} 帧 · 每 {self.step:g} 帧 1 张 · ≈{self.step / max(i.fps, 1e-6):.2f} 秒")
+        self.scene_times = []
+        self._scene_live = []
+        if self.mode == "scene":
+            self.total = 0                     # 镜头数要检测完才知道
+            self.side.set_video_info(
+                f"{i.resolution} · {i.fps:.4g} FPS · {fmt_tc(i.duration)}",
+                f"共 {i.frames} 帧 · 按镜头 {self.threshold:.2f}")
+        else:
+            est = max(1, int(round(i.frames / self.step))) if i.frames else 1
+            self.total = est
+            self.side.set_video_info(
+                f"{i.resolution} · {i.fps:.4g} FPS · {fmt_tc(i.duration)}",
+                f"共 {i.frames} 帧 · 每 {self.step:g} 帧 1 张 · "
+                f"≈{self.step / max(i.fps, 1e-6):.2f} 秒")
         self.side.set_aspect(i.width, i.height)
-        self.out_dir = cache_dir_for(self.path, self.step, self.tw, self.th)
+        self.out_dir = cache_dir_for(self.path, self.step, self.tw, self.th,
+                                     mode=self.mode, threshold=self.threshold)
         try:
             cache_root().mkdir(parents=True, exist_ok=True)
         except OSError:
@@ -248,10 +289,20 @@ class TrackPage(QWidget):
 
     def _launch(self):
         # 第一个是首选写法，其余是「这个 ffmpeg 不认时」的兜底（构建之间 filter 语法不一致）
-        variants = ffmpeg.build_extract_variants(
-            self.path, self.step, self.tw, self.th, self.out_dir, src_fps=self.info.fps)
-        job = Job(variants[0], duration=self.info.duration,
-                  label=f"抽帧 {self.path.name}", alts=variants[1:])
+        if self.mode == "scene":
+            variants = ffmpeg.build_scene_extract_variants(
+                self.path, self.threshold, self.tw, self.th, self.out_dir)
+            label = f"按镜头抽帧 {self.path.name}"
+        else:
+            variants = ffmpeg.build_extract_variants(
+                self.path, self.step, self.tw, self.th, self.out_dir,
+                src_fps=self.info.fps)
+            label = f"抽帧 {self.path.name}"
+        job = Job(variants[0], duration=self.info.duration, label=label,
+                  alts=variants[1:], stderr_limit=200000)
+        if self.mode == "scene":
+            # showinfo 每输出一帧打一行 pts_time，边跑边收就能边显示
+            job.logLine.connect(self._on_scene_line)
         self.job = job
         job.progress.connect(self._on_extract_progress)
         job.status.connect(self._on_extract_status)
@@ -265,6 +316,14 @@ class TrackPage(QWidget):
             pos = self.queue.position(job)
             if pos:
                 self.lbl_count.setText(f"排队中…（第 {pos} 位）")
+
+    def _on_scene_line(self, line: str):
+        """抽取过程中从 showinfo 的日志里捡切点时间（边收边显示，先不合并）。"""
+        if "pts_time:" not in line:
+            return
+        times = ffmpeg.parse_scene_times(line)
+        if times:
+            self._scene_live.append(times[0])
 
     def _on_job_started(self, job):
         if job is self.job:
@@ -295,10 +354,15 @@ class TrackPage(QWidget):
         self._timer.setInterval(60)
         self._timer.start()
         if ok:
+            if self.mode == "scene":
+                self._finalize_scene(job)
             try:
                 self._final_total = len(list(self.out_dir.glob("f_*.jpg")))
             except OSError:
                 self._final_total = 0
+            if self.mode == "scene" and self.scene_times:
+                # 合并过渡帧后有几张不再需要，别让「载入中 x/y」卡住
+                self._final_total = min(self._final_total, len(self.scene_times))
             if self._final_total > 0:
                 try:
                     (self.out_dir / ".done").write_text(str(self._final_total),
@@ -335,12 +399,25 @@ class TrackPage(QWidget):
         files = sorted(self.out_dir.glob("f_*.jpg"))
         if not files:
             return False
+        if self.mode == "scene":
+            meta = self.out_dir / "scene.json"
+            try:
+                data = json.loads(meta.read_text(encoding="utf-8"))
+                times = [float(x) for x in data.get("times") or []]
+            except (OSError, ValueError, TypeError):
+                return False
+            if len(times) < len(files):
+                return False
+            self.scene_times = times[:len(files)]
         refs = []
-        for n, f in enumerate(files, start=1):
-            frame = int(round((n - 1) * self.step))
+        for n, f in enumerate(files):
+            frame = self._frame_for_index(n)
+            if frame is None:
+                return False
             refs.append(FrameRef(str(f), frame / max(self.info.fps, 1e-6), frame))
         self.model.append(refs)
         self.scan_pos = len(files)
+        self._sync_timeline()
         self.bar.setValue(100)
         self.bar.setVisible(False)
         self.btn_stop.setVisible(False)
@@ -352,6 +429,27 @@ class TrackPage(QWidget):
         if self.model.rowCount():
             self.view.setCurrentIndex(self.model.index(0))
         return True
+
+    def _finalize_scene(self, job: Job | None):
+        """抽帧结束：把 showinfo 里的切点收齐 → 合并过渡帧 → 重建图墙。"""
+        times = ffmpeg.parse_scene_times(job.stderr_text if job is not None else "")
+        if not times:
+            times = list(self._scene_live)
+        times = ffmpeg.merge_scene_times(times, SCENE_MIN_GAP)
+        if not times:
+            return
+        self.scene_times = times
+        try:
+            (self.out_dir / "scene.json").write_text(
+                json.dumps({"mode": "scene", "threshold": self.threshold,
+                            "times": [round(t, 4) for t in times]}, ensure_ascii=False),
+                encoding="utf-8")
+        except OSError:
+            pass
+        # 合并会去掉几个"过渡帧"，数量和顺序都会变 → 按合并后的切点重建
+        self.model.clear_items()
+        self.scan_pos = 0
+        self._scan(force=True)
 
     def _scan(self, force=False):
         if not self._alive or not self.out_dir:
@@ -376,27 +474,36 @@ class TrackPage(QWidget):
                     self.scan_pos = n  # 坏帧跳过，避免永远卡在同一张
                     continue
                 break
-            frame = int(round((n - 1) * self.step))
+            frame = self._frame_for_index(n - 1)
+            if frame is None:
+                if force:              # 按镜头：切点还没到/被合并掉了，跳过这张
+                    self.scan_pos = n
+                    continue
+                break
             refs.append(FrameRef(str(f), frame / max(self.info.fps, 1e-6), frame))
             self.scan_pos = n
         if refs:
             first = self.model.rowCount() == 0
             self.model.append(refs)
+            self._sync_timeline()
             if first:
                 self.view.setCurrentIndex(self.model.index(0))
 
         rows = self.model.rowCount()
         if extracting:
             extra = f" · {self._speed}" if self._speed else ""
-            self.lbl_count.setText(f"已抽 {rows} 张 / 约 {self.total}{extra}")
+            if self.mode == "scene":
+                self.lbl_count.setText(f"已抽 {rows} 个镜头{extra}")
+            else:
+                self.lbl_count.setText(f"已抽 {rows} 张 / 约 {self.total}{extra}")
         elif self._finished:
             if self._final_total and rows < self._final_total:
                 self.lbl_count.setText(f"载入中 {rows}/{self._final_total} 张")
             elif self._result_ok:
-                self.lbl_count.setText(f"已抽 {rows} 张")
+                self.lbl_count.setText(
+                    f"已抽 {rows} 个镜头" if self.mode == "scene" else f"已抽 {rows} 张")
             if not refs:
                 self._timer.stop()
-        self.view.step = self.step
         self.view.set_markers(self.in_frame, self.out_frame, self.cursor_frame)
 
     # ------------------------------------------------------- 光标 / 预览卡
@@ -423,7 +530,7 @@ class TrackPage(QWidget):
             self._show_card()
 
     def _sync_wall_selection(self, frame: int):
-        row = int(round(frame / max(1, self.step)))
+        row = self.timeline.index_of(frame)[0]
         row = max(0, min(self.model.rowCount() - 1, row)) if self.model.rowCount() else -1
         if row < 0:
             return
@@ -465,7 +572,7 @@ class TrackPage(QWidget):
         """某一帧关联的缩略图矩形（用于取占位图）。"""
         if not self.model.rowCount():
             return None
-        row = int(round(frame / max(1, self.step)))
+        row = self.timeline.index_of(frame)[0]
         row = max(0, min(self.model.rowCount() - 1, row))
         return self.view.visualRect(self.model.index(row))
 
@@ -508,7 +615,7 @@ class TrackPage(QWidget):
             # 先用墙上的缩略图占位，避免空白
             ref_rect = self._item_rect(frame)
             if ref_rect is not None:
-                ref = self.model.item(int(round(frame / max(1, self.step))))
+                ref = self.model.item(self.timeline.index_of(frame)[0])
                 if ref is not None:
                     pixmap = QPixmap(ref.path)
         self.side.set_frame(pixmap, title)
@@ -751,7 +858,7 @@ class TrackPage(QWidget):
         """片段缩略图 = 已抽好的关键帧里最接近的一张（不额外解码）。"""
         if not self.model.rowCount():
             return None
-        row = int(round(t * self._fps() / max(1, self.step)))
+        row = self.timeline.index_of(t * self._fps())[0]
         row = max(0, min(self.model.rowCount() - 1, row))
         ref = self.model.item(row)
         return ref.path if ref is not None else None
@@ -1438,16 +1545,23 @@ class TrackPage(QWidget):
 
     # ------------------------------------------------------------- 操作
     def _show_extract_command(self):
-        variants = ffmpeg.build_extract_variants(
+        out_dir = self.out_dir or cache_dir_for(
             self.path, self.step, self.tw, self.th,
-            self.out_dir or cache_dir_for(self.path, self.step, self.tw, self.th),
-            src_fps=self.info.fps)
+            mode=self.mode, threshold=self.threshold)
+        if self.mode == "scene":
+            variants = ffmpeg.build_scene_extract_variants(
+                self.path, self.threshold, self.tw, self.th, out_dir)
+            headline = f"按镜头取帧（阈值 {self.threshold:.2f}），{self.tw}×{self.th}"
+        else:
+            variants = ffmpeg.build_extract_variants(
+                self.path, self.step, self.tw, self.th, out_dir,
+                src_fps=self.info.fps)
+            headline = f"每 {self.step} 帧取 1 帧，{self.tw}×{self.th}"
         cmd = ffmpeg.format_command(variants[0])
         detail = (f"视频：{self.path}\n"
                   f"缓存目录：{self.out_dir}\n\n"
                   f"同样的命令可以在命令行里手动重跑，用来排查问题。")
-        show_log(self, "抽帧命令", f"每 {self.step} 帧取 1 帧，{self.tw}×{self.th}",
-                 cmd, detail)
+        show_log(self, "抽帧命令", headline, cmd, detail)
 
     def _cursor_pixmap(self):
         frame = self.cursor_frame
@@ -1461,7 +1575,7 @@ class TrackPage(QWidget):
                     return pm
         rect = self._item_rect(frame)
         if rect is not None:
-            ref = self.model.item(int(round(frame / max(1, self.step))))
+            ref = self.model.item(self.timeline.index_of(frame)[0])
             if ref is not None:
                 return QPixmap(ref.path)
         return None

@@ -89,6 +89,11 @@ def run(app) -> int:
 
         # ---- 界面渲染 ----
         win = MainWindow()
+        # 自检要可复现：不读机器上「抽帧方式」的设置（可能是按镜头）
+        for i in range(win.combo_mode.count()):
+            if win.combo_mode.itemData(i) == "step":
+                win.combo_mode.setCurrentIndex(i)
+                break
         win.setAttribute(Qt.WA_DontShowOnScreen, True)
         win.resize(1280, 800)
         win.show()

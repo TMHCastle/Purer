@@ -17,7 +17,8 @@ from ..cache import cache_root
 from ..config import (APP_NAME, APP_VERSION, DEFAULT_DISPLAY_SIDE, DEFAULT_STEP,
                       DISPLAY_MAX, DISPLAY_MIN, DISPLAY_PRESETS, DISPLAY_STEP,
                       EXTRACT_LONG_SIDE, JOBS_MAX_CONCURRENT, MAX_THUMBS_WARN,
-                      STEP_PRESETS, STEP_PRESETS_FRACTIONAL, VIDEO_EXTS)
+                      STEP_PRESETS, STEP_PRESETS_FRACTIONAL, VIDEO_EXTS,
+                      extract_mode_items, parse_extract_mode)
 from ..download import UpdateDownloader
 from ..ffmpeg import probe
 from ..jobs import JobQueue
@@ -73,6 +74,8 @@ class MainWindow(FramelessWindow):
             self._sidebar_width = int(self.setting.value("ui/sidebar_width", 372))
         except (TypeError, ValueError):
             self._display_side, self._sidebar_width = DEFAULT_DISPLAY_SIDE, 372
+        self._extract_mode, self._scene_threshold = parse_extract_mode(
+            str(self.setting.value("ui/extract_mode", "step")))
 
         self.jobs = JobQueue(max_concurrent=JOBS_MAX_CONCURRENT, parent=self)
         self.jobs.jobStarted.connect(self._refresh_status)
@@ -115,6 +118,7 @@ class MainWindow(FramelessWindow):
         self.setCentralWidget(central)
         self._refresh_stack()
         self._setup_updater()
+        self._refresh_titles()
         self.titlebar.sync_max_button()
         QShortcut(QKeySequence("Ctrl+O"), self, activated=self.open_files)
         QShortcut(QKeySequence("Ctrl+W"), self, activated=self._close_current)
@@ -152,9 +156,23 @@ class MainWindow(FramelessWindow):
         self.combo_step.setToolTip(
             "每隔多少帧取一张（可直接输入，支持 23.98 这种小数）\n"
             "23.98 / 29.97 / 59.94 = 常见帧率下「约 1 秒」的帧数\n"
-            "改动只影响之后打开的视频；当前页可点「↻ 重抽」")
+            "选「按镜头」时这一项会变灰（改用场景检测）")
         self.combo_step.valueChanged.connect(self._on_step_changed)
         bar.addWidget(self.combo_step)
+
+        bar.addSpacing(4)
+        self.combo_mode = ArrowCombo()
+        self.combo_mode.setFixedWidth(126)
+        self.combo_mode.setToolTip(
+            "抽帧方式：\n"
+            "· 每 N 帧取一张（固定间隔，时间轴等距）\n"
+            "· 按镜头取一张（场景检测，一张图 = 一个镜头）——\n"
+            "  灵敏 20% 容易把推拉/闪光也当切镜头，保守 45% 只认硬切")
+        for label, value in extract_mode_items():
+            self.combo_mode.addItem(label, value)
+        self.combo_mode.currentIndexChanged.connect(self._on_mode_changed)
+        self._sync_mode_combo()
+        bar.addWidget(self.combo_mode)
 
         bar.addSpacing(4)
         bar.addWidget(QLabel("缩略图"))
@@ -227,7 +245,7 @@ class MainWindow(FramelessWindow):
         self._pending_exe = ""              # 已下载并校验通过的新 exe
         self.badge.clicked.connect(self._on_update_clicked)
         self.badge.recheckRequested.connect(self.check_updates)
-        self.titlebar.set_subtitle(f"每 {self._step():g} 帧一帧")
+        self.titlebar.set_subtitle(self._subtitle(self._step()))
         debug("MainWindow._setup_updater 完成")
         if debug_enabled():
             # 只诊断用：每秒记一行，能看出事件循环有没有停
@@ -399,12 +417,55 @@ class MainWindow(FramelessWindow):
         return thumb_size_for(info.width, info.height, EXTRACT_LONG_SIDE)
 
     @staticmethod
-    def _title(step: float) -> str:
+    def _title(step: float, mode: str = "step") -> str:
+        if mode == "scene":
+            return f"{APP_NAME} {APP_VERSION} · 按镜头抽帧"
         return f"{APP_NAME} {APP_VERSION} · 每 {float(step):g} 帧一帧"
 
+    def _subtitle(self, step: float) -> str:
+        if self._extract_mode == "scene":
+            return f"按镜头 · 阈值 {self._scene_threshold:.2f}"
+        return f"每 {float(step):g} 帧一帧"
+
+    def _refresh_titles(self):
+        self.setWindowTitle(self._title(self._step(), self._extract_mode))
+        if hasattr(self, "titlebar"):
+            self.titlebar.set_subtitle(self._subtitle(self._step()))
+
     def _on_step_changed(self, v):
-        self.setWindowTitle(self._title(v))
-        self.titlebar.set_subtitle(f"每 {float(v):g} 帧一帧")
+        self._refresh_titles()
+
+    # ------------------------------------------------------------ 抽帧方式
+    def _sync_mode_combo(self):
+        want = "step" if self._extract_mode != "scene" else f"scene:{self._scene_threshold:.2f}"
+        for i in range(self.combo_mode.count()):
+            if self.combo_mode.itemData(i) == want:
+                self.combo_mode.setCurrentIndex(i)
+                break
+        self.combo_step.setEnabled(self._extract_mode != "scene")
+
+    def _on_mode_changed(self, index: int):
+        value = self.combo_mode.itemData(index)
+        if not value:
+            return
+        self._extract_mode, self._scene_threshold = parse_extract_mode(value)
+        scene = self._extract_mode == "scene"
+        self.setting.setValue("ui/extract_mode",
+                              f"scene:{self._scene_threshold:.2f}" if scene else "step")
+        self.combo_step.setEnabled(not scene)
+        if hasattr(self, "titlebar"):
+            self._refresh_titles()
+        if not hasattr(self, "lbl_status"):
+            return                      # 工具栏还在搭（恢复上次选择时）
+        if scene:
+            self.lbl_status.setText(
+                f"按镜头抽帧（阈值 {self._scene_threshold:.2f}）："
+                "一张缩略图 = 一个镜头 · 只影响之后打开的视频")
+        else:
+            self.lbl_status.setText("按固定间隔抽帧（每 N 帧一张）")
+
+    def _scene_threshold_or_none(self):
+        return self._scene_threshold if self._extract_mode == "scene" else None
 
     def _sync_size_combo(self, px: int):
         """把下拉框对齐到当前显示尺寸（不在预设里就显示「自定义 · N」）。"""
@@ -575,17 +636,20 @@ class MainWindow(FramelessWindow):
             return False
         step = self._step()
         tw, th = self._thumb_size_for(info)
-        est = max(1, int(round(info.frames / step))) if info.frames else 1
-        if est > MAX_THUMBS_WARN:
-            ans = QMessageBox.question(
-                self, "缩略图太多",
-                f"《{path.name}》\n时长 {fmt_tc(info.duration)}，预计生成 {est} 张缩略图。\n\n"
-                f"这可能会占用较多时间和内存（可在顶部把「间隔帧」调大，或用大缩略图设置）。\n\n是否继续？",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-            if ans != QMessageBox.Yes:
-                return False
+        threshold = self._scene_threshold_or_none()
+        if threshold is None:
+            est = max(1, int(round(info.frames / step))) if info.frames else 1
+            if est > MAX_THUMBS_WARN:
+                ans = QMessageBox.question(
+                    self, "缩略图太多",
+                    f"《{path.name}》\n时长 {fmt_tc(info.duration)}，预计生成 {est} 张缩略图。\n\n"
+                    f"这可能会占用较多时间和内存（可在顶部把「间隔帧」调大，或用大缩略图设置）。\n\n是否继续？",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                if ans != QMessageBox.Yes:
+                    return False
         page = TrackPage(path, step, tw, th, info, self.jobs,
-                         display_side=self._display_side)
+                         display_side=self._display_side,
+                         scene_threshold=threshold)
         page.reload_requested.connect(self._on_reload)
         page.display_side_changed.connect(self._on_page_display_side)
         page.split.splitterMoved.connect(self._on_splitter_moved)

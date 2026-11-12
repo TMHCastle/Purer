@@ -30,8 +30,10 @@ class Job(QObject):
 
     def __init__(self, args=None, duration: float | None = None, label: str = "",
                  stages: list[dict] | None = None, parent=None,
-                 alts: list[list[str]] | None = None):
+                 alts: list[list[str]] | None = None,
+                 stderr_limit: int = STDERR_MAX_LINES):
         super().__init__(parent)
+        self.stderr_limit = max(1000, int(stderr_limit))
         if stages:
             self.stages = [dict(stage) for stage in stages]
         else:
@@ -168,7 +170,7 @@ class Job(QObject):
             if not line.strip():
                 continue
             self._stderr_lines.append(line)
-            if len(self._stderr_lines) > STDERR_MAX_LINES:
+            if len(self._stderr_lines) > self.stderr_limit:
                 del self._stderr_lines[:1000]
             self.logLine.emit(line)
 

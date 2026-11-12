@@ -29,6 +29,8 @@ from vff.update import (CheckResult, asset_from_json, curl_path,  # noqa: E402
                         pick_proxy, result_from_json, tag_from_json)
 from vff.selfupdate import (apply_update, backup_path, cleanup_old,  # noqa: E402
                             digest_of, download_path, parse_digest, verify_file)
+from vff.timeline import SceneTimeline, StepTimeline  # noqa: E402
+from vff.config import SCENE_DEFAULT, extract_mode_items, parse_extract_mode  # noqa: E402
 
 
 class TestTimecode(unittest.TestCase):
@@ -566,6 +568,100 @@ class TestReleaseJson(unittest.TestCase):
         self.assertFalse(result_from_json("not json").ok)
         self.assertFalse(result_from_json('{"assets": []}').ok)   # 没 tag_name
         self.assertEqual(tag_from_json(self.BODY)[0], "v1.2.0")
+
+
+class TestTimeline(unittest.TestCase):
+    """时间轴坐标系：等距 / 按镜头（不规则）。"""
+
+    def test_step_timeline(self):
+        tl = StepTimeline(24, 360)
+        self.assertEqual(tl.count(), 15)
+        self.assertEqual(tl.frame_at(3), 72)
+        index, frac = tl.index_of(50)
+        self.assertEqual(index, 2)
+        self.assertAlmostEqual(frac, 50 / 24 - 2)
+        self.assertEqual(tl.span(0), (0, 23))
+        self.assertEqual(tl.span(14), (336, 359))
+        self.assertEqual(tl.guess_step(), 24)
+        self.assertEqual(tl.label(), "每 24 帧")
+
+    def test_scene_timeline(self):
+        tl = SceneTimeline([0, 75, 90, 240], 360)
+        self.assertEqual(tl.count(), 4)
+        self.assertEqual(tl.span(0), (0, 74))
+        self.assertEqual(tl.span(1), (75, 89))
+        self.assertEqual(tl.span(3), (240, 359))
+        index, frac = tl.index_of(80)
+        self.assertEqual(index, 1)
+        self.assertAlmostEqual(frac, 5 / 15)
+        self.assertEqual(tl.index_of(0)[0], 0)
+        self.assertEqual(tl.index_of(359)[0], 3)
+        self.assertIn("按镜头", tl.label())
+
+    def test_scene_timeline_edges(self):
+        empty = SceneTimeline([], 100)
+        self.assertEqual(empty.count(), 0)
+        self.assertEqual(empty.index_of(10), (0, 0.0))
+        self.assertEqual(empty.span(0), (0.0, 0.0))
+        single = SceneTimeline([50], 100)
+        self.assertEqual(single.count(), 1)
+        self.assertEqual(single.span(0), (50, 99))
+
+    def test_scene_timeline_sorts_and_dedupes(self):
+        self.assertEqual(SceneTimeline([90, 0, 90, 75], 100).frames, [0, 75, 90])
+
+
+class TestSceneExtract(unittest.TestCase):
+    """按镜头抽帧：filter 表达式、参数、showinfo 解析、过渡帧合并。"""
+
+    def test_vf_expression(self):
+        vf = ffmpeg.scene_select_vf(0.3, 480, 270)
+        self.assertIn("eq(n,0)", vf)
+        self.assertIn("gt(scene,0.300)", vf)
+        self.assertIn("showinfo", vf)
+        self.assertIn("scale=480:270", vf)
+        self.assertIn("scene\\,0.450",
+                      ffmpeg.scene_select_vf(0.45, 480, 270, dialect="comma"))
+
+    def test_build_args(self):
+        args = ffmpeg.build_scene_extract_args(Path("in.mp4"), 0.3, 480, 270,
+                                              Path("out"))
+        self.assertEqual(args[args.index("-vf") + 1],
+                         ffmpeg.scene_select_vf(0.3, 480, 270))
+        self.assertIn("info", args)            # showinfo 要 info 级日志才有输出
+        self.assertTrue(args[-1].endswith("f_%06d.jpg"))
+
+    def test_variants_are_deduped(self):
+        variants = ffmpeg.build_scene_extract_variants(Path("a.mp4"), 0.3,
+                                                      100, 60, Path("o"))
+        self.assertGreaterEqual(len(variants), 2)
+        self.assertEqual(len({tuple(v) for v in variants}), len(variants))
+
+    def test_parse_and_merge(self):
+        log = ("[Parsed_showinfo_1 @ 000] n:0 pts:0 pts_time:0.000 x\n"
+               "[Parsed_showinfo_1 @ 000] n:75 pts:75 pts_time:3.000 x\n"
+               "[Parsed_showinfo_1 @ 000] n:73 pts:73 pts_time:2.920 x\n"
+               "随便一行日志\n")
+        times = ffmpeg.parse_scene_times(log)
+        self.assertEqual(times, [0.0, 3.0, 2.92])
+        # 2.92 / 3.00 是同一次切换的两次报告 → 合并后留后面那个（画面已稳定）
+        self.assertEqual(ffmpeg.merge_scene_times(times), [0.0, 3.0])
+        self.assertEqual(ffmpeg.merge_scene_times([0, 3.0, 3.1, 9.0]),
+                         [0.0, 3.1, 9.0])
+
+    def test_merge_off_switch(self):
+        self.assertEqual(ffmpeg.merge_scene_times([5, 1, 3], min_gap=0), [1.0, 3.0, 5.0])
+
+
+class TestExtractModeConfig(unittest.TestCase):
+    def test_items_and_parse(self):
+        items = extract_mode_items()
+        self.assertEqual(items[0], ("每 N 帧", "step"))
+        self.assertTrue(any(value.startswith("scene:") for _, value in items))
+        self.assertEqual(parse_extract_mode("step"), ("step", 0.0))
+        self.assertEqual(parse_extract_mode("scene:0.20"), ("scene", 0.20))
+        self.assertEqual(parse_extract_mode("scene"), ("scene", SCENE_DEFAULT))
+        self.assertEqual(parse_extract_mode("乱写"), ("step", 0.0))
 
 
 class TestFfmpegGuide(unittest.TestCase):

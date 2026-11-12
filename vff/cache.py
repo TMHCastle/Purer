@@ -11,15 +11,22 @@ from pathlib import Path
 from .config import CACHE_TTL_DAYS, cache_root
 
 
-def cache_dir_for(path: Path, step: float, tw: int, th: int) -> Path:
-    """同一视频 + 同设置 -> 同一个缓存目录（秒开的基础）。"""
+def cache_dir_for(path: Path, step: float, tw: int, th: int,
+                  mode: str = "step", threshold: float = 0.0) -> Path:
+    """同一视频 + 同设置 -> 同一个缓存目录（秒开的基础）。
+
+    ``mode``/``threshold`` 也进 key：按镜头抽的缓存不能和固定间隔的混在一起。
+    """
     try:
         st = path.stat()
         stamp = f"{st.st_size}|{int(st.st_mtime)}"
     except OSError:
         stamp = "0|0"
-    step_key = f"{float(step):g}"
-    key = f"v2|{path.resolve()}|{stamp}|{step_key}|{tw}x{th}"
+    if mode == "scene":
+        step_key = f"scene{float(threshold):.3f}"
+    else:
+        step_key = f"{float(step):g}"
+    key = f"v3|{path.resolve()}|{stamp}|{step_key}|{tw}x{th}"
     digest = hashlib.sha1(key.encode("utf-8", "replace")).hexdigest()[:16]
     return cache_root() / digest
 

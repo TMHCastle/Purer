@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import math
 import shutil
 from pathlib import Path
 
@@ -118,12 +119,12 @@ class FilmStrip(QObject):
             self._proc = None
 
 
-PLAY_FPS = 12           # 回放帧率（12fps 采样、按真实时长播放）
-PLAY_MAX_FRAMES = 240   # 单次回放最多抽这么多图（约 20 秒素材 @12fps）
+PLAY_FPS = 12           # 兼容旧名（实际速率由 stride 与素材 fps 决定）
+PLAY_MAX_FRAMES = 300   # 单次回放最多抽这么多图（覆盖整段，不缩短）
 
 
 class PlayClip(QObject):
-    """选区回放：一次性把整段抽成 8fps 的图，播放时只翻图、不解码。"""
+    """选区回放：一次性把整段抽成 12~30fps 的图，播放时只翻图、不解码。"""
 
     ready = Signal()
     failed = Signal(str)
@@ -140,25 +141,26 @@ class PlayClip(QObject):
         self._alive = True
         self._variants: list[list[str]] = []     # 备选命令（ffmpeg 构建差异兜底）
         self._err = ""
+        self._cache: dict[int, object] = {}      # index -> QPixmap（回放时反复读同一批图）
 
     # ---------------- 准备 ----------------
     def prepare(self, start_frame: int, end_frame: int):
         if not self._alive or self.info.fps <= 0:
             return
         span = max(1, int(end_frame) - int(start_frame))
-        # 选区越长，采样率越低：总帧数压在 PLAY_MAX_FRAMES 以内，
-        # 这样"准备回放"的时间有上限（1080p 约 2–5 秒）。
-        seconds = span / max(1.0, self.info.fps)
-        target = min(PLAY_FPS, max(3.0, PLAY_MAX_FRAMES / max(seconds, 0.2)))
-        stride = max(1, int(round(self.info.fps / target)))
-        count = min(PLAY_MAX_FRAMES, int(span / stride) + 1)
+        # 抽稀比例：只受「最多抽多少张」限制，**必须覆盖整段**。
+        # 以前按 PLAY_FPS 反推 stride 并且把张数截断，长选段会少播一截，
+        # 看上去就是「预览跟时间轴对不上 / 提前结束」。
+        stride = max(1, int(math.ceil(span / float(PLAY_MAX_FRAMES))))
+        count = int(span // stride) + 1
         start = max(0, int(start_frame))
-        if (start == self.start and count == self.count
+        if (start == self.start and count == self.count and stride == self.stride
                 and self._files_ok(count)):
             self.ready.emit()
             return
 
         self._kill()
+        self._cache.clear()
         shutil.rmtree(self.dir, ignore_errors=True)
         try:
             self.dir.mkdir(parents=True, exist_ok=True)
@@ -230,6 +232,24 @@ class PlayClip(QObject):
         except OSError:
             pass
         return None
+
+    def pixmap(self, index: int):
+        """回放用的图（带缓存：长选段时 tick 可能只有 40–300ms，别每次都读盘解码）。"""
+        from PySide6.QtGui import QPixmap
+
+        cached = self._cache.get(index)
+        if cached is not None:
+            return cached
+        path = self.path_for(index)
+        if path is None:
+            return None
+        pix = QPixmap(str(path))
+        if pix.isNull():
+            return None
+        if len(self._cache) > 300:
+            self._cache.clear()
+        self._cache[index] = pix
+        return pix
 
     def frame_at(self, index: int) -> int:
         return self.start + index * self.stride

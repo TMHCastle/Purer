@@ -18,7 +18,7 @@ from ..config import (APP_NAME, APP_VERSION, DEFAULT_DISPLAY_SIDE, DEFAULT_STEP,
                       DISPLAY_MAX, DISPLAY_MIN, DISPLAY_PRESETS, DISPLAY_STEP,
                       EXTRACT_LONG_SIDE, JOBS_MAX_CONCURRENT, MAX_THUMBS_WARN,
                       STEP_PRESETS, STEP_PRESETS_FRACTIONAL, VIDEO_EXTS,
-                      extract_mode_items, parse_extract_mode)
+                      extract_mode_items, parse_extract_mode, preset_label)
 from ..download import UpdateDownloader
 from ..ffmpeg import probe
 from ..jobs import JobQueue
@@ -459,7 +459,7 @@ class MainWindow(FramelessWindow):
             return                      # 工具栏还在搭（恢复上次选择时）
         if scene:
             self.lbl_status.setText(
-                f"按镜头抽帧（阈值 {self._scene_threshold:.2f}）："
+                f"按镜头抽帧（灵敏度 {preset_label(self._scene_threshold)}）："
                 "一张缩略图 = 一个镜头 · 只影响之后打开的视频")
         else:
             self.lbl_status.setText("按固定间隔抽帧（每 N 帧一张）")

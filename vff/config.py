@@ -12,7 +12,7 @@ from pathlib import Path
 APP_NAME = "Purer"
 APP_TAGLINE = "视频抽帧浏览 / 帧精确切片"
 APP_ID = "Purer"
-APP_VERSION = "1.1.6"
+APP_VERSION = "1.1.7"
 # 「检查更新」查的是这里（公开仓库，只读 API，不需要 token）
 GITHUB_REPO = "TMHCastle/Purer"
 
@@ -20,8 +20,7 @@ DEFAULT_STEP = 24
 
 # 按镜头抽帧：场景检测阈值（越小越灵敏，越容易把推拉/闪光当成切镜头）
 SCENE_PRESETS = [("灵敏", 0.20), ("标准", 0.30), ("保守", 0.45)]
-SCENE_DEFAULT = 0.30
-SCENE_MIN_GAP = 0.30        # 同一个切换报两次（过渡帧）时合并的间隔（秒）
+SCENE_DEFAULT = 0.30        # 界面默认档位（实际参数见 scenedetect.PRESETS）
 
 
 def extract_mode_items() -> list[tuple[str, str]]:
@@ -33,7 +32,7 @@ def extract_mode_items() -> list[tuple[str, str]]:
 
 
 def parse_extract_mode(text: str) -> tuple[str, float]:
-    """``'step'`` / ``'scene:0.30'`` → ``("step"|"scene", 阈值)``。"""
+    """``'step'`` / ``'scene:0.30'`` → ``("step"|"scene", 档位)``。"""
     text = str(text or "").strip()
     if text.startswith("scene"):
         try:
@@ -42,6 +41,15 @@ def parse_extract_mode(text: str) -> tuple[str, float]:
             threshold = SCENE_DEFAULT
         return "scene", max(0.01, min(0.99, threshold))
     return "step", 0.0
+
+
+def preset_label(value: float) -> str:
+    """档位数值 → 中文名（灵敏 / 标准 / 保守）。"""
+    for label, preset in SCENE_PRESETS:
+        if abs(float(preset) - float(value)) < 1e-9:
+            return label
+    return f"{float(value):.2f}"
+
 
 # 抽帧间隔预设：常用整数 + 常见帧率下「约 1 秒」的帧数（含不便输入的小数）
 STEP_PRESETS = [1, 2, 4, 6, 8, 12, 24, 30, 48, 96]

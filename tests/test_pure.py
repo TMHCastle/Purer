@@ -31,6 +31,9 @@ from vff.selfupdate import (apply_update, backup_path, cleanup_old,  # noqa: E40
                             digest_of, download_path, parse_digest, verify_file)
 from vff.timeline import SceneTimeline, StepTimeline  # noqa: E402
 from vff.config import SCENE_DEFAULT, extract_mode_items, parse_extract_mode  # noqa: E402
+from vff.scenedetect import (BINS, SAMPLE_BYTES, build_sample_args,  # noqa: E402
+                             cut_frames, detect_cuts, frames_to_times,
+                             hist_distance, hist_of, params_for)
 
 
 class TestTimecode(unittest.TestCase):
@@ -612,45 +615,93 @@ class TestTimeline(unittest.TestCase):
 
 
 class TestSceneExtract(unittest.TestCase):
-    """按镜头抽帧：filter 表达式、参数、showinfo 解析、过渡帧合并。"""
+    """按帧号清单抽帧（镜头检测在 TestSceneDetect 里测）。"""
 
-    def test_vf_expression(self):
-        vf = ffmpeg.scene_select_vf(0.3, 480, 270)
-        self.assertIn("eq(n,0)", vf)
-        self.assertIn("gt(scene,0.300)", vf)
-        self.assertIn("showinfo", vf)
+    def test_frame_list_expression(self):
+        vf = ffmpeg.frame_select_vf([0, 75, 150], 480, 270)
+        self.assertIn("eq(n,0)+eq(n,75)+eq(n,150)", vf)
         self.assertIn("scale=480:270", vf)
-        self.assertIn("scene\\,0.450",
-                      ffmpeg.scene_select_vf(0.45, 480, 270, dialect="comma"))
+        self.assertIn("eq(n\\,0)+eq(n\\,75)", ffmpeg.frame_select_vf([0, 75], 480, 270,
+                                                                   dialect="comma"))
+        self.assertIn("eq(n,0)", ffmpeg.frame_select_vf([], 480, 270))   # 空清单兜底
 
     def test_build_args(self):
-        args = ffmpeg.build_scene_extract_args(Path("in.mp4"), 0.3, 480, 270,
-                                              Path("out"))
+        args = ffmpeg.build_frames_extract_args(Path("in.mp4"), [0, 75], 480, 270,
+                                               Path("out"))
         self.assertEqual(args[args.index("-vf") + 1],
-                         ffmpeg.scene_select_vf(0.3, 480, 270))
-        self.assertIn("info", args)            # showinfo 要 info 级日志才有输出
+                         ffmpeg.frame_select_vf([0, 75], 480, 270))
         self.assertTrue(args[-1].endswith("f_%06d.jpg"))
 
     def test_variants_are_deduped(self):
-        variants = ffmpeg.build_scene_extract_variants(Path("a.mp4"), 0.3,
-                                                      100, 60, Path("o"))
+        variants = ffmpeg.build_frames_extract_variants(Path("a.mp4"), [0, 10],
+                                                        100, 60, Path("o"))
         self.assertGreaterEqual(len(variants), 2)
         self.assertEqual(len({tuple(v) for v in variants}), len(variants))
 
-    def test_parse_and_merge(self):
-        log = ("[Parsed_showinfo_1 @ 000] n:0 pts:0 pts_time:0.000 x\n"
-               "[Parsed_showinfo_1 @ 000] n:75 pts:75 pts_time:3.000 x\n"
-               "[Parsed_showinfo_1 @ 000] n:73 pts:73 pts_time:2.920 x\n"
-               "随便一行日志\n")
-        times = ffmpeg.parse_scene_times(log)
-        self.assertEqual(times, [0.0, 3.0, 2.92])
-        # 2.92 / 3.00 是同一次切换的两次报告 → 合并后留后面那个（画面已稳定）
-        self.assertEqual(ffmpeg.merge_scene_times(times), [0.0, 3.0])
-        self.assertEqual(ffmpeg.merge_scene_times([0, 3.0, 3.1, 9.0]),
-                         [0.0, 3.1, 9.0])
+    def test_sample_args(self):
+        args = build_sample_args(Path("a.mp4"))
+        self.assertIn("rawvideo", args)
+        self.assertIn("format=gray", " ".join(args))
+        self.assertEqual(args[-1], "-")
 
-    def test_merge_off_switch(self):
-        self.assertEqual(ffmpeg.merge_scene_times([5, 1, 3], min_gap=0), [1.0, 3.0, 5.0])
+
+class TestSceneDetect(unittest.TestCase):
+    """直方图镜头检测：切点/渐变/运动/闪光。"""
+
+    @staticmethod
+    def _hists(colors):
+        """每帧一个"纯色"直方图（用灰度值模拟），后续帧可以重复。"""
+        out = []
+        for value in colors:
+            frame = bytes([value]) * SAMPLE_BYTES
+            out.append(hist_of(frame))
+        return out
+
+    def test_hist_distance(self):
+        a = hist_of(bytes([0]) * SAMPLE_BYTES)
+        b = hist_of(bytes([255]) * SAMPLE_BYTES)
+        self.assertAlmostEqual(hist_distance(a, a), 0.0)
+        self.assertAlmostEqual(hist_distance(a, b), 1.0, places=3)
+
+    def test_hard_cut_detected(self):
+        hists = self._hists([10] * 60 + [200] * 60)
+        cuts = detect_cuts(hists, 25.0)
+        frames = [c["frame"] for c in cuts]
+        self.assertEqual(frames[0], 0)          # 第一个镜头永远从 0 开始
+        self.assertIn(60, frames)
+        self.assertEqual(len(frames), 2)
+
+    def test_pan_like_drift_is_not_a_cut(self):
+        """灰度/直方图慢慢漂移（摇镜头、曝光变化）：每帧只动一点点，不该切。"""
+        hists = []
+        for i in range(120):
+            share = i / 120.0                  # 质量从 32 档慢慢挪到 40 档
+            hists.append([0 if n not in (32, 40) else
+                          (int(SAMPLE_BYTES * (1 - share)) if n == 32
+                           else int(SAMPLE_BYTES * share))
+                          for n in range(BINS)])
+        self.assertEqual(len(detect_cuts(hists, 25.0)), 1)   # 只有第 0 帧
+
+    def test_single_frame_flash_is_not_a_cut(self):
+        hists = self._hists([30] * 50 + [250] + [30] * 50)
+        self.assertEqual(len(detect_cuts(hists, 25.0)), 1)
+
+    def test_dissolve_is_one_cut(self):
+        """两段之间用 1 秒慢慢过渡：应该切一刀，不是 0 刀也不是多刀。"""
+        colors = [20] * 60
+        for i in range(25):                    # 25 帧渐变
+            colors.append(int(20 + (200 - 20) * (i + 1) / 25))
+        colors += [200] * 60
+        cuts = detect_cuts(self._hists(colors), 25.0)
+        self.assertEqual(len(cuts), 2, [c["frame"] for c in cuts])
+        self.assertEqual(cuts[1]["kind"], "gradual")
+
+    def test_presets_and_frames(self):
+        self.assertEqual(params_for(0.20)[0] < params_for(0.45)[0], True)
+        cuts = [{"frame": 0}, {"frame": 30}, {"frame": 30}, {"frame": 90}]
+        self.assertEqual(cut_frames(cuts), [0, 30, 90])
+        self.assertEqual(cut_frames([]), [0])
+        self.assertEqual(frames_to_times([0, 50], 25.0), [0.0, 2.0])
 
 
 class TestExtractModeConfig(unittest.TestCase):

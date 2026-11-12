@@ -16,6 +16,8 @@ _backup/
 _bak*/
 _screenshots_*/
 *.bak.*
+# 自更新留下的旧 exe（Purer.exe.old）；注意 gitignore 不支持行尾注释
+*.old
 ffmpeg.ini
 *.log
 

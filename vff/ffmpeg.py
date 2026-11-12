@@ -577,72 +577,40 @@ def build_extract_variants(path: Path, step: float, tw: int, th: int, outdir: Pa
     return _dedup_args(variants)
 
 
-# --------------------------------------------------------------------------- #
-# 按镜头抽帧（场景检测）
-# --------------------------------------------------------------------------- #
-def scene_select_vf(threshold: float, tw: int, th: int,
-                    dialect: str = "quote") -> str:
-    """``select`` + ``showinfo`` + 缩放：一次解码既能吐缩略图，又能拿到每张的时间。
-
-    * ``eq(n,0)``  —— 第 0 帧永远算一个镜头（否则整片开头没有缩略图）；
-    * ``gt(scene,T)`` —— 画面变化超过阈值就算切镜头；
-    * ``showinfo`` —— 每输出一帧打一行 ``pts_time:…``，按顺序和输出文件一一对应。
-    """
-    value = f"{max(0.01, min(0.99, float(threshold))):.3f}"
+def frame_select_vf(frames, tw: int, th: int, dialect: str = "quote") -> str:
+    """按**帧号清单**抽帧（分析阶段已经知道每个镜头的首帧了，不用再猜）。"""
+    numbers = [str(int(f)) for f in frames if int(f) >= 0]
+    if not numbers:
+        numbers = ["0"]
     scale = f"scale={tw}:{th}:force_original_aspect_ratio=decrease"
-    if dialect == "comma":
-        return f"select='eq(n\\,0)+gt(scene\\,{value})',showinfo,{scale}"
-    return f"select='eq(n,0)+gt(scene,{value})',showinfo,{scale}"
+    comma = "\\," if dialect == "comma" else ","
+    terms = "+".join(f"eq(n{comma}{n})" for n in numbers)
+    return f"select='{terms}',{scale}"
 
 
-def build_scene_extract_args(path: Path, threshold: float, tw: int, th: int,
-                             outdir: Path, threads: int | None = None,
-                             dialect: str = "quote",
-                             fps_flag: str = "fps_mode") -> list[str]:
-    """每个镜头取一张（保留所有被选中的帧，不按固定间隔丢帧）。"""
-    return ["-hide_banner", "-nostats", "-loglevel", "info", "-progress", "pipe:1",
+def build_frames_extract_args(path: Path, frames, tw: int, th: int, outdir: Path,
+                              threads: int | None = None,
+                              dialect: str = "quote",
+                              fps_flag: str = "fps_mode") -> list[str]:
+    return ["-hide_banner", "-nostats", "-loglevel", "error", "-progress", "pipe:1",
             "-threads", str(threads if threads is not None else threads_for()),
             "-i", str(path), "-map", "0:v:0",
-            "-vf", scene_select_vf(threshold, tw, th, dialect),
+            "-vf", frame_select_vf(frames, tw, th, dialect),
             *fps_flag_args(fps_flag),
             "-q:v", "3", "-start_number", "1", "-y",
             str(outdir / "f_%06d.jpg")]
 
 
-def build_scene_extract_variants(path: Path, threshold: float, tw: int, th: int,
-                                 outdir: Path,
-                                 threads: int | None = None) -> list[list[str]]:
-    """按镜头抽帧的备选写法（引号方言 × fps 开关，同 build_extract_variants）。"""
+def build_frames_extract_variants(path: Path, frames, tw: int, th: int,
+                                  outdir: Path,
+                                  threads: int | None = None) -> list[list[str]]:
     variants: list[list[str]] = []
     for fps_flag in FPS_FLAGS:
         for dialect in SELECT_DIALECTS:
-            variants.append(build_scene_extract_args(
-                path, threshold, tw, th, outdir, threads=threads,
+            variants.append(build_frames_extract_args(
+                path, frames, tw, th, outdir, threads=threads,
                 dialect=dialect, fps_flag=fps_flag))
     return _dedup_args(variants)
-
-
-_SHOWINFO_TIME = re.compile(r"pts_time:([0-9]+(?:\.[0-9]+)?)")
-
-
-def parse_scene_times(stderr: str) -> list[float]:
-    """从 ``showinfo`` 的日志里按顺序取出每一张缩略图的时间（秒）。"""
-    return [float(m) for m in _SHOWINFO_TIME.findall(stderr or "")]
-
-
-def merge_scene_times(times, min_gap: float = 0.30) -> list[float]:
-    """合并"过渡帧"造成的连续切点（同一个切换可能报 2 次，差几十毫秒）。
-
-    规则：紧挨着的两个切点只留**后面**那个 —— 转场结束时画面才是稳定的，
-    留前面那个往往取到上一镜头的尾巴（实测 2.92s / 3.00s 这种）。
-    """
-    merged: list[float] = []
-    for t in sorted(float(x) for x in times):
-        if merged and t - merged[-1] < min_gap:
-            merged[-1] = t
-        else:
-            merged.append(t)
-    return merged
 
 
 def build_preview_args(path: Path, t_abs: float, out: Path, max_width: int = 1280) -> list[str]:

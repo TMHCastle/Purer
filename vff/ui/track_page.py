@@ -762,7 +762,12 @@ class TrackPage(QWidget):
         fps = max(1.0, float(self.info.fps or 25.0))
         rate = fps / stride
         tail = f"（≈{rate:.1f} fps 抽稀，时间与素材一致）" if stride > 1 else ""
-        return f"回放中…{tail}（空格暂停 · Esc 停止）"
+        # 片尾那一两张常常落在「估计出来的末帧」之外，能播多少就播多少
+        short = int(getattr(self.playclip, "count", 0) or 0)
+        note = ""
+        if getattr(self.playclip, "partial", 0) and short:
+            note = f" · 可播 {short} 张（片尾不足）"
+        return f"回放中…{tail}{note}（空格暂停 · Esc 停止）"
 
     def _pause_playback(self):
         if not self._playing:

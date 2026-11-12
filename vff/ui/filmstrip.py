@@ -40,9 +40,12 @@ class FilmStrip(QObject):
 
     # ---------------- 查询 ----------------
     def contains(self, frame: int) -> bool:
+        # 拖动时上游可能给小数帧号（时间轴插值），这里统一收敛成整数
+        frame = int(frame)
         return self.start <= frame < self.start + self.count
 
     def path_for(self, frame: int) -> Path | None:
+        frame = int(frame)
         if not self.contains(frame):
             return None
         path = self.dir / f"f_{frame:06d}.jpg"
@@ -77,6 +80,9 @@ class FilmStrip(QObject):
             return
         # 往回多半帧，保证第一帧就是 start（浮点边界不会多跳一帧）
         t = max(0.0, (start - 0.5) * self.info.frame_duration)
+        # 这里**不能**学 PlayClip 加 setpts=N：本命令没带 -fps_mode，默认 vsync=cfr
+        # 会按时间戳丢帧，时间戳被 setpts 压成 0,1,2… 之后只会出来 2 张
+        # （2026-11-12 实测）。回放缓存那条命令带了 passthrough，所以可以加。
         args = ["-hide_banner", "-loglevel", "error",
                 "-ss", f"{t:.6f}", "-i", str(self.src),
                 "-frames:v", str(count),
@@ -95,12 +101,28 @@ class FilmStrip(QObject):
     def _running(self) -> bool:
         return self._proc is not None and self._proc.state() != QProcess.NotRunning
 
+    def _window_on_disk(self, start: int, count: int) -> bool:
+        for i in range(max(1, int(count))):
+            path = self.dir / f"f_{int(start) + i:06d}.jpg"
+            try:
+                if path.is_file() and path.stat().st_size > 512:
+                    return True
+            except OSError:
+                continue
+        return False
+
     def _done(self, code, status, start: int, count: int):
         self._proc = None
         if not self._alive:
             return
         try:
             if code == 0 and status == QProcess.NormalExit:
+                self.windowReady.emit(start)
+                return
+            # 片尾那一段 ffmpeg 常会「写完图再报错退出」（时间戳不单调），
+            # 实测最后一帧的窗口 rc=-1 但其实张张都在 —— 有图就用，
+            # 不要整段退回「取相邻帧失败」，那样右侧预览会掉成墙上的缩略图。
+            if self._window_on_disk(start, count):
                 self.windowReady.emit(start)
             else:
                 self.start, self.count = -1, 0
@@ -142,6 +164,8 @@ class PlayClip(QObject):
         self._variants: list[list[str]] = []     # 备选命令（ffmpeg 构建差异兜底）
         self._err = ""
         self._cache: dict[int, object] = {}      # index -> QPixmap（回放时反复读同一批图）
+        self._requested: tuple[int, int, int] | None = None   # (start, count, stride)
+        self.partial = 0        # >0 = 只拿到这么多张之前就没了（片尾不足）
 
     # ---------------- 准备 ----------------
     def prepare(self, start_frame: int, end_frame: int):
@@ -154,13 +178,18 @@ class PlayClip(QObject):
         stride = max(1, int(math.ceil(span / float(PLAY_MAX_FRAMES))))
         count = int(span // stride) + 1
         start = max(0, int(start_frame))
-        if (start == self.start and count == self.count and stride == self.stride
-                and self._files_ok(count)):
+        want = (start, count, stride)
+        # 用「请求过的区间」判断命中，而不是用实际张数：片尾少一两张时
+        # 会走「部分可用」分支把 count 收窄，拿 count 比就永远命不中。
+        if (want == self._requested and self.count > 0
+                and self._frames_on_disk() >= self.count):
             self.ready.emit()
             return
 
         self._kill()
         self._cache.clear()
+        self.partial = 0
+        self._requested = want
         shutil.rmtree(self.dir, ignore_errors=True)
         try:
             self.dir.mkdir(parents=True, exist_ok=True)
@@ -191,16 +220,28 @@ class PlayClip(QObject):
         except RuntimeError:          # 进程已销毁
             pass
 
+    def _frames_on_disk(self) -> int:
+        """从 p_00000.jpg 开始连着数，遇到缺号/坏图就停（= 能播的张数）。"""
+        n = 0
+        limit = PLAY_MAX_FRAMES + 8
+        while n < limit:
+            path = self.dir / f"p_{n:05d}.jpg"
+            try:
+                if not path.is_file() or path.stat().st_size <= 256:
+                    break
+            except OSError:
+                break
+            n += 1
+        return n
+
     def _files_ok(self, count: int) -> bool:
-        if count <= 0:
-            return False
-        first = self.dir / "p_00000.jpg"
-        last = self.dir / f"p_{count - 1:05d}.jpg"
-        try:
-            return (first.is_file() and first.stat().st_size > 512
-                    and last.is_file() and last.stat().st_size > 512)
-        except OSError:
-            return False
+        return count > 0 and self._frames_on_disk() >= count
+
+    def _why(self, code) -> str:
+        tail = " ".join(line.strip() for line in (self._err or "").splitlines()[-3:])
+        if tail:
+            return f"ffmpeg 抽图中断（退出码 {code}）：{tail[:160]}"
+        return f"ffmpeg 一张回放图也没抽出来（退出码 {code}）"
 
     def _done(self, proc, code, status):
         if proc is not self._proc:        # 已被新的启动 / 取消顶掉
@@ -209,15 +250,26 @@ class PlayClip(QObject):
         if not self._alive:
             return
         try:
-            ok = (code == 0 and status == QProcess.NormalExit
-                  and self._files_ok(self.count))
-            if not ok and self._variants and ffmpeg.command_rejected(self._err):
+            normal = code == 0 and status == QProcess.NormalExit
+            have = self._frames_on_disk() if normal else 0
+            if have >= self.count:
+                self.partial = 0
+                self.ready.emit()
+                return
+            if have > 0:
+                # 片尾差几张是**正常现象**：nb_frames 常缺失，程序按
+                # 「时长 × 帧率」估出来的总帧数会比真实末帧多 1 帧，
+                # 于是选区一贴到片尾就差最后一张。能播多少播多少，
+                # 别因为少一张就把整段回放报废。
+                self.partial = self.count - have
+                self.count = have
+                self.ready.emit()
+                return
+            if self._variants and ffmpeg.command_rejected(self._err):
                 self._launch()            # 换一种写法再试（第一次是首选）
                 return
-            if ok:
-                self.ready.emit()
-            else:
-                self.failed.emit("回放缓存生成失败")
+            self.start, self.count = -1, 0
+            self.failed.emit(self._why(code))
         except RuntimeError:      # 页面已销毁
             pass
 

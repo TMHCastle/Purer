@@ -753,12 +753,22 @@ def build_concat_args(list_path: Path, out: Path) -> list[str]:
 
 def build_play_cache_args(src: Path, t_start: float, count: int, stride: int,
                           outdir: Path, dialect: str = "quote",
-                          fps_flag: str = "fps_mode") -> list[str]:
+                          fps_flag: str = "fps_mode",
+                          renumber: bool = True) -> list[str]:
     """为「选区回放」一次抽出整段（按 stride 抽稀），播放时只读图片。
 
     低配机上实时解码会卡，所以播放不碰解码器；抽 8fps 的图，一秒钟只要 8 张。
+
+    ``renumber``（v1.1.8 起默认开）：在过滤链末尾加 ``setpts=N``，把输出时间戳
+    强制重编成 0,1,2…。实测（2026-11-12，1080p HEVC 的 .mkv，选区落在片尾）：
+    不加时 jpeg 的 image2 封装会报
+    ``Application provided invalid, non monotonically increasing dts to muxer``
+    并**当场中止**（只出十几张、退出码 -1）→ 界面报「回放缓存生成失败」；
+    加上之后同一段连跑 3 次都是满张、rc=0。
     """
     vf = f"{select_expr(stride, dialect)},scale='min(1280,iw)':-2"
+    if renumber:
+        vf += ",setpts=N"
     return ["-hide_banner", "-nostats", "-loglevel", "error",
             "-ss", f"{max(0.0, t_start):.6f}",
             "-i", str(src),
@@ -770,12 +780,18 @@ def build_play_cache_args(src: Path, t_start: float, count: int, stride: int,
 
 def build_play_cache_variants(src: Path, t_start: float, count: int, stride: int,
                               outdir: Path) -> list[list[str]]:
-    """回放缓存命令的备选写法（同 build_extract_variants，但没有 fps 兜底）。"""
+    """回放缓存命令的备选写法（同 build_extract_variants，但没有 fps 兜底）。
+
+    首选「``setpts=N`` + 单引号 + ``-fps_mode``」；万一某个 ffmpeg 构建不认
+    ``setpts``（会报 no such filter），再退回不带 ``setpts`` 的老写法。
+    """
     variants: list[list[str]] = []
-    for fps_flag in FPS_FLAGS:
-        for dialect in ("quote", "comma"):
-            variants.append(build_play_cache_args(src, t_start, count, stride, outdir,
-                                                  dialect=dialect, fps_flag=fps_flag))
+    for renumber in (True, False):
+        for fps_flag in FPS_FLAGS:
+            for dialect in ("quote", "comma"):
+                variants.append(build_play_cache_args(
+                    src, t_start, count, stride, outdir, dialect=dialect,
+                    fps_flag=fps_flag, renumber=renumber))
     return _dedup_args(variants)
 
 

@@ -188,6 +188,32 @@ class TestArgBuilders(unittest.TestCase):
         self.assertIn("fps=0.999833", joined)
         self.assertNotIn("select=", joined)
 
+    def test_play_cache_renumbers_timestamps(self):
+        # 2026-11-12：`-ss` 跳到片尾后 jpeg 的 image2 封装会因重复 dts 直接中止
+        # （"non monotonically increasing dts"）→ 界面报「回放缓存生成失败」。
+        # 修法：过滤链末尾加 setpts=N，把输出时间戳重编成 0,1,2…
+        args = ffmpeg.build_play_cache_args(Path("a.mkv"), 12.5, 30, 1, Path("C:/out"))
+        vf = args[args.index("-vf") + 1]
+        self.assertIn("setpts=N", vf)
+        self.assertTrue(vf.endswith("setpts=N"))
+        self.assertIn("select='not(mod(n,1))'", vf)
+        self.assertLess(args.index("-ss"), args.index("-i"))
+        self.assertEqual(args[args.index("-frames:v") + 1], "30")
+        self.assertEqual(args[-1], "C:\\out\\p_%05d.jpg")
+
+    def test_play_cache_variants_fallback_without_setpts(self):
+        path, out = Path("C:/v/a.mkv"), Path("C:/out")
+        variants = ffmpeg.build_play_cache_variants(path, 0.0, 20, 3, out)
+        self.assertEqual(variants[0],
+                         ffmpeg.build_play_cache_args(path, 0.0, 20, 3, out))
+        self.assertEqual(len({tuple(v) for v in variants}), len(variants))
+        vfs = [v[v.index("-vf") + 1] for v in variants]
+        # 首选带 setpts；老构建不认 setpts 时还留了不带它的写法兜底
+        self.assertTrue(vfs[0].endswith("setpts=N"))
+        self.assertTrue(any("setpts" not in v for v in vfs))
+        self.assertTrue(any("not(mod(n\\,3))" in v for v in vfs))
+        self.assertTrue(any("-vsync 0" in " ".join(v) for v in variants))
+
     def test_command_rejected_only_for_syntax_problems(self):
         # 某电脑上格式工厂自带 ffmpeg 的真实报错（2026-11-11）
         bad = ("[Parsed_select_0 @ 1] [Eval @ 2] Missing ')' or too many args in "

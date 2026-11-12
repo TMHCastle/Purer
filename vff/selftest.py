@@ -157,6 +157,18 @@ def run(app) -> int:
                        f"stride={page.playclip.stride if page.playclip else 0} ok={play_ok}")
             ok = ok and play_ok
 
+            # C2：选区贴到片尾也不能报「回放缓存生成失败」（v1.1.8）
+            # nb_frames 缺失时程序按「时长 × 帧率」估的末帧常比真实末帧多 1，
+            # 于是最后一张永远取不到 —— 现在允许少几张，按实际张数播。
+            total_frames = max(1, int(page.info.frames or 0))
+            page.playclip.prepare(total_frames - 1, total_frames)
+            tail_ok = _wait(app, lambda: page.playclip.count >= 1
+                            and page.playclip.path_for(page.playclip.count - 1)
+                            is not None, 30)
+            log.append(f"c2: tail count={page.playclip.count} "
+                       f"partial={page.playclip.partial} ok={tail_ok}")
+            ok = ok and tail_ok
+
             # D：多片段批量导出
             batch_dir = tmp / "batch"
             batch_dir.mkdir()

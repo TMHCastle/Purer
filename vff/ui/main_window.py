@@ -4,39 +4,49 @@
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QProcess, QSettings, Qt, QTimer, QUrl
+from PySide6.QtCore import (QByteArray, QEvent, QProcess, QSettings, QSize, Qt,
+                            QTimer, QUrl)
 from PySide6.QtGui import QDesktopServices, QKeySequence, QShortcut
-from PySide6.QtWidgets import (QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel,
-                               QMessageBox, QProgressDialog, QPushButton,
-                               QSizePolicy, QStackedWidget, QTabWidget,
+from PySide6.QtWidgets import (QApplication, QDialog, QFileDialog, QFrame, QHBoxLayout,
+                               QLabel, QMessageBox, QProgressDialog, QPushButton,
+                               QSizePolicy, QStackedWidget, QTabBar, QTabWidget,
                                QVBoxLayout, QWidget)
 
 from ..cache import cache_root
+from ..cache_store import CacheStore
 from ..config import (APP_NAME, APP_VERSION, DEFAULT_DISPLAY_SIDE, DEFAULT_STEP,
                       DISPLAY_MAX, DISPLAY_MIN, DISPLAY_PRESETS, DISPLAY_STEP,
                       EXTRACT_LONG_SIDE, JOBS_MAX_CONCURRENT, MAX_THUMBS_WARN,
-                      STEP_PRESETS, STEP_PRESETS_FRACTIONAL, VIDEO_EXTS,
-                      extract_mode_items, parse_extract_mode, preset_label)
+                      STEP_MAX, STEP_MIN, STEP_PRESETS, STEP_PRESETS_FRACTIONAL,
+                      VIDEO_EXTS, data_dir, extract_mode_items,
+                      parse_extract_mode, preset_label)
 from ..download import UpdateDownloader
 from ..ffmpeg import probe
 from ..jobs import JobQueue
 from ..media import find_videos, thumb_size_for
 from ..selfupdate import (app_exe, apply_update, auto_install_enabled,
                           can_self_update, download_path, verify_file)
+from ..settings import (CACHE_MODE_NEVER, CACHE_MODE_USAGE, Settings,
+                        close_prompt_needed, usage_meets)
 from ..update import RELEASES_PAGE, ReleaseChecker
 from ..util import fmt_tc
 from ..version import normalize
 from ..log import debug, debug_enabled
+from .cache_badge import CacheBadge
+from .cache_list import CacheImportDialog, sorted_entries
 from .frameless import FramelessWindow
-from .style import make_icon
+from .settings_dialog import CloseCacheDialog, SettingsDialog
+from .style import icon_win_close, make_icon
 from .titlebar import TitleBar
 from .track_page import TrackPage
 from .update_badge import UpdateBadge
 from .widgets import ArrowCombo, EmptyState, StepCombo
 
 CUSTOM_INDEX = len(DISPLAY_PRESETS)
+USAGE_TICK_MS = 5000        # 每 5 秒给「当前页签」记一次使用时长
 
 
 def update_checks_enabled() -> bool:
@@ -46,12 +56,53 @@ def update_checks_enabled() -> bool:
 
 
 def _ui_settings() -> QSettings:
-    root = cache_root()
+    """界面记忆（间隔 / 显示尺寸 / 窗口位置 / 上次打开目录…）。
+
+    放在**持久数据目录**而不是临时缓存里 —— 重启电脑、清理 `%TEMP%` 之后
+    「记忆上次设置」还得在。
+    """
+    root = data_dir()
     try:
         root.mkdir(parents=True, exist_ok=True)
     except OSError:
         pass
-    return QSettings(str(root / "ui.ini"), QSettings.IniFormat)
+    ini = root / "ui.ini"
+    # 从旧位置（临时缓存里的 ui.ini）搬一次记忆，别让用户重启后丢设置
+    if not ini.is_file():
+        old = cache_root() / "ui.ini"
+        try:
+            if old.is_file():
+                shutil.copy2(old, ini)
+        except OSError:
+            pass
+    return QSettings(str(ini), QSettings.IniFormat)
+
+
+class TabCloseButton(QPushButton):
+    """标签页上的关闭按钮：悬停白色 X，带暗红圆角底。
+
+    做成独立按钮（而不是用 QTabBar 自带的 close-button），这样才能
+    通过一个「右侧留白」的容器把它整体往左挪一格，点击区域也更舒服。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("tabClose")
+        self.setFixedSize(18, 18)
+        self.setCursor(Qt.ArrowCursor)
+        self.setFocusPolicy(Qt.NoFocus)
+        self.setIconSize(QSize(11, 11))
+        self._normal = icon_win_close("#8C94A3", 16)
+        self._hover = icon_win_close("#FFFFFF", 16)
+        self.setIcon(self._normal)
+
+    def enterEvent(self, event):              # noqa: N802
+        self.setIcon(self._hover)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):              # noqa: N802
+        self.setIcon(self._normal)
+        super().leaveEvent(event)
 
 
 class MainWindow(FramelessWindow):
@@ -81,6 +132,12 @@ class MainWindow(FramelessWindow):
         self.jobs.jobStarted.connect(self._refresh_status)
         self.jobs.jobFinished.connect(self._refresh_status)
 
+        # 设置（持久）+ 已保存的缓存库
+        self.app_settings = Settings()
+        self.cache_store = CacheStore(
+            root=self.app_settings.effective_cache_dir(),
+            settings=self.app_settings)
+
         central = QWidget()
         central.setObjectName("root")
         lay = QVBoxLayout(central)
@@ -94,6 +151,7 @@ class MainWindow(FramelessWindow):
         card_lay.setContentsMargins(0, 0, 0, 0)
         card_lay.setSpacing(0)
         self.titlebar = TitleBar(self.card)
+        self.titlebar.settingsRequested.connect(self.open_settings)
         self.badge = UpdateBadge(self.titlebar)
         self.titlebar.set_center_widget(self.badge)
         card_lay.addWidget(self.titlebar)
@@ -104,7 +162,7 @@ class MainWindow(FramelessWindow):
         self.stack = QStackedWidget()
         self.empty = EmptyState()
         self.tabs = QTabWidget()
-        self.tabs.setTabsClosable(True)
+        self.tabs.setTabsClosable(False)   # 关自己画的按钮，见 _install_tab_close
         self.tabs.setMovable(True)
         self.tabs.setDocumentMode(True)
         self.tabs.setElideMode(Qt.ElideRight)
@@ -112,16 +170,23 @@ class MainWindow(FramelessWindow):
         self.tabs.tabBar().setExpanding(False)
         self.tabs.tabCloseRequested.connect(self.close_tab)
         self.tabs.currentChanged.connect(self._on_tab_changed)
+        # 标签页左侧的缓存红绿灯（加载中 / 未缓存 / 已缓存）
+        self.cache_badge = CacheBadge(self.tabs)
+        self.cache_badge.clicked.connect(self._on_cache_badge_clicked)
+        self.tabs.setCornerWidget(self.cache_badge, Qt.TopLeftCorner)
         self.stack.addWidget(self.empty)
         self.stack.addWidget(self.tabs)
         lay.addWidget(self.stack, 1)
         self.setCentralWidget(central)
         self._refresh_stack()
         self._setup_updater()
+        self._setup_usage_timer()
+        self._setup_badge_timer()
         self._refresh_titles()
         self.titlebar.sync_max_button()
         QShortcut(QKeySequence("Ctrl+O"), self, activated=self.open_files)
         QShortcut(QKeySequence("Ctrl+W"), self, activated=self._close_current)
+        QShortcut(QKeySequence("Ctrl+,"), self, activated=self.open_settings)
         for i in range(len(DISPLAY_PRESETS)):
             QShortcut(QKeySequence(f"Ctrl+{i + 1}"), self,
                       activated=lambda n=i: self._pick_size(n))
@@ -140,11 +205,16 @@ class MainWindow(FramelessWindow):
         btn_open.setToolTip("打开一个或多个视频（Ctrl+O）")
         btn_open.clicked.connect(self.open_files)
         btn_dir = QPushButton("添加文件夹")
-        btn_dir.setObjectName("ghost")
-        btn_dir.setToolTip("把一个文件夹里所有视频加进来")
+        btn_dir.setObjectName("hintBorder")
+        btn_dir.setToolTip("把一个文件夹里所有视频加进来（记住上次选的文件夹）")
         btn_dir.clicked.connect(self.open_folder)
+        btn_import = QPushButton("从缓存导入")
+        btn_import.setObjectName("hintBorder")
+        btn_import.setToolTip("从已经保存的缓存里挑一个视频打开（秒开，不重新抽帧）")
+        btn_import.clicked.connect(self.import_from_cache)
         bar.addWidget(btn_open)
         bar.addWidget(btn_dir)
+        bar.addWidget(btn_import)
 
         bar.addSpacing(6)
         bar.addWidget(self._vline())
@@ -152,6 +222,12 @@ class MainWindow(FramelessWindow):
 
         bar.addWidget(QLabel("间隔"))
         self.combo_step = StepCombo(STEP_PRESETS, STEP_PRESETS_FRACTIONAL, DEFAULT_STEP)
+        try:
+            saved_step = float(self.setting.value("ui/step", DEFAULT_STEP))
+        except (TypeError, ValueError):
+            saved_step = DEFAULT_STEP
+        self.combo_step.set_value(max(STEP_MIN, min(STEP_MAX, saved_step)),
+                                  notify=False)
         self.combo_step.setFixedWidth(104)
         self.combo_step.setToolTip(
             "每隔多少帧取一张（可直接输入，支持 23.98 这种小数）\n"
@@ -408,6 +484,176 @@ class MainWindow(FramelessWindow):
             self.titlebar.sync_max_button()
         super().changeEvent(event)
 
+    # ------------------------------------------------------------ 缓存红绿灯
+    def _setup_badge_timer(self):
+        self._badge_timer = QTimer(self)
+        self._badge_timer.setInterval(700)
+        self._badge_timer.timeout.connect(self._refresh_cache_badge)
+        self._badge_timer.start()
+
+    def _refresh_cache_badge(self):
+        badge = getattr(self, "cache_badge", None)
+        if badge is None:
+            return
+        page = self.tabs.currentWidget()
+        if not isinstance(page, TrackPage):
+            badge.set_state("none")
+            return
+        if page.busy or not page._finished:
+            badge.set_state("loading", "正在抽帧 / 加载缓存…\n完成后如果还没保存，图标会变成蓝色")
+            return
+        if page.cache_ready():
+            if self.cache_store.has(page.cache_digest()):
+                badge.set_state("saved")
+            else:
+                badge.set_state(
+                    "ready",
+                    "图墙已加载，但还没保存缓存\n点这里保存到：\n"
+                    f"{self.cache_store.root}")
+        else:
+            badge.set_state("none", "没有可保存的缓存（抽帧失败或已取消）")
+
+    def _on_cache_badge_clicked(self):
+        page = self.tabs.currentWidget()
+        if not isinstance(page, TrackPage):
+            return
+        if self.cache_badge.state_name() != "ready":
+            return
+        self._flush_usage(page)
+        if self._save_page_cache(page):
+            self.lbl_status.setText("✅ 已保存这一页的缓存")
+        else:
+            QMessageBox.warning(
+                self, "保存缓存",
+                "缓存没能保存（目录不可写 / 磁盘空间不足？）。\n"
+                f"目录：{self.cache_store.root}")
+        self._refresh_cache_badge()
+
+    # ------------------------------------------------------------ 设置 / 缓存
+    def open_settings(self):
+        dialog = SettingsDialog(
+            self, settings=self.app_settings, store=self.cache_store,
+            save_now=self._save_rendered_now,
+            check_update=(self.check_updates if update_checks_enabled() else None),
+            load_cache=self.open_cached_entry)
+        dialog.exec()
+        self.cache_store.reload()
+        self.cache_store.prune()
+        self._refresh_cache_badge()
+
+    def _setup_usage_timer(self):
+        """给「自动保存用得多 / 导出过」的策略攒数据：只记当前页签。"""
+        self._usage_timer = QTimer(self)
+        self._usage_timer.setInterval(USAGE_TICK_MS)
+        self._usage_timer.timeout.connect(self._tick_usage)
+        self._usage_timer.start()
+
+    def _tick_usage(self):
+        if not self.isActiveWindow():
+            return
+        page = self.tabs.currentWidget()
+        if isinstance(page, TrackPage):
+            page.used_seconds += USAGE_TICK_MS / 1000.0
+
+    def _flush_usage(self, page):
+        if not isinstance(page, TrackPage):
+            return
+        seconds, exports = page.used_seconds, page.export_count
+        page.used_seconds, page.export_count = 0.0, 0
+        if not seconds and not exports:
+            return
+        try:
+            self.cache_store.record_usage(page.path, seconds, exports)
+        except Exception:      # noqa: BLE001  统计失败不能影响正常使用
+            pass
+
+    def _flush_all_usage(self):
+        for page in list(self._pages):
+            self._flush_usage(page)
+
+    def _save_page_cache(self, page) -> bool:
+        if not isinstance(page, TrackPage) or not page.cache_ready():
+            return False
+        try:
+            ok, _why = self.cache_store.save_dir(
+                page.cache_digest(), page.out_dir, page.cache_entry())
+        except Exception:      # noqa: BLE001
+            return False
+        return ok
+
+    def _save_rendered_now(self):
+        """设置页的「立即保存本次已渲染的视频」。返回 (保存数, 失败数)。"""
+        saved = failed = 0
+        for page in [p for p in self._pages
+                     if isinstance(p, TrackPage) and p.cache_ready()]:
+            self._flush_usage(page)
+            if self._save_page_cache(page):
+                saved += 1
+            else:
+                failed += 1
+        return saved, failed
+
+    def _uncached_pages(self):
+        """本次渲染完成、但持久库里还没有的页签。"""
+        return [p for p in self._pages
+                if isinstance(p, TrackPage) and p.cache_ready()
+                and not self.cache_store.has(p.cache_digest())]
+
+    def _apply_cache_policy(self, cfg: dict, pages) -> tuple[int, int]:
+        """按策略保存；返回 ``(保存数, 失败数)``。"""
+        mode = cfg.get("mode")
+        if mode == CACHE_MODE_NEVER:
+            return 0, 0
+        saved = failed = 0
+        for page in pages:
+            self._flush_usage(page)
+            if mode == CACHE_MODE_USAGE:
+                usage = self.cache_store.usage(page.path)
+                if not usage_meets(cfg, usage):
+                    continue
+            if self._save_page_cache(page):
+                saved += 1
+            else:
+                failed += 1
+        self.cache_store.prune()
+        return saved, failed
+
+    def _handle_close_cache(self) -> bool:
+        """关窗口前处理缓存。返回 False = 用户取消，不要关。"""
+        pages = self._uncached_pages()
+        if not pages:
+            self._flush_all_usage()
+            return True
+        cfg = self.app_settings.cache()
+        if not close_prompt_needed(cfg):
+            self._apply_cache_policy(cfg, pages)
+            self._flush_all_usage()
+            return True
+        dialog = CloseCacheDialog(self, pages, cfg, self.cache_store)
+        if dialog.exec() != QDialog.Accepted:
+            return False
+        values = dialog.values()
+        if dialog.action == "skip":
+            if values.get("skip_close_prompt") != cfg.get("skip_close_prompt"):
+                self.app_settings.update_cache(
+                    skip_close_prompt=values["skip_close_prompt"])
+                self.app_settings.save()
+            self._flush_all_usage()
+            return True
+        merged = dict(cfg)
+        merged.update(values)
+        self.app_settings.update_cache(**values)
+        if not self.app_settings.save():
+            self.lbl_status.setText("⚠ 缓存设置没能保存（目录不可写）")
+        _saved, failed = self._apply_cache_policy(merged, pages)
+        if failed:
+            QMessageBox.warning(
+                self, "保存缓存",
+                f"{failed} 个视频的缓存没能保存（缓存目录不可写 / 磁盘空间不足？）。\n"
+                f"目录：{self.cache_store.root}")
+        self._flush_all_usage()
+        return True
+
     # ------------------------------------------------------------ 设置
     def _step(self) -> float:
         return float(self.combo_step.value())
@@ -433,6 +679,10 @@ class MainWindow(FramelessWindow):
             self.titlebar.set_subtitle(self._subtitle(self._step()))
 
     def _on_step_changed(self, v):
+        try:
+            self.setting.setValue("ui/step", float(v))
+        except (TypeError, ValueError):
+            pass
         self._refresh_titles()
 
     # ------------------------------------------------------------ 抽帧方式
@@ -524,6 +774,7 @@ class MainWindow(FramelessWindow):
         self.setting.setValue("ui/sidebar_width", width)
 
     def _refresh_status(self, *_args):
+        self._refresh_cache_badge()
         running = self.jobs.running_count
         pending = self.jobs.pending_count
         if not running and not pending:
@@ -577,23 +828,112 @@ class MainWindow(FramelessWindow):
         self.add_videos(found)
 
     # ------------------------------------------------------------ 打开
+    def _last_dir(self, key: str, fallback: str = "") -> str:
+        """上次用过的目录（不存在就退回兜底 / 用户目录）。"""
+        for candidate in (key, fallback):
+            if not candidate:
+                continue
+            value = str(self.setting.value(candidate, "") or "")
+            if not value:
+                continue
+            try:
+                if Path(value).is_dir():
+                    return value
+            except OSError:
+                continue
+        return str(Path.home())
+
+    def _remember_dir(self, key: str, path) -> None:
+        try:
+            folder = Path(path)
+            if folder.is_file():
+                folder = folder.parent
+            if folder.is_dir():
+                self.setting.setValue(key, str(folder))
+        except OSError:
+            pass
+
     def open_files(self):
         pattern = "视频文件 (" + " ".join("*" + x for x in sorted(VIDEO_EXTS)) + ");;所有文件 (*.*)"
-        files, _ = QFileDialog.getOpenFileNames(self, "选择视频", "", pattern)
+        start = self._last_dir("paths/last_file_dir", "paths/last_folder_dir")
+        files, _ = QFileDialog.getOpenFileNames(self, "选择视频", start, pattern)
         if files:
+            self._remember_dir("paths/last_file_dir", files[0])
             self.add_videos([Path(f) for f in files])
 
     def open_folder(self):
-        d = QFileDialog.getExistingDirectory(self, "选择文件夹（含视频）")
+        start = self._last_dir("paths/last_folder_dir", "paths/last_file_dir")
+        d = QFileDialog.getExistingDirectory(self, "选择文件夹（含视频）", start)
         if d:
+            self._remember_dir("paths/last_folder_dir", d)
             vids = find_videos(Path(d))
             if not vids:
                 QMessageBox.information(self, APP_NAME, "该文件夹里没有找到视频文件。")
                 return
             self.add_videos(vids)
 
+    # ------------------------------------------------------- 从缓存导入
+    def import_from_cache(self):
+        """列出已保存的缓存，选一条直接打开对应视频（不重新抽帧）。"""
+        if not sorted_entries(self.cache_store):
+            QMessageBox.information(
+                self, "从缓存导入",
+                "还没有保存过缓存。\n\n"
+                "打开视频后，标签页左边的红绿灯变成蓝色时点一下就能保存。")
+            return
+        CacheImportDialog(self, self.cache_store, self.open_cached_entry).exec()
+
+    def open_cached_entry(self, entry: dict) -> bool:
+        """按缓存条目里的设置打开原视频（命中持久缓存 -> 秒开）。"""
+        video = Path(str(entry.get("video") or ""))
+        if not video.is_file():
+            QMessageBox.warning(
+                self, "从缓存导入",
+                f"原视频不在了：\n{video}\n\n"
+                "这条缓存可以到 设置-缓存 → 缓存条目 里删除。")
+            return False
+        try:
+            info = probe(video)
+        except Exception as e:  # noqa: BLE001
+            self.lbl_status.setText(f"⚠ {video.name}：{e}")
+            return False
+        for existing in self._pages:
+            try:
+                if existing.path.resolve() == video.resolve():
+                    self.tabs.setCurrentWidget(existing)
+                    return True
+            except OSError:
+                continue
+        try:
+            step = max(STEP_MIN, min(STEP_MAX, float(entry.get("step") or DEFAULT_STEP)))
+        except (TypeError, ValueError):
+            step = DEFAULT_STEP
+        threshold = None
+        if entry.get("mode") == "scene":
+            try:
+                threshold = max(0.01, min(0.99, float(entry.get("threshold") or 0.30)))
+            except (TypeError, ValueError):
+                threshold = 0.30
+        try:
+            tw = int(entry.get("tw") or 0)
+            th = int(entry.get("th") or 0)
+        except (TypeError, ValueError):
+            tw = th = 0
+        if tw <= 0 or th <= 0:
+            tw, th = self._thumb_size_for(info)
+        page = TrackPage(video, step, tw, th, info, self.jobs,
+                         display_side=self._display_side,
+                         scene_threshold=threshold,
+                         store=self.cache_store)
+        if not self._insert_page(page):
+            return False
+        self._refresh_cache_badge()
+        return True
+
     def add_videos(self, paths):
         paths = [Path(p) for p in paths]
+        if paths:
+            self._remember_dir("paths/last_file_dir", paths[0])
         seen = {str(p.path.resolve()).lower() for p in self._pages}
         prog = None
         if len(paths) > 8:
@@ -649,17 +989,24 @@ class MainWindow(FramelessWindow):
                     return False
         page = TrackPage(path, step, tw, th, info, self.jobs,
                          display_side=self._display_side,
-                         scene_threshold=threshold)
+                         scene_threshold=threshold,
+                         store=self.cache_store)
+        return self._insert_page(page, index=index)
+
+    def _insert_page(self, page: TrackPage, index: int | None = None) -> bool:
+        """把已经建好的 TrackPage 接进标签栏并开始加载。"""
         page.reload_requested.connect(self._on_reload)
         page.display_side_changed.connect(self._on_page_display_side)
         page.split.splitterMoved.connect(self._on_splitter_moved)
         page.set_sidebar_width(self._sidebar_width)
-        name = path.name if len(path.name) <= 28 else path.name[:26] + "…"
+        name = page.path.name if len(page.path.name) <= 28 \
+            else page.path.name[:26] + "…"
         if index is None:
             idx = self.tabs.addTab(page, name)
         else:
             idx = self.tabs.insertTab(index, page, name)
-        self.tabs.setTabToolTip(idx, str(path))
+        self.tabs.setTabToolTip(idx, str(page.path))
+        self._install_tab_close(idx, page)
         self._pages.append(page)
         if index is None:
             self.tabs.setCurrentIndex(idx)
@@ -667,7 +1014,28 @@ class MainWindow(FramelessWindow):
         page.start()
         self._refresh_stack()
         self._refresh_status()
+        self._refresh_cache_badge()
         return True
+
+    def _install_tab_close(self, index: int, page: TrackPage):
+        """每个标签右侧一个自绘关闭按钮（用 36px 容器把它往左让出 18px）。"""
+        holder = QWidget()
+        holder.setObjectName("tabCloseHolder")
+        holder.setFixedWidth(36)
+        row = QHBoxLayout(holder)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(0)
+        button = TabCloseButton(holder)
+        button.setToolTip("关闭这个标签页（Ctrl+W）")
+        button.clicked.connect(lambda _=False, p=page: self._close_page(p))
+        row.addWidget(button, 0, Qt.AlignLeft | Qt.AlignVCenter)
+        row.addStretch(1)
+        self.tabs.tabBar().setTabButton(index, QTabBar.RightSide, holder)
+
+    def _close_page(self, page: TrackPage):
+        index = self.tabs.indexOf(page)
+        if index >= 0:
+            self.close_tab(index)
 
     def _forget_page(self, page):
         if page in self._pages:
@@ -687,6 +1055,7 @@ class MainWindow(FramelessWindow):
         page = self.tabs.widget(index)
         if page is None:
             return
+        self._flush_usage(page)
         try:
             page.shutdown()
         except Exception:  # noqa: BLE001
@@ -716,6 +1085,7 @@ class MainWindow(FramelessWindow):
                     pass
         if isinstance(cur, TrackPage):
             self._sync_size_combo(cur.display_side)
+        self._refresh_cache_badge()
 
     def _refresh_stack(self):
         self.stack.setCurrentWidget(self.tabs if self.tabs.count() else self.empty)
@@ -726,7 +1096,34 @@ class MainWindow(FramelessWindow):
             return
         super().keyPressEvent(e)
 
+    def restore_geometry(self) -> bool:
+        """恢复上一次的窗口大小 / 位置（超出所有屏幕就放弃，用默认尺寸）。"""
+        state = self.setting.value("ui/window_geometry")
+        if not isinstance(state, QByteArray) or state.isEmpty():
+            return False
+        try:
+            self.restoreGeometry(state)
+        except RuntimeError:
+            return False
+        screens = QApplication.screens() or []
+        if screens and not any(s.availableGeometry().intersects(self.frameGeometry())
+                               for s in screens):
+            return False
+        maximized = self.setting.value("ui/window_maximized", False)
+        if maximized is True or str(maximized).lower() in ("1", "true", "yes"):
+            self.showMaximized()
+        return True
+
     def closeEvent(self, e):
+        if not self._handle_close_cache():
+            e.ignore()
+            return
+        try:
+            self.setting.setValue("ui/window_geometry", self.saveGeometry())
+            self.setting.setValue("ui/window_maximized", self.isMaximized())
+            self.setting.sync()
+        except (RuntimeError, OSError):
+            pass
         for page in list(self._pages):
             try:
                 page.shutdown()

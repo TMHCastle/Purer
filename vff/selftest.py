@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import tempfile
 import time
@@ -34,6 +35,9 @@ def run(app) -> int:
     from .ui.main_window import MainWindow
 
     tmp = Path(tempfile.mkdtemp(prefix="purer_selftest_"))
+    # 自检不能动用户真实的「设置 / 已保存缓存」
+    os.environ["PURER_DATA_DIR"] = str(tmp / "data")
+    os.environ["PURER_PERSIST_CACHE_DIR"] = str(tmp / "cache")
     log: list[str] = []
     ok = True
     try:
@@ -89,6 +93,9 @@ def run(app) -> int:
 
         # ---- 界面渲染 ----
         win = MainWindow()
+        # 自检最后要自动关窗：不弹「保存缓存」提示，也不写任何缓存
+        # （「所有缓存都不自动保存」按设计每次都会提示，所以这里用 usage + 不再提醒）
+        win.app_settings.update_cache(skip_close_prompt=True, mode="usage")
         # 自检要可复现：不读机器上「抽帧方式」的设置（可能是按镜头）
         for i in range(win.combo_mode.count()):
             if win.combo_mode.itemData(i) == "step":

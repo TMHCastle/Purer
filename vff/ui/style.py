@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import math
+
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import (QColor, QIcon, QPainter, QPalette, QPen, QPixmap)
 
@@ -89,6 +91,24 @@ def icon_photo(color: str = DIM, size: int = 18) -> QIcon:
     return QIcon(_icon_pix(size, draw))
 
 
+def icon_gear(color: str = DIM, size: int = 18) -> QIcon:
+    """齿轮：设置入口。"""
+    def draw(p: QPainter):
+        pen = QPen(QColor(color), 1.3)
+        pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        center = QPointF(9.0, 9.0)
+        p.drawEllipse(center, 4.6, 4.6)
+        p.drawEllipse(center, 1.7, 1.7)
+        for i in range(8):
+            angle = math.radians(i * 45.0)
+            cos_a, sin_a = math.cos(angle), math.sin(angle)
+            p.drawLine(QPointF(9 + cos_a * 5.0, 9 + sin_a * 5.0),
+                       QPointF(9 + cos_a * 7.1, 9 + sin_a * 7.1))
+    return QIcon(_icon_pix(size, draw))
+
+
 # --------------------------------------------------- 自绘标题栏的窗口按钮图标
 def _win_icon(draw, color: str, size: int = 16) -> QIcon:
     return QIcon(_icon_pix(size, lambda p: draw(p, QColor(color))))
@@ -153,6 +173,13 @@ def make_icon() -> QIcon:
     return QIcon(pm)
 
 
+def apply_theme(app) -> None:
+    """统一入口：Fusion + 深色调色板 + 全局样式表。"""
+    app.setStyle("Fusion")
+    app.setPalette(dark_palette())
+    app.setStyleSheet(DARK_QSS)
+
+
 DARK_QSS = f"""
 QWidget {{
     color:{TEXT};
@@ -192,6 +219,28 @@ QLabel#verChip {{
     background:#2C3448; color:#8FA6E8; border-radius:3px;
     padding:1px 6px; font-family:{MONO}; font-size:8pt;
 }}
+QPushButton#gearBtn {{
+    background:#2C3448; color:#A9BAEA; border:1px solid transparent;
+    border-radius:4px; padding:0 7px; font-size:8.4pt;
+    min-height:21px; max-height:21px;
+}}
+QPushButton#gearBtn:hover {{ background:#354060; color:#FFFFFF; border-color:#4A5570; }}
+QPushButton#gearBtn:pressed {{ background:#283143; }}
+QFrame#cfgCard {{
+    background:#1D2027; border:1px solid #2C3240; border-radius:8px;
+}}
+QWidget#cfgBody, QScrollArea#cfgScroll {{ background:transparent; border:none; }}
+QLabel#cfgHead {{ color:{TEXT}; font-size:9.6pt; font-weight:600; }}
+QLabel#cfgKey {{ color:#7E879A; font-size:8.8pt; }}
+QLabel#cfgVal {{ color:#C9CFDA; font-size:8.8pt; }}
+QLabel#cfgNote {{ color:#6E7686; font-size:8.4pt; }}
+QRadioButton {{ color:#C8CCD2; spacing:8px; padding:2px 0; }}
+QRadioButton::indicator {{
+    width:14px; height:14px; border-radius:7px;
+    border:1px solid {BORDER}; background:#1B1F27;
+}}
+QRadioButton::indicator:checked {{ background:{ACCENT}; border-color:{ACCENT}; }}
+QRadioButton::indicator:disabled {{ background:#232830; border-color:#2D333F; }}
 QFrame#vline {{ background:#2E3440; max-width:1px; min-width:1px; border:none; }}
 QFrame#hline {{ background:#2E3440; max-height:1px; min-height:1px; border:none; }}
 
@@ -235,6 +284,16 @@ QPushButton#ghost {{
 }}
 QPushButton#ghost:hover {{ background:{PANEL2}; color:{TEXT}; }}
 QPushButton#ghost:disabled {{ background:transparent; color:#4E5563; }}
+/* 默认没有样式的文字按钮：加一圈白色圆角外框，提示「这里可以点」 */
+QPushButton#hintBorder {{
+    background:transparent; color:{DIM}; padding:0 8px;
+    border:1px solid #FFFFFF; border-radius:{RADIUS_BUTTON}px;
+}}
+QPushButton#hintBorder:hover {{
+    background:{PANEL2}; color:{TEXT}; border-color:#FFFFFF;
+}}
+QPushButton#hintBorder:pressed {{ background:#252A33; }}
+QPushButton#hintBorder:disabled {{ color:#4E5563; border-color:#3A4150; }}
 
 QPushButton#danger {{ color:#B9BFCB; }}
 QPushButton#danger:hover {{ background:#3A2A2E; color:{DANGER}; border-color:#5A3A40; }}
@@ -276,6 +335,13 @@ QSpinBox, QComboBox {{
     selection-background-color:{ACCENT}; selection-color:#0E1116;
 }}
 QSpinBox:hover, QComboBox:hover {{ border-color:#414B5E; }}
+QLineEdit {{
+    background:{TOOLBAR}; border:1px solid {BORDER}; border-radius:{RADIUS_BUTTON}px;
+    padding:0 8px; min-height:{CTRL_H - 4}px; color:{TEXT};
+    selection-background-color:{ACCENT}; selection-color:#0E1116;
+}}
+QLineEdit:hover {{ border-color:#414B5E; }}
+QLineEdit:focus {{ border-color:{ACCENT}; }}
 QSpinBox:focus, QComboBox:focus {{ border-color:{ACCENT}; }}
 QSpinBox::up-button, QSpinBox::down-button {{ width:14px; background:transparent; border:none; }}
 QComboBox::drop-down {{ border:none; width:18px; }}
@@ -289,17 +355,35 @@ QComboBox QAbstractItemView {{
 QTabWidget::pane {{ border:none; background:transparent; }}
 QTabBar {{ background:transparent; }}
 QTabBar::tab {{
-    background:#1C1F26; color:{DIM};
-    border:1px solid #262B35; border-bottom:none;
-    border-top-left-radius:{RADIUS_PANEL}px; border-top-right-radius:{RADIUS_PANEL}px;
-    padding:6px 14px; margin-right:4px; margin-top:2px; min-height:24px;
+    background:#1B1F27; color:{DIM};
+    border:1px solid #252A33;
+    border-radius:9px;
+    padding:6px 12px;
+    margin:3px 6px 3px 0;
+    min-height:22px;
+}}
+QTabBar::tab:hover:!selected {{
+    background:#252A33; color:#D5DAE3; border-color:#343A46;
 }}
 QTabBar::tab:selected {{
-    background:{PANEL}; color:{TEXT};
-    border-color:{BORDER}; border-top:2px solid {ACCENT};
+    background:#2D3442; color:#FFFFFF; border-color:#4A5570;
 }}
-QTabBar::tab:hover:!selected {{ background:#20242C; color:#C9CFDA; }}
-QTabBar QToolButton {{ background:{PANEL2}; border:1px solid {BORDER}; border-radius:4px; }}
+QTabBar::tab:selected:hover {{ background:#333B4C; }}
+QTabBar::tab:disabled {{ color:#5B6270; border-color:#222730; }}
+QTabBar QToolButton {{
+    background:#1B1F27; border:1px solid #252A33; border-radius:7px;
+    margin:3px 2px; min-width:22px; max-width:22px;
+}}
+QTabBar QToolButton:hover {{ background:#2B303A; border-color:#3A4150; }}
+QTabBar QToolButton:pressed {{ background:#252A33; }}
+/* 自绘的标签关闭按钮（比系统默认的灰叉好看，也方便往左让位） */
+QWidget#tabCloseHolder {{ background:transparent; }}
+QPushButton#tabClose {{
+    background:transparent; border:none; border-radius:9px; padding:0;
+    min-width:18px; max-width:18px; min-height:18px; max-height:18px;
+}}
+QPushButton#tabClose:hover {{ background:#3A2A2E; }}
+QPushButton#tabClose:pressed {{ background:#8E3B42; }}
 
 /* ------------------------------------------------------------ 图墙 */
 QListView {{
@@ -308,6 +392,19 @@ QListView {{
     border-radius:{RADIUS_PANEL}px;
     outline:none;
 }}
+
+/* ------------------------------------------------------------ 缓存条目表 */
+QTableWidget#cacheTable {{
+    background:#14171C; border:1px solid #262B35; border-radius:6px;
+    gridline-color:#262B35; selection-background-color:#2C3448;
+    selection-color:#FFFFFF;
+}}
+QTableWidget#cacheTable::item {{ padding:3px 6px; }}
+QHeaderView::section {{
+    background:#1B1F27; color:{DIM}; border:none;
+    border-bottom:1px solid #2C3240; padding:5px 8px; font-size:8.6pt;
+}}
+QTableCornerButton::section {{ background:#1B1F27; border:none; }}
 
 /* ------------------------------------------------------------ 片段列表 */
 QScrollArea#segScroll {{ background:transparent; border:none; }}
@@ -322,6 +419,7 @@ QLabel#segNum {{
     color:{ACCENT}; font-family:{MONO}; font-size:9pt; font-weight:600;
 }}
 QLabel#segMain {{ font-family:{MONO}; color:{TEXT}; font-size:9pt; }}
+QLabel#segName {{ color:{TEXT}; font-size:8.9pt; }}
 QLabel#segDur {{ font-family:{MONO}; color:{DIM}; font-size:8.4pt; }}
 QPushButton#segDel {{
     background:transparent; border:none; color:#6E7686;

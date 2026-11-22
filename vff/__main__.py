@@ -131,6 +131,11 @@ def cmd_where() -> int:
     if Tools.ffmpeg is None:
         _p("（标准位置没找到；启动界面时会自动扫盘，或手动放一个 ffmpeg.ini）")
     _p(f"缓存目录: {cache_root()}")
+    from .config import settings_file
+    from .settings import Settings
+    app_settings = Settings()
+    _p(f"已保存缓存: {app_settings.effective_cache_dir()}")
+    _p(f"设置文件: {settings_file()}")
     _p(f"程序目录: {app_dir()}")
     bundle = bundle_dir()
     if bundle is not None:
@@ -433,7 +438,7 @@ def main(argv: list[str] | None = None) -> int:
 
     from .ui.ffmpeg_missing import ensure_ffmpeg
     from .ui.main_window import MainWindow
-    from .ui.style import DARK_QSS, dark_palette
+    from .ui.style import apply_theme
 
     # 窗口版没有控制台：未捕获异常（含 Qt 槽函数里的）落到 %TEMP%\Purer_cache\error.log
     install_crash_log()
@@ -443,9 +448,7 @@ def main(argv: list[str] | None = None) -> int:
     QLocale.setDefault(QLocale.c())
     QApplication.setApplicationName(APP_NAME)
     app = QApplication([sys.argv[0] or APP_NAME])
-    app.setStyle("Fusion")
-    app.setPalette(dark_palette())
-    app.setStyleSheet(DARK_QSS)
+    apply_theme(app)
 
     if mode == "selftest":
         from .selftest import run
@@ -464,7 +467,8 @@ def main(argv: list[str] | None = None) -> int:
     except Exception:      # noqa: BLE001  删不掉不影响使用
         pass
     screen = app.primaryScreen()
-    if screen is not None:
+    restored = win.restore_geometry()
+    if not restored and screen is not None:
         g = screen.availableGeometry()
         win.resize(min(1480, int(g.width() * 0.94)), min(900, int(g.height() * 0.92)))
         win.move(g.center() - win.rect().center())

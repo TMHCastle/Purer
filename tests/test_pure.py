@@ -441,6 +441,17 @@ class TestFfmpegLocation(unittest.TestCase):
                     os.environ["PURER_FFMPEG_DIR"] = old
 
 
+class TestToolVersion(unittest.TestCase):
+    def test_parse_tool_version(self):
+        self.assertEqual(
+            ffmpeg.parse_tool_version(
+                "ffmpeg version 8.1.3-full_build-www.gyan.dev Copyright (c) 2000-2025"),
+            "8.1.3-full_build-www.gyan.dev")
+        self.assertEqual(ffmpeg.parse_tool_version("ffprobe version n7.1"), "n7.1")
+        self.assertEqual(ffmpeg.parse_tool_version(""), "")
+        self.assertEqual(ffmpeg.parse_tool_version("nonsense"), "nonsense")
+
+
 class TestVersions(unittest.TestCase):
     """检查更新：只比数字；查不到绝不能报「已是最新」。"""
 

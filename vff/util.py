@@ -35,11 +35,14 @@ def human_size(n: float | int | None) -> str:
     return f"{n:.1f} TB"
 
 
-def safe_filename(name: str) -> str:
-    """去掉 Windows 文件名非法字符（保留中文），并把连续替换符合并。"""
+def safe_filename(name: str, fallback: str = "output") -> str:
+    """去掉 Windows 文件名非法字符（保留中文），并把连续替换符合并。
+
+    ``fallback=""`` 时，什么都不剩就返回空串（用于「用户没填名字」的场景）。
+    """
     cleaned = _ILLEGAL.sub("-", name)
     cleaned = re.sub(r"-{2,}", "-", cleaned).strip(" .-")
-    return cleaned or "output"
+    return cleaned or fallback
 
 
 def parse_time_arg(text: str) -> float:

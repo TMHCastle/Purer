@@ -12,7 +12,7 @@ from pathlib import Path
 APP_NAME = "Purer"
 APP_TAGLINE = "视频抽帧浏览 / 帧精确切片"
 APP_ID = "Purer"
-APP_VERSION = "1.1.8"
+APP_VERSION = "1.1.9"
 # 「检查更新」查的是这里（公开仓库，只读 API，不需要 token）
 GITHUB_REPO = "TMHCastle/Purer"
 
@@ -83,6 +83,13 @@ MAX_THUMBS_WARN = 4000
 PREVIEW_DEBOUNCE_MS = 140
 JOBS_MAX_CONCURRENT = 1
 
+# 持久缓存（「保存下来的图墙」）默认上限 = 所在磁盘总量的这个比例。
+# 用户可以在 设置-缓存 里改；这里只是「没设过」时的默认值。
+CACHE_LIMIT_FRACTION = 0.005
+CACHE_LIMIT_MIN = 256 * 1024 * 1024        # 256 MB
+CACHE_LIMIT_MAX = 8 * 1024 * 1024 * 1024   # 8 GB
+
+
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
 
@@ -100,11 +107,67 @@ def bundle_dir() -> Path | None:
 
 
 def cache_root() -> Path:
-    """缩略图缓存根目录。PURER_CACHE_DIR 可覆盖（测试/便携用）。"""
+    """缩略图缓存根目录。PURER_CACHE_DIR 可覆盖（测试/便携用）。
+
+    这是「本次渲染用的临时目录」：同一视频同设置重开会秒开，
+    但重启电脑 / 清理临时文件后就没了。要跨重启保留请用
+    :func:`persistent_cache_root`（设置-缓存 里管理）。
+    """
     override = os.environ.get("PURER_CACHE_DIR")
     if override:
         return Path(override)
     return Path(tempfile.gettempdir()) / f"{APP_ID}_cache"
+
+
+def data_dir() -> Path:
+    """持久数据目录（设置文件 + 缓存不可写时的兜底）。
+
+    ``%LOCALAPPDATA%\\Purer``；``PURER_DATA_DIR`` 可覆盖（测试 / 便携用）。
+    故意不放在临时目录，也不默认放在 exe 旁边 —— 设置文件要保证可写。
+    """
+    override = os.environ.get("PURER_DATA_DIR")
+    if override:
+        return Path(override)
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        return Path(local) / APP_ID
+    return Path.home() / f".{APP_ID.lower()}"
+
+
+_PERSIST_ROOT: Path | None = None
+
+
+def settings_file() -> Path:
+    """应用设置（自动保存策略 / 缓存上限 / 关闭提醒开关…）的唯一文件。"""
+    override = os.environ.get("PURER_SETTINGS_FILE")
+    if override:
+        return Path(override)
+    return data_dir() / "settings.json"
+
+
+def persistent_cache_root() -> Path:
+    """默认缓存位置：**Purer 同目录**下的 ``cache``（exe / 源码根旁边）。
+
+    ``PURER_PERSIST_CACHE_DIR`` 可覆盖；程序目录不可写（例如装在
+    ``Program Files``）时自动退回用户数据目录，不让「保存缓存」整块失效。
+    """
+    global _PERSIST_ROOT
+    override = os.environ.get("PURER_PERSIST_CACHE_DIR")
+    if override:
+        return Path(override)
+    if _PERSIST_ROOT is not None:
+        return _PERSIST_ROOT
+    candidate = app_dir() / "cache"
+    chosen = candidate
+    try:
+        candidate.mkdir(parents=True, exist_ok=True)
+        probe = candidate / ".purer_write_test"
+        probe.write_bytes(b"")
+        probe.unlink()
+    except OSError:
+        chosen = data_dir() / "cache"
+    _PERSIST_ROOT = chosen
+    return chosen
 
 
 def ffmpeg_ini() -> Path:

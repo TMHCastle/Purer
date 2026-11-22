@@ -20,15 +20,16 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QFileDialog, QMe
                                QMessageBox, QSplitter, QVBoxLayout, QWidget)
 
 from .. import ffmpeg, scenedetect, smartcut
-from ..cache import cache_dir_for
+from ..cache import cache_dir_for, cache_digest
 from ..config import (DEFAULT_DISPLAY_SIDE, DISPLAY_MAX, DISPLAY_MIN, DISPLAY_STEP,
                       cache_root, preset_label)
+from ..export_names import existing_names, plan_filenames
 from ..jobs import Job, JobQueue
 from ..media import MediaInfo, thumb_size_for
 from ..scenedetect import SceneSampler
 from ..timeline import SceneTimeline, StepTimeline
 from ..util import fmt_tc, fmt_tc_compact, human_size, safe_filename
-from .dialogs import ask_export, show_log
+from .dialogs import ask_batch_export, ask_export, show_log
 from .filmstrip import PLAY_FPS, FilmStrip, PlayClip
 from .images import jpeg_ready
 from .sidebar import SIDEBAR_MAX, SIDEBAR_MIN, EditSidebar
@@ -42,7 +43,7 @@ class TrackPage(QWidget):
 
     def __init__(self, path: Path, step: int, tw: int, th: int, info: MediaInfo,
                  queue: JobQueue, parent=None, display_side: int | None = None,
-                 scene_threshold: float | None = None):
+                 scene_threshold: float | None = None, store=None):
         super().__init__(parent)
         self.path = Path(path)
         self.step = float(step)
@@ -63,6 +64,10 @@ class TrackPage(QWidget):
                                                   self.display_side)
         self.info = info
         self.queue = queue
+        self.store = store                      # 持久缓存库（MainWindow 传进来）
+        self.cache_source = ""                  # "temp" / "persistent" / "new"
+        self.used_seconds = 0.0                 # 本次会话里这个页签被使用的时间
+        self.export_count = 0                   # 本次会话成功导出的次数
 
         self.out_dir: Path | None = None
         self.total = 0
@@ -286,7 +291,12 @@ class TrackPage(QWidget):
         self.playclip.ready.connect(self._on_play_ready)
         self.playclip.failed.connect(self._on_play_failed)
         if (self.out_dir / ".done").exists() and self._load_cache():
+            self.cache_source = "temp"
+            self._touch_persistent_hit()
             return
+        if self._load_persistent_cache():
+            return
+        self.cache_source = "new"
         shutil.rmtree(self.out_dir, ignore_errors=True)
         try:
             self.out_dir.mkdir(parents=True, exist_ok=True)
@@ -446,6 +456,73 @@ class TrackPage(QWidget):
     @property
     def exporting(self) -> bool:
         return self.exp_job is not None
+
+    # ------------------------------------------------- 持久缓存（保存下来的图墙）
+    def cache_digest(self) -> str:
+        """这个视频 + 这组设置的缓存 id（临时目录名 / 持久库条目 id）。"""
+        return cache_digest(self.path, self.step, self.tw, self.th,
+                            mode=self.mode, threshold=self.threshold)
+
+    def cache_ready(self) -> bool:
+        """本次抽帧已经完成（图墙完整），可以存进持久库。"""
+        if not self.out_dir or not self._finished or not self._result_ok:
+            return False
+        if self.model.rowCount() <= 0:
+            return False
+        try:
+            return (self.out_dir / ".done").is_file()
+        except OSError:
+            return False
+
+    def cache_entry(self) -> dict:
+        """给持久库的元信息。"""
+        try:
+            stat = self.path.stat()
+            size, mtime = stat.st_size, int(stat.st_mtime)
+        except OSError:
+            size, mtime = 0, 0
+        return {
+            "video": str(self.path),
+            "video_size": size,
+            "video_mtime": mtime,
+            "mode": self.mode,
+            "step": self.step if self.mode != "scene" else None,
+            "threshold": self.threshold if self.mode == "scene" else None,
+            "tw": self.tw,
+            "th": self.th,
+            "frames": int(self.info.frames or 0),
+        }
+
+    def _load_persistent_cache(self) -> bool:
+        """临时目录没有、但持久库里有 -> 恢复一份进来（硬链接，几乎瞬间）。"""
+        if self.store is None or self.out_dir is None:
+            return False
+        digest = self.cache_digest()
+        if not self.store.has(digest):
+            return False
+        shutil.rmtree(self.out_dir, ignore_errors=True)
+        try:
+            self.out_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return False
+        if not self.store.materialize(digest, self.out_dir):
+            shutil.rmtree(self.out_dir, ignore_errors=True)
+            return False
+        if not self._load_cache():
+            shutil.rmtree(self.out_dir, ignore_errors=True)
+            return False
+        self.cache_source = "persistent"
+        self.lbl_count.setToolTip("来自已保存的缓存（下次打开同样能直接加载）")
+        return True
+
+    def _touch_persistent_hit(self):
+        """临时缓存命中也算「用过这个保存的缓存」，让 LRU 更准确。"""
+        if self.store is None:
+            return
+        try:
+            self.store.touch(self.cache_digest())
+        except Exception:      # noqa: BLE001  统计失败不能影响看片
+            pass
 
     def _load_cache(self) -> bool:
         files = sorted(self.out_dir.glob("f_*.jpg"))
@@ -942,7 +1019,8 @@ class TrackPage(QWidget):
 
     def _refresh_segments(self):
         self.side.set_segments([
-            (s["t_in"], s["t_end"], self._thumb_for_time(s["t_in"]))
+            (s["t_in"], s["t_end"], self._thumb_for_time(s["t_in"]),
+             str(s.get("name") or ""))
             for s in self.segments])
 
     def _thumb_for_time(self, t: float) -> str | None:
@@ -1002,7 +1080,8 @@ class TrackPage(QWidget):
             self.side.set_export_text("先设好入点/出点（I/O 或 Shift 框两帧），再加入片段")
             return
         fps = self._fps()
-        item = {"t_in": self.in_frame / fps, "t_end": self.out_frame / fps}
+        item = {"t_in": self.in_frame / fps, "t_end": self.out_frame / fps,
+                "name": ""}
         for existing in self.segments:
             if (abs(existing["t_in"] - item["t_in"]) < 1e-6
                     and abs(existing["t_end"] - item["t_end"]) < 1e-6):
@@ -1385,6 +1464,7 @@ class TrackPage(QWidget):
             + (f" · {info_text}" if info_text else ""))
         self.btn_reveal.setVisible(True)
         self._export_text = self.lbl_export.text()
+        self.export_count += 1
 
     def _reveal_output(self):
         if self.exp_out is None:
@@ -1409,33 +1489,46 @@ class TrackPage(QWidget):
         except Exception:  # noqa: BLE001
             smart = None
 
-        detail = [f"共 {len(self.segments)} 段 → {out_dir}"]
-        for i, segment in enumerate(self.segments[:8]):
-            count = max(1, round((segment['t_end'] - segment['t_in']) * (self.info.fps or 25.0)))
-            detail.append(
-                f"  #{i + 1}  {fmt_tc(segment['t_in'])} → {fmt_tc(segment['t_end'])}"
+        rows = []
+        for segment in self.segments:
+            count = max(1, round((segment['t_end'] - segment['t_in'])
+                                 * (self.info.fps or 25.0)))
+            rows.append(
+                f"{fmt_tc(segment['t_in'])} → {fmt_tc(segment['t_end'])}"
                 f"（{count} 帧 / {count / (self.info.fps or 25.0):.2f} 秒）")
-        if len(self.segments) > 8:
-            detail.append(f"  …… 共 {len(self.segments)} 段")
-        detail.append("每段都会单独校验；某一段失败不影响其它段。")
-        ok, exact = ask_export(
-            self, f"导出全部 {len(self.segments)} 段？", "\n".join(detail),
+        defaults = plan_filenames([""] * len(self.segments), self.path.stem,
+                                  self.path.suffix, existing_names(Path(out_dir)))
+        ok, exact, texts = ask_batch_export(
+            self, f"导出全部 {len(self.segments)} 段",
+            rows,
+            [str(segment.get("name") or "") for segment in self.segments],
+            defaults,
             exact_available=bool(smart and smart.mode == "smart"),
             exact_note=(smart.reason if smart and smart.mode != "smart"
-                        else "只重编码每段的切点，中段保持原始码流"))
+                        else "只重编码每段的切点，中段保持原始码流"),
+            folder=out_dir)
         if not ok:
             return
-        self._batch_start(Path(out_dir), exact)
+        for i, text in enumerate(texts):
+            if i < len(self.segments):
+                self.segments[i]["name"] = str(text or "").strip()
+        self._batch_start(Path(out_dir), exact, names=texts)
 
-    def _batch_start(self, out_dir: Path, exact: bool):
+    def _batch_start(self, out_dir: Path, exact: bool, names=None):
+        """``names`` = 用户手填的素材名（可以是空串 / 可以不带扩展名）。"""
+        texts = [str(x or "") for x in names] if names else []
+        if len(texts) < len(self.segments):
+            texts.extend([""] * (len(self.segments) - len(texts)))
+        filenames = plan_filenames(texts, self.path.stem, self.path.suffix,
+                                   existing_names(out_dir))
         items = []
         for i, segment in enumerate(self.segments):
-            out = out_dir / (f"{safe_filename(self.path.stem)}_seg{i + 1:02d}_"
-                             f"{fmt_tc_compact(segment['t_in'])}-"
-                             f"{fmt_tc_compact(segment['t_end'])}{self.path.suffix}")
+            name = Path(filenames[i]).name
+            out = out_dir / name
             items.append({"t_in": segment["t_in"], "t_end": segment["t_end"],
-                          "out": out, "label": f"seg{i + 1:02d}", "ok": None,
-                          "error": "", "cut": None, "temp": [], "fallback": False})
+                          "out": out, "label": f"#{i + 1}", "name": name,
+                          "ok": None, "error": "", "cut": None, "temp": [],
+                          "fallback": False})
         self._batch = {"items": items, "index": 0, "exact": exact,
                        "src": self.path, "info": self.info, "dir": out_dir,
                        "norm_dir": None}
@@ -1562,6 +1655,7 @@ class TrackPage(QWidget):
                 self._batch_fallback(item, why)
                 return
         item["ok"] = True
+        self.export_count += 1
         smartcut.cleanup(item["temp"])
         self._batch_advance()
 

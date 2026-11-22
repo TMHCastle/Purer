@@ -20,6 +20,10 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ["PURER_NO_UPDATE"] = "1"        # 冒烟测试不联网
 # 用独立缓存目录：别读到你自己 ui.ini 里的 抽帧方式/显示尺寸（否则结果不可复现）
 os.environ["PURER_CACHE_DIR"] = tempfile.mkdtemp(prefix="purer_smoke_cache_")
+# 设置 / 已保存缓存也放临时目录：冒烟测试不能碰真实用户数据
+os.environ["PURER_DATA_DIR"] = tempfile.mkdtemp(prefix="purer_smoke_data_")
+os.environ["PURER_PERSIST_CACHE_DIR"] = tempfile.mkdtemp(
+    prefix="purer_smoke_pcache_")
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -27,7 +31,7 @@ if str(ROOT) not in sys.path:
 
 from PySide6.QtCore import QItemSelection, QItemSelectionModel, QPoint, Qt  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtWidgets import QApplication, QMessageBox, QTabBar  # noqa: E402
 
 from vff import ffmpeg  # noqa: E402
 from vff.config import APP_VERSION  # noqa: E402
@@ -99,9 +103,12 @@ def main() -> int:
               titlebar.isVisible() and titlebar.height() > 0
               and titlebar.y() < win.card.height(),
               f"h={titlebar.height()} y={titlebar.y()}")
-        check("titlebar shows app + version",
-              "Purer" in titlebar.brand.text() and APP_VERSION in titlebar.ver.text(),
-              f"{titlebar.brand.text()} {titlebar.ver.text()}")
+        check("titlebar shows app + settings",
+              "Purer" in titlebar.brand.text()
+              and titlebar.btn_settings.text() == "设置"
+              and APP_VERSION in titlebar.btn_settings.toolTip(),
+              f"{titlebar.brand.text()} {titlebar.btn_settings.text()} "
+              f"{titlebar.btn_settings.toolTip()}")
         offset = badge.geometry().center().x() - titlebar.width() // 2
         check("badge centered in top card", abs(offset) <= 2,
               f"dx={offset} badge={badge.geometry().getRect()} tb={titlebar.width()}")
@@ -128,6 +135,15 @@ def main() -> int:
               abs(badge.geometry().center().x() - titlebar.width() // 2) <= 2,
               str(badge.geometry().getRect()))
 
+        # ---- 标签页：圆角卡片 + 自绘关闭按钮 ----
+        from vff.ui.style import DARK_QSS
+        check("modern tab style in stylesheet",
+              "QTabBar::tab" in DARK_QSS and "border-radius" in DARK_QSS
+              and "QTabBar::tab:selected" in DARK_QSS)
+        check("custom tab close style in stylesheet",
+              "QPushButton#tabClose" in DARK_QSS
+              and "QPushButton#tabClose:hover" in DARK_QSS)
+
         # ---- 自动更新用的两个新状态（下载中 / 已下载待装） ----
         badge.set_state("downloading", tag="v1.1.5", detail="42%")
         check("badge downloading shows percent",
@@ -153,9 +169,84 @@ def main() -> int:
         check("maximize / restore buttons", maximized and not win.isMaximized(),
               f"max={maximized} back={win.isMaximized()}")
 
+        # ---- 设置窗：关于 / 缓存（v1.1.9） ----
+        from vff.ui.settings_dialog import CloseCacheDialog, SettingsDialog
+        from PySide6.QtWidgets import QLabel
+        settings_dlg = SettingsDialog(win, settings=win.app_settings,
+                                      store=win.cache_store)
+        settings_dlg.setAttribute(Qt.WA_DontShowOnScreen, True)
+        settings_dlg.show()
+        app.processEvents()
+        tabs = [settings_dlg.tabs.tabText(i)
+                for i in range(settings_dlg.tabs.count())]
+        check("settings tabs (cache left, about right)", tabs == ["缓存", "关于"],
+              str(tabs))
+        check("settings opens the leftmost tab",
+              settings_dlg.tabs.currentIndex() == 0,
+              str(settings_dlg.tabs.currentIndex()))
+        about_text = " ".join(w.text() for w in settings_dlg.findChildren(QLabel))
+        check("about shows version", f"v{APP_VERSION}" in about_text,
+              about_text[:80])
+        check("about shows library info",
+              "ffmpeg" in about_text and "PySide6" in about_text
+              and "Python" in about_text)
+        check("cache page default policy",
+              settings_dlg.radio_never.isChecked()
+              and not settings_dlg.check_skip.isEnabled()
+              and settings_dlg.spin_videos.value() == 20,
+              f"never={settings_dlg.radio_never.isChecked()} "
+              f"skip_enabled={settings_dlg.check_skip.isEnabled()} "
+              f"videos={settings_dlg.spin_videos.value()}")
+        settings_dlg.radio_usage.setChecked(True)
+        app.processEvents()
+        check("usage mode enables its spinboxes",
+              settings_dlg.spin_minutes.isEnabled()
+              and settings_dlg.spin_exports.isEnabled()
+              and not settings_dlg.spin_videos.isEnabled()
+              and settings_dlg.check_skip.isEnabled())
+        settings_dlg.spin_minutes.setValue(7)
+        settings_dlg.check_skip.setChecked(True)
+        values = settings_dlg.values()
+        check("settings values collected",
+              values["mode"] == "usage" and values["usage_minutes"] == 7
+              and values["skip_close_prompt"] is True, str(values))
+        settings_dlg.radio_never.setChecked(True)
+        app.processEvents()
+        self_never = settings_dlg.values()
+        check("never mode disables skip prompt",
+              self_never["mode"] == "never"
+              and not settings_dlg.check_skip.isEnabled()
+              and self_never["skip_close_prompt"] is False, str(self_never))
+        settings_dlg.radio_usage.setChecked(True)
+        settings_dlg.check_skip.setChecked(True)
+        app.processEvents()
+        settings_dlg.accept()
+        app.processEvents()
+        saved_cfg = win.app_settings.cache()
+        check("settings saved to disk",
+              saved_cfg["mode"] == "usage" and saved_cfg["usage_minutes"] == 7
+              and saved_cfg["skip_close_prompt"] is True, str(saved_cfg))
+        settings_dlg.deleteLater()
+        app.processEvents()
+        check("cache store follows settings dir",
+              win.cache_store.root == win.app_settings.effective_cache_dir(),
+              f"{win.cache_store.root} vs "
+              f"{win.app_settings.effective_cache_dir()}")
+
         # ---- 1. 一次拖 3 个：必须串行 ----
         win.add_videos(clips)
         check("tabs==3", win.tabs.count() == 3, str(win.tabs.count()))
+        check("badge loading while extracting",
+              win.cache_badge.state_name() == "loading",
+              win.cache_badge.state_name())
+        bar = win.tabs.tabBar()
+        check("custom close button on every tab",
+              bar.count() == 3 and all(
+                  bar.tabButton(i, QTabBar.RightSide) is not None
+                  for i in range(bar.count())))
+        last_dir = str(win.setting.value("paths/last_file_dir", ""))
+        check("remembers last opened directory",
+              Path(last_dir).resolve() == clips[0].parent.resolve(), last_dir)
 
         peak = 0
         deadline = time.time() + 180
@@ -169,6 +260,38 @@ def main() -> int:
         check("queue never exceeded 1", peak <= 1, f"peak={peak}")
         rows = [win.tabs.widget(i).model.rowCount() for i in range(win.tabs.count())]
         check("all pages extracted", rows == [5, 5, 5], str(rows))
+        win.tabs.setCurrentIndex(2)
+        app.processEvents()
+        win._refresh_cache_badge()
+        check("badge ready (blue) after load",
+              win.cache_badge.state_name() == "ready",
+              win.cache_badge.state_name())
+        QTest.mouseClick(win.cache_badge, Qt.LeftButton)
+        app.processEvents()
+        badge_page = win.tabs.widget(2)
+        check("badge click saves cache",
+              win.cache_badge.state_name() == "saved"
+              and win.cache_store.has(badge_page.cache_digest()),
+              win.cache_badge.state_name())
+        QTest.mouseClick(win.cache_badge, Qt.LeftButton)   # 绿色时点击不应重复
+        app.processEvents()
+        check("green badge click does nothing",
+              win.cache_badge.state_name() == "saved")
+        win.tabs.setCurrentIndex(0)
+        app.processEvents()
+        win._refresh_cache_badge()
+        check("badge switches with tab",
+              win.cache_badge.state_name() == "ready",
+              win.cache_badge.state_name())
+
+        # 记忆上次设置：间隔（测完恢复 24，别影响后面新增的视频）
+        win.combo_step.set_value(12)
+        app.processEvents()
+        check("remembers extract step",
+              abs(float(win.setting.value("ui/step", 0)) - 12.0) < 1e-6,
+              str(win.setting.value("ui/step", 0)))
+        win.combo_step.set_value(24)
+        app.processEvents()
 
         # ---- 2. 区间导出（行 1..3） ----
         win.tabs.setCurrentIndex(0)
@@ -440,21 +563,181 @@ def main() -> int:
         check("segments collected", len(page.segments) == 3, str(len(page.segments)))
         batch_dir = tmp / "batch"
         batch_dir.mkdir()
-        page._batch_start(batch_dir, exact=True)
+        page._batch_start(batch_dir, exact=True, names=["开场", "", ""])
         batch_done = wait(app, lambda: page._batch is None
                           and page.lbl_export.text().startswith("✅"), 240)
         batch_files = sorted(batch_dir.glob("*.mp4"))
         check("batch exported 3", batch_done and len(batch_files) == 3,
               f"{len(batch_files)} 个 · {page.lbl_export.text()[:40]}")
+        check("batch custom + series names",
+              {p.name for p in batch_files}
+              == {"开场.mp4", "Cut - 2_c0.mp4", "Cut - 3_c0.mp4"},
+              str([p.name for p in batch_files]))
         if len(batch_files) == 3:
             fps = page.info.fps or 30.0
-            expected = [(36 - 24) / fps, (60 - 48) / fps, (90 - 72) / fps]
-            durs = [ffmpeg.probe(f).duration for f in batch_files]
+            expected = {"开场.mp4": (36 - 24) / fps,
+                        "Cut - 2_c0.mp4": (60 - 48) / fps,
+                        "Cut - 3_c0.mp4": (90 - 72) / fps}
+            durs = {f.name: ffmpeg.probe(f).duration for f in batch_files}
             check("batch durations",
-                  all(abs(d - e) < 0.15 for d, e in zip(durs, expected)),
-                  str([round(d, 2) for d in durs]))
+                  all(abs(durs.get(name, 99.0) - want) < 0.15
+                      for name, want in expected.items()),
+                  str({k: round(v, 2) for k, v in durs.items()}))
             check("batch exact mode", "帧精确" in page.lbl_export.text(),
                   page.lbl_export.text()[:40])
+
+        # ---- 2b. 保存缓存 + 关闭前提示（v1.1.9） ----
+        check("page cache ready", page.cache_ready(),
+              f"finished={page._finished} rows={page.model.rowCount()}")
+        uncached = win._uncached_pages()
+        check("uncached pages found", any(p is page for p in uncached),
+              str(len(uncached)))
+        cache_dlg = CloseCacheDialog(win, uncached,
+                                     {"mode": "never", "skip_close_prompt": True},
+                                     win.cache_store)
+        cache_dlg.setAttribute(Qt.WA_DontShowOnScreen, True)
+        cache_dlg.show()
+        app.processEvents()
+        dlg_text = " ".join(w.text() for w in cache_dlg.findChildren(QLabel))
+        check("close dialog lists uncached",
+              "还没保存" in dlg_text and "c0.mp4" in dlg_text, dlg_text[:80])
+        check("close dialog defaults to never",
+              cache_dlg.radio_never.isChecked()
+              and not cache_dlg.check_skip.isEnabled()
+              and cache_dlg.values()["skip_close_prompt"] is False)
+        cache_dlg.radio_count.setChecked(True)
+        cache_values = cache_dlg.values()
+        check("close dialog values",
+              cache_values["mode"] == "count" and cache_dlg.action == "cancel",
+              str(cache_values))
+        cache_dlg.close()
+        saved, failed = win._apply_cache_policy(
+            {"mode": "count", "max_videos": 20,
+             "usage_minutes": 10, "usage_exports": 2,
+             "skip_close_prompt": True}, uncached)
+        check("cache saved to store",
+              saved >= 1 and failed == 0 and win.cache_store.has(page.cache_digest())
+              and win.cache_store.summary()["count"] >= 1,
+              f"saved={saved} failed={failed} "
+              f"count={win.cache_store.summary()['count']}")
+        check("saved cache can be restored",
+              win.cache_store.materialize(page.cache_digest(), tmp / "restored"),
+              str(tmp / "restored"))
+        restored = sorted((tmp / "restored").glob("f_*.jpg"))
+        check("restored frame count", len(restored) == page.model.rowCount(),
+              f"{len(restored)} vs {page.model.rowCount()}")
+
+        # ---- 2c. 从缓存导入 / 设置里的条目列表 ----
+        from vff.ui.cache_list import CacheEntryTable, CacheImportDialog
+        import_dlg = CacheImportDialog(win, win.cache_store, win.open_cached_entry)
+        import_dlg.setAttribute(Qt.WA_DontShowOnScreen, True)
+        import_dlg.show()
+        app.processEvents()
+        check("import dialog lists entries",
+              import_dlg.table.table.rowCount() >= 1,
+              str(import_dlg.table.table.rowCount()))
+        import_dlg.close()
+
+        entry_dlg = SettingsDialog(win, settings=win.app_settings,
+                                   store=win.cache_store,
+                                   load_cache=win.open_cached_entry)
+        entry_dlg.setAttribute(Qt.WA_DontShowOnScreen, True)
+        entry_dlg.show()
+        app.processEvents()
+        entry_dlg.btn_entries.setChecked(True)
+        app.processEvents()
+        check("settings entries expandable",
+              entry_dlg.entry_table is not None
+              and entry_dlg.entry_table.isVisible()
+              and entry_dlg.entry_table.table.rowCount() >= 1,
+              str(entry_dlg.entry_table.table.rowCount()
+                  if entry_dlg.entry_table else None))
+        entry_dlg.close()
+
+        opened = []
+        load_dlg = SettingsDialog(win, settings=win.app_settings,
+                                  store=win.cache_store,
+                                  load_cache=lambda e: opened.append(e))
+        load_dlg.entry_table.table.selectRow(0)
+        load_dlg.entry_table.open_selected()
+        for _ in range(30):
+            app.processEvents()
+            if opened:
+                break
+        check("settings entry load callback", len(opened) == 1, str(len(opened)))
+        load_dlg.deleteLater()
+        app.processEvents()
+
+        # 删除条目（用独立的库 + 独立的小缓存）
+        from vff.cache_store import CacheStore as Store2
+        ui_store = Store2(tmp / "ui_store", win.app_settings)
+        ui_src = tmp / "ui_src"
+        ui_src.mkdir()
+        for i in range(1, 3):
+            (ui_src / f"f_{i:06d}.jpg").write_bytes(b"x" * 50)
+        (ui_src / ".done").write_text("2", encoding="utf-8")
+        ui_ok, ui_why = ui_store.save_dir(
+            "aaaaaaaaaaaaaaaa", ui_src,
+            {"video": str(tmp / "ui.mp4"), "video_size": 1, "video_mtime": 1,
+             "mode": "step", "step": 24, "threshold": None,
+             "tw": 320, "th": 180, "frames": 2})
+        ui_table = CacheEntryTable(ui_store)
+        check("entry table builds",
+              ui_ok and ui_table.table.rowCount() == 1, ui_why)
+        orig_question = QMessageBox.question
+        QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.Yes)
+        try:
+            ui_table.table.selectRow(0)
+            ui_table.remove_selected()
+        finally:
+            QMessageBox.question = orig_question
+        check("entry table deletes cache",
+              ui_table.table.rowCount() == 0
+              and ui_store.summary()["count"] == 0)
+
+        # 策略 3：用得不多的不保存；用够时间才保存
+        p1 = win.tabs.widget(1)
+        win.cache_store.drop(p1.cache_digest())
+        usage_cfg = {"mode": "usage", "max_videos": 20, "usage_minutes": 10,
+                     "usage_exports": 2, "skip_close_prompt": True}
+        p1.used_seconds, p1.export_count = 0.0, 0
+        kept, failed1 = win._apply_cache_policy(usage_cfg, [p1])
+        check("usage policy skips unused video",
+              kept == 0 and failed1 == 0
+              and not win.cache_store.has(p1.cache_digest()),
+              f"kept={kept} failed={failed1}")
+        p1.used_seconds = 660.0        # 11 分钟
+        kept2, failed2 = win._apply_cache_policy(usage_cfg, [p1])
+        check("usage policy saves used video",
+              kept2 == 1 and failed2 == 0
+              and win.cache_store.has(p1.cache_digest()),
+              f"kept={kept2} failed={failed2}")
+
+        # 关闭前提示规则：不自动保存每次都问；自动保存 + 不再提醒才静默
+        from PySide6.QtWidgets import QDialog
+        from vff.ui import settings_dialog as sd_mod
+        p2 = win.tabs.widget(2)
+        win.cache_store.drop(p2.cache_digest())
+        prompts = []
+        orig_close_exec = sd_mod.CloseCacheDialog.exec
+        sd_mod.CloseCacheDialog.exec = lambda self: (prompts.append(self)
+                                                     or QDialog.Rejected)
+        try:
+            win.app_settings.update_cache(mode="never", skip_close_prompt=True)
+            proceed = win._handle_close_cache()
+            check("never mode always prompts",
+                  proceed is False and len(prompts) == 1,
+                  f"proceed={proceed} prompts={len(prompts)}")
+            win.app_settings.update_cache(mode="usage", skip_close_prompt=True)
+            proceed2 = win._handle_close_cache()
+            check("auto-save + skip closes silently",
+                  proceed2 is True and len(prompts) == 1,
+                  f"proceed={proceed2} prompts={len(prompts)}")
+        finally:
+            sd_mod.CloseCacheDialog.exec = orig_close_exec
+
+        # 关窗口时不再弹提示（上面已经勾了「不再提醒」，且是自动保存策略）
+        win.app_settings.update_cache(mode="usage", skip_close_prompt=True)
 
         # ---- 3. 校验失败 -> 自动回退无损（稳定性关键路径） ----
         import vff.smartcut as smartcut_mod
@@ -538,6 +821,14 @@ def main() -> int:
                 None, "标题", "细节", exact_available=False, exact_note="不支持")
             check("confirm dialog disables exact", dlg_ok2 and not dlg_exact2,
                   f"{dlg_ok2},{dlg_exact2}")
+            from vff.export_names import plan_filenames
+            b_ok, b_exact, b_texts = dialogs_mod.ask_batch_export(
+                None, "导出 2 段", ["00:01 → 00:02", "00:03 → 00:04"],
+                ["", ""], plan_filenames(["", ""], "c0", ".mp4"), True,
+                "只重编码切点", "D:/out")
+            check("batch naming dialog builds",
+                  b_ok and b_exact and b_texts == ["", ""],
+                  f"{b_ok},{b_exact},{b_texts}")
         finally:
             QDialog.exec = original_exec
 

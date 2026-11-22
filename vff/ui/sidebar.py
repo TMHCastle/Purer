@@ -62,13 +62,13 @@ def _time(t: float) -> str:
 
 
 class SegmentRow(QFrame):
-    """一条片段：缩略图 / 序号 / 起止 / 时长 / 删除。"""
+    """一条片段：缩略图 / 序号 / 起止（有自定义名就显示名字）/ 删除。"""
 
     clicked = Signal(int)
     removed = Signal(int)
 
     def __init__(self, index: int, t1: float, t2: float, thumb: str | None = None,
-                 parent=None):
+                 name: str = "", parent=None):
         super().__init__(parent)
         self.index = index
         self.setObjectName("segRow")
@@ -76,7 +76,9 @@ class SegmentRow(QFrame):
         self.setProperty("active", "false")
         self.setCursor(Qt.PointingHandCursor)
         self.setToolTip(f"第 {index + 1} 段 · {_time(t1)} → {_time(t2)}"
-                        f"（{max(0.0, t2 - t1):.2f} 秒）\n点击跳到这一段")
+                        f"（{max(0.0, t2 - t1):.2f} 秒）"
+                        + (f"\n素材名：{name}" if name else "")
+                        + "\n点击跳到这一段")
 
         lay = QHBoxLayout(self)
         lay.setContentsMargins(6, 4, 5, 4)
@@ -101,10 +103,19 @@ class SegmentRow(QFrame):
         mid = QVBoxLayout()
         mid.setContentsMargins(0, 0, 0, 0)
         mid.setSpacing(0)
-        main = QLabel(f"{_time(t1)} → {_time(t2)}")
-        main.setObjectName("segMain")
-        sub = QLabel(f"{max(0.0, t2 - t1):.2f} 秒")
+        span = f"{_time(t1)} → {_time(t2)}"
+        if name:
+            main = QLabel(name)
+            main.setObjectName("segName")
+            sub = QLabel(span)
+        else:
+            main = QLabel(span)
+            main.setObjectName("segMain")
+            sub = QLabel(f"{max(0.0, t2 - t1):.2f} 秒")
+        main.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        main.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         sub.setObjectName("segDur")
+        sub.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         mid.addWidget(main)
         mid.addWidget(sub)
 
@@ -518,7 +529,7 @@ class EditSidebar(QWidget):
 
     # ------------------------------------------------------------ 片段
     def set_segments(self, segments: list):
-        """segments: [(t_in, t_end, 缩略图路径或 None), ...]"""
+        """segments: [(t_in, t_end, 缩略图路径或 None[, 素材名]), ...]"""
         self._segments = list(segments)
         for row in self._rows:
             row.setParent(None)
@@ -533,7 +544,8 @@ class EditSidebar(QWidget):
         for i, seg in enumerate(segments):
             t1, t2 = seg[0], seg[1]
             thumb = seg[2] if len(seg) > 2 else None
-            row = SegmentRow(i, t1, t2, thumb, self)
+            name = seg[3] if len(seg) > 3 else ""
+            row = SegmentRow(i, t1, t2, thumb, name, self)
             row.clicked.connect(self.selectSegmentRequested)
             row.removed.connect(self.removeSegmentRequested)
             self.seg_lay.insertWidget(self.seg_lay.count() - 1, row)

@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 """自绘标题栏（无边框窗口的第一行）。
 
-布局：``[图标] Purer [v1.1.4] 每 24 帧一帧  ……  正中留空给更新药丸 ……  — □ ✕``
+布局：``[图标] Purer [⚙ 设置] 每 24 帧一帧  ……  正中留空给更新药丸 ……  — □ ✕``
+
+版本号不再挤在标题栏（原来那个 ``v1.1.8`` 小药丸的位置现在留给「设置」按钮，
+版本信息移到 设置-关于 里）。
 
 正中间那块是**绝对居中**的：更新药丸不放进 QHBoxLayout，而是作为子控件在
 ``resizeEvent`` 里按 ``(width - hint) / 2`` 摆好 —— 否则左右两侧宽度不一样，
@@ -13,13 +16,13 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QPoint, QSize, Qt
+from PySide6.QtCore import QPoint, QSize, Qt, Signal
 from PySide6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QPushButton,
                                QWidget)
 
 from ..config import APP_NAME, APP_VERSION
-from .style import (icon_win_close, icon_win_max, icon_win_min, icon_win_restore,
-                    make_icon)
+from .style import (icon_gear, icon_win_close, icon_win_max, icon_win_min,
+                    icon_win_restore, make_icon)
 
 TITLE_H = 38
 BTN_W, BTN_H = 36, 26
@@ -54,6 +57,8 @@ class WindowButton(QPushButton):
 
 
 class TitleBar(QWidget):
+    settingsRequested = Signal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("titlebar")
@@ -72,14 +77,21 @@ class TitleBar(QWidget):
         self.icon.setPixmap(make_icon().pixmap(18, 18))
         self.brand = QLabel(APP_NAME, self)
         self.brand.setObjectName("title")
-        self.ver = QLabel(f"v{APP_VERSION}", self)
-        self.ver.setObjectName("verChip")
+        # 原来版本号药丸的位置 -> 设置入口（版本信息在 设置-关于 里）
+        self.btn_settings = QPushButton("设置", self)
+        self.btn_settings.setObjectName("gearBtn")
+        self.btn_settings.setIcon(icon_gear("#A9BAEA", 15))
+        self.btn_settings.setIconSize(QSize(13, 13))
+        self.btn_settings.setCursor(Qt.PointingHandCursor)
+        self.btn_settings.setFocusPolicy(Qt.NoFocus)
+        self.btn_settings.setToolTip(f"设置（{APP_NAME} v{APP_VERSION}）")
+        self.btn_settings.clicked.connect(self.settingsRequested)
         self.subtitle = QLabel("", self)
         self.subtitle.setObjectName("hint")
 
         row.addWidget(self.icon)
         row.addWidget(self.brand)
-        row.addWidget(self.ver)
+        row.addWidget(self.btn_settings)
         row.addSpacing(4)
         row.addWidget(self.subtitle)
         row.addStretch(1)

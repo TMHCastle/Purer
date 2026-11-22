@@ -318,6 +318,39 @@ def run_hidden(cmd, timeout: float = 40):
                           timeout=timeout)
 
 
+def parse_tool_version(text: str) -> str:
+    """从 ``ffmpeg -version`` 的第一行里取版本号（纯函数，便于单测）。
+
+    ``ffmpeg version 8.1.3-full_build-www.gyan.dev`` -> ``8.1.3-full_build-www.gyan.dev``
+    """
+    first = next((ln.strip() for ln in str(text or "").splitlines() if ln.strip()), "")
+    if not first:
+        return ""
+    match = re.search(r"version\s+(\S+)", first)
+    return match.group(1) if match else first[:80]
+
+
+_VERSION_CACHE: dict[str, str] = {}
+
+
+def tool_version(tool) -> str:
+    """ffmpeg / ffprobe 的版本号（进程内缓存；找不到 / 跑不动就返回空串）。"""
+    if tool is None:
+        return ""
+    key = str(tool)
+    if key in _VERSION_CACHE:
+        return _VERSION_CACHE[key]
+    version = ""
+    try:
+        result = run_hidden([key, "-version"], timeout=10)
+        version = parse_tool_version(
+            (result.stdout or b"").decode("utf-8", "replace"))
+    except (OSError, subprocess.SubprocessError, ValueError):
+        version = ""
+    _VERSION_CACHE[key] = version
+    return version
+
+
 def stream_progress(args, on_progress=None, on_line=None, timeout: float | None = None,
                     duration: float | None = None):
     """同步跑 ffmpeg，边跑边回调（CLI 用；UI 用 jobs.Job）。

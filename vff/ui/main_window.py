@@ -609,10 +609,11 @@ class MainWindow(FramelessWindow):
         QDesktopServices.openUrl(QUrl(result.url or RELEASES_PAGE))
         return False
 
-    def _apply_hotfix(self, path: str) -> bool:
-        """装代码包并重建界面。
+    def _apply_hotfix(self, path: str) -> tuple[bool, str, object]:
+        """装代码包并重建界面 → ``(成功?, 原因, 新窗口)``。
 
-        成功时 **旧窗口已经被新窗口取代**，这里不能再碰 ``self``。
+        注意：**重建之后旧窗口（self）已经被销毁**，调用方不能再碰 self；
+        失败且没重建时返回的 ``new_win`` 就是 self 本身。
         """
         self.save_session("hotfix")
         self._flush_all_usage()
@@ -628,18 +629,18 @@ class MainWindow(FramelessWindow):
             except Exception as exc2:       # noqa: BLE001
                 ok, why, new_win = False, f"{exc} / {exc2}", None
         if ok:
-            return True
+            return True, "", new_win
         info = hotfix_state()
         QMessageBox.warning(
             new_win, "热修复",
-            f"{why}\n\n当前仍然可用（v{info.get('effective_version') or '?'}）。\n"
-            f"代码包位置：{info.get('installed_path') or '—'}")
+            f"{why}\n\n当前仍然可用（v{info.get('effective_version') or '?'}）。"
+            + ("\n稍后会改用整包更新。" if why and "整包" not in why else ""))
         if new_win is not None:
             try:
                 new_win.badge.set_state("error", tip=f"热修复没装上：{why}")
             except Exception:               # noqa: BLE001
                 pass
-        return False
+        return False, why, new_win
 
     def _start_download(self, result) -> bool:
         tag = normalize(result.tag) or result.tag
@@ -687,7 +688,7 @@ class MainWindow(FramelessWindow):
                 "error", tip=f"下载失败：{error}\n点击重试（右键重新检查）")
             return
         if self._download_kind == "code":
-            self._apply_hotfix(path)
+            self._finish_code_download(path, result)
             return
         self._pending_exe = path
         self.badge.set_state(
@@ -700,6 +701,23 @@ class MainWindow(FramelessWindow):
             QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
         if answer == QMessageBox.Yes:
             self._install_update()
+
+    def _finish_code_download(self, path: str, result) -> None:
+        """热补丁包下完了：装它；装不了（例如 exe 太旧）就自动改走整包。"""
+        ok, why, new_win = self._apply_hotfix(path)
+        if ok:
+            return
+        if result is None or not result.can_install() or not auto_install_enabled():
+            self.lbl_status.setText(f"热补丁没装上：{why}")
+            return
+        # 可能是「包要求更高的 exe」——整包就在同一个 Release 里，直接接着下
+        target = new_win if (new_win is not None and new_win is not self) else self
+        try:
+            target._update_result = result
+            target.lbl_status.setText("热补丁不适用于当前版本，改用整包更新…")
+            target._start_download(result)
+        except (AttributeError, RuntimeError):
+            pass
 
     def _ask_install(self):
         if not self._pending_exe:

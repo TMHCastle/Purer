@@ -144,7 +144,8 @@ Purer.exe --no-restore                             # 这次不恢复上次的标
 - **查看状态**：`Purer.exe --code-info`（JSON：exe 版本 / 生效版本 / 包路径）；
   设置-更新 里也会显示「热补丁 v1.2.1 生效中」，旁边可以「移除热补丁」（下次启动回内置代码）。
 
-> 什么时候发 exe、什么时候只发 code 包，见 `DEV.ignore` 里的「发布规则」。
+> 每个 Release **同时提供 exe 和 code 包**：从 GitHub 直接下到的 `Purer.exe` 永远是最新完整版；
+> 已经在 1.2.1+ 的，点一下装 180 KB 就够（不重启）。细节见 `DEV.ignore` 的「发布规则」。
 
 ## 缓存
 

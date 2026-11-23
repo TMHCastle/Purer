@@ -1196,6 +1196,24 @@ def main() -> int:
               and len(started.get("mirrors") or []) >= 2,
               str(started))
 
+        # 热补丁不适用（包要求更高的 exe）→ 自动改走整包更新
+        fallback = {}
+        orig_apply = win._apply_hotfix
+        orig_dl = win._start_download
+        win._apply_hotfix = lambda p: (False, "代码包要求 exe ≥ 9.9.0", win)
+        win._start_download = lambda r: fallback.update(tag=r.tag) or True
+        try:
+            win._finish_code_download("x.zip", CheckResult(
+                True, "v9.9.12", "", "", "",
+                "https://github.com/x/Purer.exe", 1000, "",
+                "https://github.com/x/code.zip", 200, ""))
+        finally:
+            win._apply_hotfix = orig_apply
+            win._start_download = orig_dl
+            win.badge.set_state("idle")
+        check("incompatible hotfix falls back to the full exe",
+              fallback.get("tag") == "v9.9.12", str(fallback))
+
         # ---- 4. 会话快照：保存 → 换个窗口恢复（更新重启 / 崩溃恢复都靠它） ----
         from vff import session as session_state
 
@@ -1211,6 +1229,8 @@ def main() -> int:
               str(session_state.session_file()))
 
         # 造一份"上次的会话"：两个视频 + 当前帧 + 入出点 + 片段 + 导出记录
+        # （先停掉 30 秒自动存盘，否则它可能在我们 restore 之前把文件覆盖回去）
+        win._session_timer.stop()
         crafted = {
             "version": 1, "saved_at": time.time(), "reason": "update",
             "window": {"geometry": "", "maximized": False},

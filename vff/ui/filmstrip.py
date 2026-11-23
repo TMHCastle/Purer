@@ -142,7 +142,7 @@ class FilmStrip(QObject):
 
 
 PLAY_FPS = 12           # 兼容旧名（实际速率由 stride 与素材 fps 决定）
-PLAY_MAX_FRAMES = 300   # 单次回放最多抽这么多图（覆盖整段，不缩短）
+PLAY_MAX_FRAMES = 1500  # 单次回放最多抽这么多图（覆盖整段，不缩短）
 
 
 class PlayClip(QObject):

@@ -1,15 +1,11 @@
 # -*- coding: utf-8 -*-
-"""右侧固定操作面板（V1.3.1：信息密度优先）。
+"""右侧操作面板：两块独立可折叠卡片 + 外层垂直滚动。
 
-五个模块自上而下：
-    A 视频信息（两行 + 次级图标操作）
-    B 预览（按视频原始宽高比自适应 + 一行工具栏）
-    C 当前帧（两行紧凑按钮）
-    D 区间（一行时间码 + 帧数/时长）
-    E 片段（缩略图列表，唯一滚动区 + 固定底栏）
+卡片 A「编辑与导出」：视频信息 / 预览 / 逐帧与入点出点 / 标记 / 播放导出
+卡片 B「片段与导出记录」：片段列表 + 已导出文件
 
-高度策略：A/C/D 固定紧凑，B 按原始比例取高（并给 E 让位），E 吃掉剩余空间。
-**整个面板不滚动** —— 片段再多也只在 E 的列表里滚。
+高度策略：两块卡片都能单独收起；都展开时如果超过侧栏高度，外层出现滚动条。
+片段列表自己仍可滚动（避免几百段时把整页顶长）。
 """
 
 from __future__ import annotations
@@ -18,7 +14,8 @@ from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QListWidget,
                                QListWidgetItem, QProgressBar, QPushButton,
-                               QScrollArea, QSizePolicy, QVBoxLayout, QWidget)
+                               QScrollArea, QSizePolicy, QToolButton,
+                               QVBoxLayout, QWidget)
 
 from ..util import human_size
 from .images import thumb_pixmap
@@ -143,6 +140,59 @@ class SegmentRow(QFrame):
         self.update()
 
 
+class SideCard(QFrame):
+    """侧栏里的一整块卡片：点标题整块收起/展开。"""
+
+    toggled = Signal(bool)          # True = 展开
+
+    def __init__(self, title: str, parent=None):
+        super().__init__(parent)
+        self.setObjectName("sideCard")
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        self.head = QToolButton(self)
+        self.head.setObjectName("sideCardHead")
+        self.head.setCheckable(True)
+        self.head.setChecked(True)
+        self.head.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.head.setArrowType(Qt.DownArrow)
+        self.head.setText(title)
+        self.head.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.head.setCursor(Qt.PointingHandCursor)
+        self.head.setToolTip(f"{title}：点标题收起 / 展开")
+        self.head.clicked.connect(self._on_clicked)
+        lay.addWidget(self.head)
+
+        self.body = QWidget(self)
+        self.body.setObjectName("sideCardBody")
+        self.body_lay = QVBoxLayout(self.body)
+        self.body_lay.setContentsMargins(6, 2, 6, 6)
+        self.body_lay.setSpacing(4)
+        lay.addWidget(self.body)
+
+    def _on_clicked(self, checked: bool):
+        self.set_expanded(checked)
+
+    def set_expanded(self, expanded: bool, notify: bool = True):
+        expanded = bool(expanded)
+        self.head.setChecked(expanded)
+        self.head.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        self.body.setVisible(expanded)
+        self.body.updateGeometry()
+        self.updateGeometry()
+        if notify:
+            self.toggled.emit(expanded)
+
+    def is_expanded(self) -> bool:
+        return bool(self.head.isChecked())
+
+    def add_widget(self, widget: QWidget):
+        self.body_lay.addWidget(widget)
+
+
 class EditSidebar(QWidget):
     """固定宽度（可拖拽调整）；只有片段列表内部滚动。"""
 
@@ -164,6 +214,7 @@ class EditSidebar(QWidget):
     exportAllSegmentsRequested = Signal()
     openExportRequested = Signal(str)      # 打开某个已导出的片段
     folderExportRequested = Signal(str)    # 打开它所在的文件夹
+    collapseChanged = Signal(str, bool)     # 哪块卡片（edit/segments）、是否展开
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -178,25 +229,60 @@ class EditSidebar(QWidget):
         self._exports: list[dict] = []
         self._active = -1
 
-        root = QVBoxLayout(self)
-        root.setContentsMargins(6, 5, 6, 5)
-        root.setSpacing(3)
-
         self.p_info = self._build_info()
         self.p_preview = self._build_preview()
         self.p_frame = self._build_frame()
         self.p_range = self._build_range()
         self.p_seg = self._build_segments()
 
-        root.addWidget(self.p_info)
-        root.addWidget(self.p_preview)
-        root.addWidget(self.p_frame)
-        root.addWidget(self.p_range)
-        root.addWidget(self.p_seg, 1)
+        # 卡片 A：数据 / 预览 / 逐帧·入点出点·标记 / 播放导出
+        self.card_edit = SideCard("编辑与导出", self)
+        for widget in (self.p_info, self.p_preview, self.p_frame,
+                       self.p_range):
+            self.card_edit.add_widget(widget)
+        # 卡片 B：片段与已导出记录
+        self.card_segments = SideCard("片段与导出记录", self)
+        self.card_segments.add_widget(self.p_seg)
+        self.card_edit.toggled.connect(
+            lambda ok: self.collapseChanged.emit("edit", ok))
+        self.card_segments.toggled.connect(
+            lambda ok: self.collapseChanged.emit("segments", ok))
+
+        content = QWidget()
+        content.setObjectName("sideContent")
+        content_lay = QVBoxLayout(content)
+        content_lay.setContentsMargins(6, 5, 6, 5)
+        content_lay.setSpacing(6)
+        content_lay.addWidget(self.card_edit)
+        content_lay.addWidget(self.card_segments)
+        content_lay.addStretch(1)
+
+        self.scroll = QScrollArea()
+        self.scroll.setObjectName("sideScroll")
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.scroll.setWidget(content)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        root.addWidget(self.scroll)
 
         self.set_extract_progress(0, False, False)
         self.set_play_state(None)
         self.set_segments([])
+
+    # ------------------------------------------------------------ 折叠
+    def set_card_expanded(self, key: str, expanded: bool,
+                          notify: bool = True):
+        card = self.card_segments if key == "segments" else self.card_edit
+        card.set_expanded(expanded, notify=notify)
+
+    def is_card_expanded(self, key: str) -> bool:
+        card = self.card_segments if key == "segments" else self.card_edit
+        return card.is_expanded()
 
     # ------------------------------------------------------------ 模块 A
     def _build_info(self) -> QFrame:

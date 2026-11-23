@@ -30,7 +30,8 @@ from ..jobs import Job, JobQueue
 from ..media import MediaInfo, thumb_size_for
 from ..scenedetect import SceneSampler
 from ..timeline import SceneTimeline, StepTimeline
-from ..util import fmt_tc, fmt_tc_compact, human_size, safe_filename
+from ..util import (fmt_tc, fmt_tc_compact, human_size, next_play_index,
+                    safe_filename)
 from .dialogs import ask_batch_export, ask_export, show_log
 from .filmstrip import PLAY_FPS, FilmStrip, PlayClip
 from .images import jpeg_ready
@@ -1167,13 +1168,20 @@ class TrackPage(QWidget):
     def _play_tick(self):
         if not self._playing or self.playclip is None:
             return
+        count = max(0, int(getattr(self.playclip, "count", 0) or 0))
         stride = max(1, int(getattr(self.playclip, "stride", 1) or 1))
         fps = max(1.0, float(self.info.fps or 25.0))
         rate = max(0.5, fps / stride)                    # 每秒推进多少张
         want = self._play_base + int(self._play_clock.elapsed() * rate / 1000.0)
-        if want <= self._play_index:
+        index, finished = next_play_index(want, count, self._play_index)
+        if finished:
+            # 最后一张已经显示过（或本来就空）：收尾。
+            # 选段帧数不能被 stride 整除时，最后一张会小于出点；
+            # 以前只靠 frame >= out_frame 判断，会永远停不下来。
+            self.stop_playback(at_end=True)
+            return
+        if index <= self._play_index:
             return                                       # 还没到下一张（省一次刷新）
-        index = min(want, max(0, self.playclip.count - 1))
         if self.playclip.path_for(index) is None:
             self.stop_playback(at_end=True)
             return

@@ -22,8 +22,8 @@ if str(ROOT) not in sys.path:
 
 from vff import cache, ffmpeg  # noqa: E402
 from vff.media import find_videos, parse_probe_json, rate, thumb_size_for  # noqa: E402
-from vff.util import (fmt_tc, fmt_tc_compact, human_size, parse_time_arg,  # noqa: E402
-                      safe_filename)
+from vff.util import (fmt_tc, fmt_tc_compact, human_size, next_play_index,
+                      parse_time_arg, safe_filename)  # noqa: E402
 from vff.version import is_newer, normalize, parse_version, state_for  # noqa: E402
 from vff.update import (CheckResult, asset_from_json, curl_path,  # noqa: E402
                         pick_proxy, result_from_json, tag_from_json)
@@ -34,6 +34,21 @@ from vff.config import SCENE_DEFAULT, extract_mode_items, parse_extract_mode  # 
 from vff.scenedetect import (BINS, SAMPLE_BYTES, build_sample_args,  # noqa: E402
                              cut_frames, detect_cuts, frames_to_times,
                              hist_distance, hist_of, params_for)
+
+
+class TestPlaybackIndex(unittest.TestCase):
+    def test_advances_and_holds(self):
+        self.assertEqual(next_play_index(5, 10, 0), (5, False))
+        self.assertEqual(next_play_index(5, 10, 5), (5, False))
+
+    def test_finishes_when_stride_does_not_divide(self):
+        # 选段 359 帧、stride=2：最后一张是 #179，want=180 时不能再停在最后一张
+        self.assertEqual(next_play_index(180, 180, 179), (179, True))
+        # 最后一张还没显示过：先显示，下一 tick 再收尾
+        self.assertEqual(next_play_index(180, 180, 178), (179, False))
+
+    def test_empty(self):
+        self.assertEqual(next_play_index(0, 0, 0), (-1, True))
 
 
 class TestTimecode(unittest.TestCase):

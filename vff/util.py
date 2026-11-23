@@ -35,6 +35,27 @@ def human_size(n: float | int | None) -> str:
     return f"{n:.1f} TB"
 
 
+def next_play_index(want: int, count: int, current: int) -> tuple[int, bool]:
+    """挂钟算出来的目标张数 → 实际该显示的张数 / 是否已播完。
+
+    关键：``want`` 可能超过最后一张（选段帧数不能被 stride 整除时），
+    以前直接 ``min(want, count-1)`` 会永远停在最后一张停不下来；
+    这里明确返回 ``finished=True``，让调用方收尾。
+    """
+    count = max(0, int(count))
+    if count <= 0:
+        return -1, True
+    current = max(0, int(current))
+    if int(want) >= count:
+        if current >= count - 1:
+            return count - 1, True
+        return count - 1, False
+    index = max(0, int(want))
+    if index <= current:
+        return current, False
+    return index, False
+
+
 def safe_filename(name: str, fallback: str = "output") -> str:
     """去掉 Windows 文件名非法字符（保留中文），并把连续替换符合并。
 

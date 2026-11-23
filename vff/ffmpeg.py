@@ -799,7 +799,7 @@ def build_play_cache_args(src: Path, t_start: float, count: int, stride: int,
     并**当场中止**（只出十几张、退出码 -1）→ 界面报「回放缓存生成失败」；
     加上之后同一段连跑 3 次都是满张、rc=0。
     """
-    vf = f"{select_expr(stride, dialect)},scale='min(1280,iw)':-2"
+    vf = f"{select_expr(stride, dialect)},scale='min(960,iw)':-2"
     if renumber:
         vf += ",setpts=N"
     return ["-hide_banner", "-nostats", "-loglevel", "error",

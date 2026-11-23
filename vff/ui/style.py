@@ -199,6 +199,32 @@ QFrame#panel {{
     border:1px solid #2C3240;
     border-radius:{RADIUS_PANEL}px;
 }}
+/* 右侧两块可折叠卡片：卡片自己有边框，内部模块不再各画一圈 */
+QFrame#sideCard {{
+    background:{PANEL};
+    border:1px solid #2C3240;
+    border-radius:{RADIUS_PANEL}px;
+}}
+QToolButton#sideCardHead {{
+    background:transparent;
+    border:none;
+    border-radius:7px;
+    padding:6px 8px;
+    color:{TEXT};
+    font-size:9.2pt;
+    font-weight:600;
+    text-align:left;
+}}
+QToolButton#sideCardHead:hover {{ background:#2E3440; color:#FFFFFF; }}
+QToolButton#sideCardHead:checked {{ color:{TEXT}; }}
+QFrame#sideCard QFrame#panel {{
+    background:transparent;
+    border:none;
+    border-radius:0;
+}}
+QWidget#sideCardBody {{ background:transparent; }}
+QScrollArea#sideScroll {{ background:transparent; border:none; }}
+QWidget#sideContent {{ background:transparent; }}
 /* 顶部卡片 = 自绘标题栏 + 工具栏，一整块（无边框窗口的第一块） */
 QFrame#topcard {{
     background:{TOOLBAR};

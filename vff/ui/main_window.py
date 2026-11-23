@@ -185,6 +185,11 @@ class MainWindow(FramelessWindow):
             self._sidebar_width = int(self.setting.value("ui/sidebar_width", 372))
         except (TypeError, ValueError):
             self._display_side, self._sidebar_width = DEFAULT_DISPLAY_SIDE, 372
+        self._sidebar_expanded = {}
+        for key in ("edit", "segments"):
+            value = str(self.setting.value(f"ui/sidebar_{key}_expanded", "true"))
+            self._sidebar_expanded[key] = value.strip().lower() not in (
+                "false", "0", "no", "off")
         self._extract_mode, self._scene_threshold = parse_extract_mode(
             str(self.setting.value("ui/extract_mode", "step")))
 
@@ -1190,6 +1195,17 @@ class MainWindow(FramelessWindow):
         self._sidebar_width = width
         self.setting.setValue("ui/sidebar_width", width)
 
+    def _on_sidebar_collapse(self, key: str, expanded: bool):
+        """记住两块卡片各自的展开状态（新开标签也照这个来）。"""
+        key = "segments" if key == "segments" else "edit"
+        self._sidebar_expanded[key] = bool(expanded)
+        self.setting.setValue(f"ui/sidebar_{key}_expanded",
+                              "true" if expanded else "false")
+        source = self.sender()
+        for page in self._pages:
+            if page.side is not source:
+                page.side.set_card_expanded(key, expanded, notify=False)
+
     def _refresh_status(self, *_args):
         self._refresh_tab_states()
         running = self.jobs.running_count
@@ -1423,6 +1439,9 @@ class MainWindow(FramelessWindow):
         page.split.splitterMoved.connect(self._on_splitter_moved)
         page.set_sidebar_width(self._sidebar_width if sidebar_width is None
                                else sidebar_width)
+        for key, expanded in self._sidebar_expanded.items():
+            page.side.set_card_expanded(key, expanded, notify=False)
+        page.side.collapseChanged.connect(self._on_sidebar_collapse)
         name = page.path.name if len(page.path.name) <= 28 \
             else page.path.name[:26] + "…"
         if index is None:

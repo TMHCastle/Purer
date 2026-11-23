@@ -586,6 +586,39 @@ def main() -> int:
         page.clear_markers()
         app.processEvents()
 
+        # ---- B1.7: 侧栏两块卡片 + 外层滚动 ----
+        side = page.side
+        check("sidebar has two cards",
+              side.card_edit.is_expanded() and side.card_segments.is_expanded(),
+              f"{side.card_edit.is_expanded()},{side.card_segments.is_expanded()}")
+        check("sidebar scroll is as-needed",
+              side.scroll.verticalScrollBarPolicy() == Qt.ScrollBarAsNeeded,
+              str(side.scroll.verticalScrollBarPolicy()))
+        tall = side.card_edit.height() + side.card_segments.height()
+        edit_h = side.card_edit.height()
+        check("sidebar scrolls when cards are tall",
+              tall > side.scroll.viewport().height(),
+              f"cards={tall} viewport={side.scroll.viewport().height()}")
+        side.set_card_expanded("edit", False)
+        app.processEvents()
+        collapsed = wait(app, lambda: side.card_edit.height() < edit_h, 2)
+        check("edit card collapses",
+              not side.card_edit.body.isVisible() and collapsed,
+              f"h={side.card_edit.height()} before={edit_h}")
+        check("collapse state saved",
+              str(win.setting.value("ui/sidebar_edit_expanded")).lower() == "false",
+              str(win.setting.value("ui/sidebar_edit_expanded")))
+        side.set_card_expanded("edit", True)
+        seg_h = side.card_segments.height()
+        side.set_card_expanded("segments", False)
+        app.processEvents()
+        seg_collapsed = wait(app, lambda: side.card_segments.height() < seg_h, 2)
+        check("segments card collapses",
+              not side.card_segments.body.isVisible() and seg_collapsed,
+              f"h={side.card_segments.height()} before={seg_h}")
+        side.set_card_expanded("segments", True)
+        app.processEvents()
+
         # ---- B2: 时间轴手柄「垂直拖动」+ 预览跟随被拖的帧 ----
         total = max(1, int(page.info.frames or 0))
         page.set_display_side(320)          # 放大缩略图 → 墙折成多行，才能测纵向拖动

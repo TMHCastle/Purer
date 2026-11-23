@@ -93,6 +93,13 @@ def main() -> int:
         win.resize(1200, 760)
         win.show()
         app.processEvents()
+        screen = win.screen() or QApplication.primaryScreen()
+        area = screen.availableGeometry()
+        check("minimum window fits current screen",
+              win.minimumWidth() <= area.width()
+              and win.minimumHeight() <= area.height(),
+              f"min={win.minimumWidth()}x{win.minimumHeight()} "
+              f"screen={area.width()}x{area.height()}")
 
         # 冒烟测试固定用「每 N 帧」，不读机器上的 ui.ini
         for i in range(win.combo_mode.count()):
@@ -618,6 +625,31 @@ def main() -> int:
               f"h={side.card_segments.height()} before={seg_h}")
         side.set_card_expanded("segments", True)
         app.processEvents()
+
+        # ---- B1.8: 片段列表随数量长高，5 条起步，上限取 2/3 高度 ----
+        from vff.ui.sidebar import SEG_ROW_H, EditSidebar
+        probe = EditSidebar()
+        probe.resize(372, 760)
+        probe.show()
+        app.processEvents()
+
+        def seg_h(count):
+            probe.set_segments([(i, i + 1, None, "") for i in range(count)])
+            app.processEvents()
+            return probe.seg_scroll.height()
+
+        h0, h5, h8, h20 = seg_h(0), seg_h(5), seg_h(8), seg_h(20)
+        max_rows = max(5, int((probe.height() * 2.0 / 3.0) // (SEG_ROW_H + 3)))
+        expected_cap = (max_rows * SEG_ROW_H
+                        + max(0, max_rows - 1) * 3 + 4)
+        check("segments list shows at least 5 rows",
+              h0 >= 5 * SEG_ROW_H and h5 >= 5 * SEG_ROW_H,
+              f"0={h0} 5={h5}")
+        check("segments list grows with count", h8 > h5, f"5={h5} 8={h8}")
+        check("segments list caps at 2/3 height",
+              h20 == expected_cap and max_rows >= 5,
+              f"20={h20} cap={expected_cap} rows={max_rows}")
+        probe.close()
 
         # ---- B2: 时间轴手柄「垂直拖动」+ 预览跟随被拖的帧 ----
         total = max(1, int(page.info.frames or 0))

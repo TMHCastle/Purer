@@ -13,12 +13,25 @@ Windows 上再顺手让 DWM 把圆角/深色边框补上（Win10 不支持就忽
 
 from __future__ import annotations
 
+import ctypes
 import sys
+from ctypes import wintypes
 
 from PySide6.QtCore import QEvent, Qt
 from PySide6.QtWidgets import QApplication, QMainWindow, QWidget
 
 BORDER = 6          # 边缘判定宽度（px）。中央控件的外边距 ≥ 这个值才不挡内容
+
+_HT = {
+    (True, True, False, False): 13,      # left + top
+    (False, True, True, False): 14,      # right + top
+    (True, False, False, True): 16,      # left + bottom
+    (False, False, True, True): 17,      # right + bottom
+    (True, False, False, False): 10,     # left
+    (False, False, True, False): 11,     # right
+    (False, True, False, False): 12,     # top
+    (False, False, False, True): 15,     # bottom
+}
 
 
 def cursor_for(edges) -> Qt.CursorShape:
@@ -77,12 +90,33 @@ class FramelessWindow(QMainWindow):
 
     def _start_resize(self, edges) -> bool:
         handle = self.windowHandle()
-        if handle is None or not edges:
-            return False
-        try:
-            return bool(handle.startSystemResize(edges))
-        except (RuntimeError, TypeError):
-            return False
+        if handle is not None and edges:
+            try:
+                if handle.startSystemResize(edges):
+                    return True
+            except (RuntimeError, TypeError):
+                pass
+        # 极少数构建 startSystemResize 不认（frameless）：发原生 WM_NCLBUTTONDOWN。
+        if sys.platform == "win32" \
+                and QApplication.platformName() == "windows" and edges:
+            key = (bool(edges & Qt.LeftEdge), bool(edges & Qt.TopEdge),
+                   bool(edges & Qt.RightEdge), bool(edges & Qt.BottomEdge))
+            ht = _HT.get(key)
+            if ht is None:
+                return False
+            try:
+                hwnd = int(self.winId())
+                user32 = ctypes.windll.user32
+                user32.SendMessageW.argtypes = [
+                    wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
+                    wintypes.LPARAM]
+                user32.SendMessageW.restype = ctypes.c_ssize_t
+                user32.ReleaseCapture()
+                user32.SendMessageW(hwnd, 0x00A1, ht, 0)
+                return True
+            except (AttributeError, OSError, ValueError):
+                return False
+        return False
 
     # ------------------------------------------------------------ 拉伸光标
     def _set_edge_cursor(self, shape: Qt.CursorShape):

@@ -247,6 +247,8 @@ class EditSidebar(QWidget):
             lambda ok: self.collapseChanged.emit("edit", ok))
         self.card_segments.toggled.connect(
             lambda ok: self.collapseChanged.emit("segments", ok))
+        self.card_segments.toggled.connect(
+            lambda _ok: self._update_segment_height())
 
         content = QWidget()
         content.setObjectName("sideContent")
@@ -283,6 +285,21 @@ class EditSidebar(QWidget):
     def is_card_expanded(self, key: str) -> bool:
         card = self.card_segments if key == "segments" else self.card_edit
         return card.is_expanded()
+
+    def _update_segment_height(self):
+        """片段列表高度：至少 5 条，随片段增加长高；上限取
+        「5 条」和「侧栏 2/3 高度能放下的条数」里的较大者（再向下取整）。
+        """
+        if getattr(self, "seg_scroll", None) is None:
+            return
+        total = max(200, int(self.height()))
+        step = SEG_ROW_H + 3
+        max_rows = max(5, int((total * 2.0 / 3.0) // step))
+        rows = max(5, min(max(1, len(self._segments)), max_rows))
+        height = rows * SEG_ROW_H + max(0, rows - 1) * 3 + 4
+        if self.seg_scroll.height() != height:
+            self.seg_scroll.setFixedHeight(height)
+            self.p_seg.updateGeometry()
 
     # ------------------------------------------------------------ 模块 A
     def _build_info(self) -> QFrame:
@@ -712,6 +729,7 @@ class EditSidebar(QWidget):
         self.btn_export_all.setText(f"✂ 导出全部（{len(segments)}）" if segments
                                     else "✂ 导出全部")
         self.btn_clear_seg.setVisible(bool(segments))
+        self._update_segment_height()
 
     def set_active_segment(self, index: int):
         self._active = index
@@ -805,6 +823,7 @@ class EditSidebar(QWidget):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._apply_preview_height()
+        self._update_segment_height()
         self._fit()
 
     def _apply_preview_height(self):

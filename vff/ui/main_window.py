@@ -791,6 +791,48 @@ class MainWindow(FramelessWindow):
         QApplication.quit()
         return True
 
+    def showEvent(self, event):              # noqa: N802
+        super().showEvent(event)
+        if not getattr(self, "_screen_hooked", False):
+            handle = self.windowHandle()
+            if handle is not None:
+                handle.screenChanged.connect(self._on_screen_changed)
+            self._screen_hooked = True
+        QTimer.singleShot(0, lambda: self._apply_screen_limits(None, resize=True))
+
+    def _on_screen_changed(self, screen):
+        """跨屏时只更新最小尺寸，不在拖动过程中硬改窗口（避免跳变）。"""
+        self._apply_screen_limits(screen, resize=False)
+
+    def _apply_screen_limits(self, screen=None, resize: bool = False):
+        """按当前屏幕可用区域约束最小尺寸（125% / 150% 屏逻辑高度可能 < 720）。
+
+        例如 1707×960 @150% 的屏幕逻辑区只有约 1138×640：如果最小高度还是
+        720，窗口就永远比屏幕高，拖动/缩放都会看起来"坏掉"。
+        """
+        screens = QApplication.screens() or []
+        target = screen or QApplication.screenAt(self.frameGeometry().center()) \
+            or self.screen() or (screens[0] if screens else None)
+        if target is None:
+            return
+        area = target.availableGeometry()
+        self.setMinimumSize(min(1024, max(640, area.width())),
+                            min(720, max(480, area.height())))
+        if not resize or self.isMaximized() or self.isFullScreen():
+            return
+        spans = sum(1 for s in screens
+                    if s.availableGeometry().intersects(self.frameGeometry()))
+        if spans > 1:
+            return
+        width = min(self.width(), area.width())
+        height = min(self.height(), area.height())
+        if (width, height) != (self.width(), self.height()):
+            self.resize(width, height)
+        x = max(area.left(), min(self.x(), area.right() - self.width() + 1))
+        y = max(area.top(), min(self.y(), area.bottom() - self.height() + 1))
+        if (x, y) != (self.x(), self.y()):
+            self.move(x, y)
+
     def changeEvent(self, event):
         """最大化 / 还原时把「□ ↔ ❐」图标换掉。"""
         if event.type() == QEvent.WindowStateChange:

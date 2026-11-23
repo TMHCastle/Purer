@@ -16,6 +16,10 @@
 
 from __future__ import annotations
 
+import ctypes
+import sys
+from ctypes import wintypes
+
 from PySide6.QtCore import QPoint, QSize, Qt, Signal
 from PySide6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QPushButton,
                                QWidget)
@@ -68,6 +72,7 @@ class TitleBar(QWidget):
         self._drag_origin = QPoint()
         self._press_local = QPoint()
         self._dragging = False
+        self._system_moving = False
 
         row = QHBoxLayout(self)
         row.setContentsMargins(12, 4, 8, 4)
@@ -166,11 +171,43 @@ class TitleBar(QWidget):
         self._press_local = event.position().toPoint()
         self._drag_origin = self.window().pos()
         self._dragging = False
+        self._system_moving = False
         event.accept()
+
+    def _start_system_move(self) -> bool:
+        """让 Windows 自己搬窗口：跨不同缩放比例的屏幕时不会算错坐标。"""
+        window = self.window()
+        handle = window.windowHandle()
+        if handle is not None:
+            try:
+                if handle.startSystemMove():
+                    return True
+            except (RuntimeError, AttributeError):
+                pass
+        # 老 Qt / 个别平台不支持 startSystemMove：直接发原生 WM_SYSCOMMAND。
+        # 这是 Windows 无边框窗口的标准做法，跨屏 DPI / 贴边也由系统算。
+        if sys.platform == "win32" \
+                and QApplication.platformName() == "windows":
+            try:
+                hwnd = int(window.winId())
+                user32 = ctypes.windll.user32
+                user32.SendMessageW.argtypes = [
+                    wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
+                    wintypes.LPARAM]
+                user32.SendMessageW.restype = ctypes.c_ssize_t
+                user32.ReleaseCapture()
+                user32.SendMessageW(hwnd, 0x0112, 0xF010, 0)
+                return True
+            except (AttributeError, OSError, ValueError):
+                return False
+        return False
 
     def mouseMoveEvent(self, event):            # noqa: N802
         if not (event.buttons() & Qt.LeftButton) or self._press_global is None:
             super().mouseMoveEvent(event)
+            return
+        if self._system_moving:
+            event.accept()
             return
         window = self.window()
         point = event.globalPosition().toPoint()
@@ -183,17 +220,33 @@ class TitleBar(QWidget):
                 ratio = self._press_local.x() / max(1, window.width())
                 window.showNormal()
                 self.sync_max_button()
+                screen = (QApplication.screenAt(point) or window.screen()
+                          or QApplication.primaryScreen())
+                if screen is not None:
+                    area = screen.availableGeometry()
+                    width = min(window.width(), area.width())
+                    height = min(window.height(), area.height())
+                    if (width, height) != (window.width(), window.height()):
+                        window.resize(width, height)
                 window.move(QPoint(point.x() - int(window.width() * ratio),
                                    point.y() - self._press_local.y()))
                 self._drag_origin = window.pos()
                 self._press_global = point
-        window.move(self._drag_origin + (point - self._press_global))
+            # 普通窗口交给系统拖动（跨屏 DPI / 贴边最大化都由 Windows 处理）
+            if self._start_system_move():
+                self._system_moving = True
+                event.accept()
+                return
+        if not self._system_moving:
+            window.move(self._drag_origin + (point - self._press_global))
         event.accept()
 
     def mouseReleaseEvent(self, event):         # noqa: N802
         if event.button() == Qt.LeftButton and self._dragging:
-            self._snap_if_top()
+            if not self._system_moving:
+                self._snap_if_top()
         self._dragging = False
+        self._system_moving = False
         self._press_global = None
         super().mouseReleaseEvent(event)
 

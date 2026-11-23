@@ -45,7 +45,8 @@ class TrackPage(QWidget):
 
     def __init__(self, path: Path, step: int, tw: int, th: int, info: MediaInfo,
                  queue: JobQueue, parent=None, display_side: int | None = None,
-                 scene_threshold: float | None = None, store=None):
+                 scene_threshold: float | None = None, store=None,
+                 restore: dict | None = None):
         super().__init__(parent)
         self.path = Path(path)
         self.step = float(step)
@@ -83,6 +84,7 @@ class TrackPage(QWidget):
         self.out_frame: int | None = None
         self.segments: list[dict] = []
         self.exports: list[dict] = []      # 已导出的片段文件（打开 / 打开文件夹用）
+        self._restore_pending: dict | None = dict(restore) if restore else None
         self._batch: dict | None = None
         self.batch_job: Job | None = None
 
@@ -437,6 +439,7 @@ class TrackPage(QWidget):
         self._scan(force=True)
         self.job = None
         self._refresh_range()
+        self._apply_pending_restore()            # 抽完才恢复，否则行数还没齐
 
     def stop_extract(self):
         if self.job is not None:
@@ -587,6 +590,111 @@ class TrackPage(QWidget):
         self._refresh_range()
         return bool(segments or exports or rng)
 
+    # ------------------------------------------------- 会话快照（跨重启恢复）
+    def session_snapshot(self) -> dict:
+        """这一页需要跨重启记住的东西（session.py 的 tab 结构）。
+
+        还没套上「待恢复状态」的页面（刚建好、图墙还在抽）：用待恢复值兜底，
+        否则中途存盘会把片段/入出点抹掉。
+        """
+        pending = self._restore_pending or {}
+        row = 0
+        try:
+            index = self.view.indexAt(QPoint(4, 4))
+            if index.isValid():
+                row = index.row()
+        except RuntimeError:
+            row = 0
+
+        segments = [{"t_in": float(s["t_in"]),
+                     "t_end": float(s["t_end"]),
+                     "name": str(s.get("name") or "")}
+                    for s in self.segments]
+        if not segments:
+            segments = list(pending.get("segments") or [])
+        exports = [dict(item) for item in self.exports[-100:]]
+        if not exports:
+            exports = list(pending.get("exports") or [])
+
+        def _pick(key, value):
+            return value if value is not None else pending.get(key)
+
+        return {
+            "path": str(self.path),
+            "step": self.step,
+            "mode": self.mode,
+            "threshold": self.threshold if self.mode == "scene" else None,
+            "display_side": self.display_side,
+            "sidebar_width": self.sidebar_width(),
+            "cursor_frame": _pick("cursor_frame", self.cursor_frame),
+            "in_frame": _pick("in_frame", self.in_frame),
+            "out_frame": _pick("out_frame", self.out_frame),
+            "scroll_row": row or int(pending.get("scroll_row") or 0),
+            "segments": segments,
+            "exports": exports,
+        }
+
+    def session_restore(self, data: dict) -> bool:
+        """把会话里的片段/入出点/光标/滚动套回界面（图墙就绪之后调用）。"""
+        if not isinstance(data, dict):
+            return False
+        limit = max(0, int(self.info.frames or 0) - 1)
+
+        def _frame(key):
+            value = data.get(key)
+            if value is None:
+                return None
+            try:
+                return max(0, min(limit, int(value)))
+            except (TypeError, ValueError):
+                return None
+
+        in_frame, out_frame = _frame("in_frame"), _frame("out_frame")
+        if in_frame is not None and out_frame is not None and out_frame <= in_frame:
+            out_frame = None
+        self.in_frame, self.out_frame = in_frame, out_frame
+
+        segments = data.get("segments") or []
+        exports = data.get("exports") or []
+        if segments or exports:
+            self.apply_state({"segments": segments,
+                              "range": {"in": in_frame, "out": out_frame},
+                              "exports": exports})
+        else:
+            self._refresh_range()
+
+        cursor = _frame("cursor_frame")
+        if cursor is None:
+            cursor = in_frame if in_frame is not None else 0
+        if self.model.rowCount():
+            self._set_cursor(cursor)
+
+        try:
+            width = int(data.get("sidebar_width") or 0)
+        except (TypeError, ValueError):
+            width = 0
+        if width > 0:
+            self.set_sidebar_width(width)
+
+        try:
+            row = int(data.get("scroll_row") or 0)
+        except (TypeError, ValueError):
+            row = 0
+        if 0 < row < self.model.rowCount():
+            self.view.scrollTo(self.model.index(row),
+                               QAbstractItemView.PositionAtTop)
+        return True
+
+    def _apply_pending_restore(self) -> bool:
+        """图墙一就绪就把待恢复的状态套上去（只做一次）。"""
+        data, self._restore_pending = self._restore_pending, None
+        if not data or not self.model.rowCount():
+            return False
+        try:
+            return self.session_restore(data)
+        except Exception:      # noqa: BLE001  恢复失败不能影响看图
+            return False
+
     def _record_export(self, out: Path, kind: str = ""):
         """记一条「已导出的片段文件」，顺手把片段状态存进缓存。"""
         try:
@@ -686,6 +794,7 @@ class TrackPage(QWidget):
         if self.model.rowCount():
             self.view.setCurrentIndex(self.model.index(0))
         self.apply_state(self._read_state())     # 片段 / 入点出点 / 导出记录
+        self._apply_pending_restore()            # 会话快照优先于缓存里的旧状态
         return True
 
     def _save_scene_meta(self):

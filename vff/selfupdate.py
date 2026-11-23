@@ -155,6 +155,69 @@ def cleanup_old(exe=None) -> bool:
     return False
 
 
+# --------------------------------------------------------------------------- #
+# 进程存活（新版本「等旧进程退出再开窗」用；不依赖 Qt，好单测）
+# --------------------------------------------------------------------------- #
+STILL_ACTIVE = 259
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+ACCESS_DENIED = 5
+
+
+def pid_alive(pid) -> bool:
+    """这个 PID 现在还活着吗？（不确定时按「活」处理，宁可多等一会儿）"""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        return True
+    import ctypes
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        # 拿不到句柄：可能是权限不足（进程还在），也可能是真没了
+        return ctypes.get_last_error() == ACCESS_DENIED
+    try:
+        code = ctypes.c_ulong(0)
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return True                     # 查不动就当还活着
+        return int(code.value) == STILL_ACTIVE
+    finally:
+        try:
+            kernel32.CloseHandle(handle)
+        except OSError:
+            pass
+
+
+def wait_for_pid(pid, timeout: float = 30.0, interval: float = 0.1) -> bool:
+    """等旧进程退出；返回 True = 已退出（或本来就不在）。
+
+    超时返回 False —— 调用方自己决定「照常开窗」还是提示，别在这里卡死。
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return True
+    if pid <= 0:
+        return True
+    import time
+
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    interval = max(0.02, float(interval))
+    while True:
+        if not pid_alive(pid):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(interval)
+
+
 def auto_install_enabled() -> bool:
     """``PURER_NO_AUTO_UPDATE=1`` → 只提示，不自动下载安装。"""
     flag = os.environ.get("PURER_NO_AUTO_UPDATE", "").strip().lower()

@@ -43,6 +43,8 @@ USAGE = """Purer {ver} · 视频抽帧浏览 / 帧精确切片
         -o, --out <文件>      输出文件（默认自动命名）
         --lossless            强制无损复制（默认：能精确就精确到帧）
         --no-snap             无损模式下不吸附到关键帧
+  --resume                 恢复上次的标签页（更新重启时自动带上）
+  --no-restore             这次不恢复上次的会话
   -h, --help               显示本帮助
 """
 
@@ -407,6 +409,9 @@ def main(argv: list[str] | None = None) -> int:
                     or EXTRACT_LONG_SIDE)
     no_snap = _pop_flag(argv, "--no-snap")
     lossless = _pop_flag(argv, "--lossless")
+    resume = _pop_flag(argv, "--resume")
+    no_restore = _pop_flag(argv, "--no-restore")
+    after_pid = _pop_value(argv, "--after-pid")
 
     if mode == "probe":
         if not argv:
@@ -444,6 +449,16 @@ def main(argv: list[str] | None = None) -> int:
     install_crash_log()
     start_debug_watchdog()
 
+    # 更新重启：新进程先等旧进程退出，再建窗口（否则两个窗口会短暂打架）
+    if after_pid:
+        try:
+            old_pid = int(str(after_pid).strip())
+        except (TypeError, ValueError):
+            old_pid = 0
+        if old_pid > 0:
+            from .selfupdate import wait_for_pid
+            wait_for_pid(old_pid, timeout=30.0)
+
     # 本机默认 locale 是 zh_HK，Qt 会把 24 格式化成「〢〤」（苏州码子），强制普通数字
     QLocale.setDefault(QLocale.c())
     QApplication.setApplicationName(APP_NAME)
@@ -461,11 +476,6 @@ def main(argv: list[str] | None = None) -> int:
     clean_cache()
 
     win = MainWindow()
-    # 上一次自更新留下的旧 exe（Purer.exe.old）到这里已经确认新版本能跑起来，删掉
-    try:
-        cleanup_old()
-    except Exception:      # noqa: BLE001  删不掉不影响使用
-        pass
     screen = app.primaryScreen()
     restored = win.restore_geometry()
     if not restored and screen is not None:
@@ -473,6 +483,19 @@ def main(argv: list[str] | None = None) -> int:
         win.resize(min(1480, int(g.width() * 0.94)), min(900, int(g.height() * 0.92)))
         win.move(g.center() - win.rect().center())
     win.show()
+
+    # 上一次自更新留下的旧 exe（Purer.exe.old）：窗口都建出来了，说明新版本能跑，删掉
+    try:
+        cleanup_old()
+    except Exception:      # noqa: BLE001  删不掉不影响使用
+        pass
+
+    # 会话恢复：显式打开文件时以「你要看的那个视频」为准，不恢复旧标签
+    if not no_restore and (resume or not argv):
+        try:
+            win.restore_session()
+        except Exception:      # noqa: BLE001  恢复失败不能导致打不开程序
+            pass
 
     if argv:
         videos = []

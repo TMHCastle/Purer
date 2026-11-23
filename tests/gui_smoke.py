@@ -1042,6 +1042,94 @@ def main() -> int:
         guide.close()
         app.processEvents()
 
+        # ---- 4. 会话快照：保存 → 换个窗口恢复（更新重启 / 崩溃恢复都靠它） ----
+        from vff import session as session_state
+
+        live = win.session_payload()
+        check("session payload covers every tab",
+              len(live["tabs"]) == win.tabs.count() and win.tabs.count() >= 3,
+              f"{len(live['tabs'])} vs {win.tabs.count()}")
+        check("session tab carries settings",
+              all(t.get("path") and t.get("step") for t in live["tabs"]),
+              str(live["tabs"][:1]))
+        check("session saves to disk",
+              win.save_session("smoke") and session_state.load()["tabs"],
+              str(session_state.session_file()))
+
+        # 造一份"上次的会话"：两个视频 + 当前帧 + 入出点 + 片段 + 导出记录
+        crafted = {
+            "version": 1, "saved_at": time.time(), "reason": "update",
+            "window": {"geometry": "", "maximized": False},
+            "tabs": [
+                {"path": str(clips[0]), "step": 24, "mode": "step",
+                 "threshold": None, "display_side": 200, "sidebar_width": 380,
+                 "cursor_frame": 60, "in_frame": 24, "out_frame": 90,
+                 "scroll_row": 2,
+                 "segments": [{"t_in": 1.0, "t_end": 2.0, "name": "开场"}],
+                 "exports": [{"path": str(tmp / "old.mp4"), "at": 1.0,
+                              "size": 4096, "kind": "帧精确"}]},
+                {"path": str(clips[1]), "step": 24, "mode": "step",
+                 "threshold": None, "display_side": 160, "sidebar_width": 372,
+                 "cursor_frame": 30, "in_frame": None, "out_frame": None,
+                 "scroll_row": 0, "segments": [], "exports": []},
+            ],
+            "current": 1,
+        }
+        check("session file written", session_state.save(crafted),
+              str(session_state.session_file()))
+
+        win2 = MainWindow()
+        win2.setAttribute(Qt.WA_DontShowOnScreen, True)
+        win2.resize(1200, 760)
+        win2.show()
+        app.processEvents()
+        restored = win2.restore_session()
+        check("session restores tab count", restored == 2 and win2.tabs.count() == 2,
+              f"restored={restored} tabs={win2.tabs.count()}")
+        page_a = win2.tabs.widget(0)
+        page_b = win2.tabs.widget(1)
+        ready = wait(app, lambda: page_a is not None and page_b is not None
+                     and not page_a.busy and not page_b.busy
+                     and page_a.model.rowCount() > 0 and page_b.model.rowCount() > 0,
+                     180)
+        check("session pages loaded", ready, "not ready")
+        if ready:
+            check("session keeps tab order",
+                  Path(page_a.path) == clips[0] and Path(page_b.path) == clips[1],
+                  f"{page_a.path} | {page_b.path}")
+            check("session restores current tab",
+                  win2.tabs.currentIndex() == 1, str(win2.tabs.currentIndex()))
+            check("session restores range",
+                  page_a.in_frame == 24 and page_a.out_frame == 90,
+                  f"{page_a.in_frame}..{page_a.out_frame}")
+            check("session restores cursor",
+                  page_a.cursor_frame == 60, str(page_a.cursor_frame))
+            check("session restores segments",
+                  len(page_a.segments) == 1
+                  and page_a.segments[0]["name"] == "开场",
+                  str(page_a.segments))
+            check("session restores export list",
+                  any("old.mp4" in str(e.get("path")) for e in page_a.exports),
+                  str(page_a.exports[:2]))
+            check("session restores display side",
+                  page_a.display_side == 200, str(page_a.display_side))
+            check("session restore is one-shot",
+                  page_a._restore_pending is None)
+            check("second tab keeps its own state",
+                  page_b.in_frame is None and page_b.out_frame is None)
+
+        # 坏会话：不能崩，也不能恢复出东西
+        session_state.session_file().write_text("{ broken", encoding="utf-8")
+        check("broken session is ignored",
+              session_state.load()["tabs"] == []
+              and win2.restore_session() == 0,
+              str(session_state.load()["tabs"]))
+
+        win2.app_settings.update_cache(mode="usage", skip_close_prompt=True)
+        win2.app_settings.save()
+        win2.close()
+        app.processEvents()
+
         win.close()
         app.processEvents()
     finally:

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import time
 from pathlib import Path
 
 from PySide6.QtCore import (QByteArray, QEvent, QProcess, QSettings, QSize,
@@ -30,6 +31,7 @@ from ..jobs import JobQueue
 from ..media import find_videos, thumb_size_for
 from ..selfupdate import (app_exe, apply_update, auto_install_enabled,
                           can_self_update, download_path, verify_file)
+from .. import session as session_state
 from ..settings import (CACHE_MODE_NEVER, CACHE_MODE_USAGE, Settings,
                         close_prompt_needed, usage_meets)
 from ..update import RELEASES_PAGE, ReleaseChecker
@@ -184,6 +186,10 @@ class MainWindow(FramelessWindow):
         self.jobs = JobQueue(max_concurrent=JOBS_MAX_CONCURRENT, parent=self)
         self.jobs.jobStarted.connect(self._refresh_status)
         self.jobs.jobFinished.connect(self._refresh_status)
+
+        # 会话快照（标签/帧/入出点/片段）：定时落盘，更新重启 / 崩溃后接上
+        self._session_reason = "auto"
+        self._restoring = False
 
         # 设置（持久）+ 已保存的缓存库
         self.app_settings = Settings()
@@ -515,7 +521,7 @@ class MainWindow(FramelessWindow):
             self._install_update()
 
     def _install_update(self) -> bool:
-        """把下载好的 exe 换掉自己，然后重启新版本。"""
+        """把下载好的 exe 换掉自己，然后「无缝重启」（会话快照 + --resume）。"""
         if not self._pending_exe:
             return False
         exe = app_exe()
@@ -530,6 +536,14 @@ class MainWindow(FramelessWindow):
             QMessageBox.warning(self, "安装更新", f"安装包校验失败：{why}")
             QDesktopServices.openUrl(QUrl(RELEASES_PAGE))
             return False
+        # 1) 先把「我正在干什么」记下来（更新重启后要原样接上）
+        self.save_session("update")
+        self._flush_all_usage()
+        try:
+            self.setting.sync()
+        except (RuntimeError, OSError):
+            pass
+        # 2) 换文件（运行中改名 + 挪入；失败会自动回滚，界面还能继续用）
         ok, why = apply_update(self._pending_exe, exe)
         if not ok:
             QMessageBox.warning(
@@ -537,11 +551,27 @@ class MainWindow(FramelessWindow):
                 f"{why}\n\n可以到发布页手动下载，或把 Purer 放到有写权限的目录再试。")
             QDesktopServices.openUrl(QUrl(RELEASES_PAGE))
             return False
-        started = QProcess.startDetached(str(exe))
+        # 3) 拉起新版本，让它等这个进程退出之后再开窗（避免两个窗口打架）
+        started = QProcess.startDetached(
+            str(exe), ["--resume", "--after-pid", str(os.getpid())])
         started_ok = started[0] if isinstance(started, tuple) else bool(started)
         if not started_ok:
-            QMessageBox.information(self, "安装更新",
-                                    "新版本已就位，请手动重新打开 Purer。")
+            QMessageBox.information(
+                self, "安装更新",
+                "新版本已就位，但没能自动重启。\n"
+                "这次的会话已经保存，手动重新打开 Purer 就能接着干。")
+            return True
+        for page in list(self._pages):
+            try:
+                page.shutdown()
+            except Exception:          # noqa: BLE001
+                pass
+        self.jobs.cancel_all()
+        for worker in ("updater", "downloader"):
+            try:
+                getattr(self, worker).cancel()      # 别把 curl 子进程留在后台
+            except (AttributeError, RuntimeError):
+                pass
         QApplication.quit()
         return True
 
@@ -559,6 +589,16 @@ class MainWindow(FramelessWindow):
         self._state_timer.timeout.connect(self._on_state_tick)
         self._state_timer.start()
         self._state_ticks = 0
+        # 会话快照：30 秒一次。崩溃/断电最多丢半分钟，写盘量只有几 KB。
+        self._session_timer = QTimer(self)
+        self._session_timer.setInterval(30000)
+        self._session_timer.timeout.connect(self._on_session_tick)
+        self._session_timer.start()
+
+    def _on_session_tick(self):
+        if self._restoring or not self.tabs.count():
+            return
+        self.save_session("auto")
 
     def _on_state_tick(self):
         self._refresh_tab_states()
@@ -1158,12 +1198,14 @@ class MainWindow(FramelessWindow):
                          store=self.cache_store)
         return self._insert_page(page, index=index)
 
-    def _insert_page(self, page: TrackPage, index: int | None = None) -> bool:
+    def _insert_page(self, page: TrackPage, index: int | None = None,
+                     sidebar_width: int | None = None) -> bool:
         """把已经建好的 TrackPage 接进标签栏并开始加载。"""
         page.reload_requested.connect(self._on_reload)
         page.display_side_changed.connect(self._on_page_display_side)
         page.split.splitterMoved.connect(self._on_splitter_moved)
-        page.set_sidebar_width(self._sidebar_width)
+        page.set_sidebar_width(self._sidebar_width if sidebar_width is None
+                               else sidebar_width)
         name = page.path.name if len(page.path.name) <= 28 \
             else page.path.name[:26] + "…"
         if index is None:
@@ -1180,6 +1222,8 @@ class MainWindow(FramelessWindow):
         self._refresh_stack()
         self._refresh_status()
         self._refresh_tab_states()
+        if not self._restoring:
+            self.save_session("tabs")
         return True
 
     def _install_tab_close(self, index: int, page: TrackPage):
@@ -1230,6 +1274,8 @@ class MainWindow(FramelessWindow):
         self._forget_page(page)
         page.deleteLater()
         self._refresh_stack()
+        if not self._restoring:
+            self.save_session("tabs")
 
     def clear_all(self):
         while self.tabs.count():
@@ -1264,6 +1310,140 @@ class MainWindow(FramelessWindow):
             return
         super().keyPressEvent(e)
 
+    # ------------------------------------------------------------ 会话快照
+    def session_payload(self) -> dict:
+        """把当前界面打包成 session.py 的结构。"""
+        tabs = []
+        for index in range(self.tabs.count()):
+            page = self.tabs.widget(index)
+            if not isinstance(page, TrackPage):
+                continue
+            try:
+                tabs.append(page.session_snapshot())
+            except Exception:          # noqa: BLE001  某一页坏了不能拖累其他
+                continue
+        try:
+            geometry = bytes(self.saveGeometry().toBase64()).decode("ascii")
+        except RuntimeError:
+            geometry = ""
+        return {
+            "version": session_state.SESSION_VERSION,
+            "saved_at": time.time(),
+            "reason": self._session_reason,
+            "window": {"geometry": geometry,
+                       "maximized": bool(self.isMaximized())},
+            "tabs": tabs,
+            "current": max(0, self.tabs.currentIndex()),
+        }
+
+    def save_session(self, reason: str = "auto") -> bool:
+        """落盘（原子写）；失败不提示 —— 丢会话可以接受，弹窗打断不行。"""
+        self._session_reason = reason
+        try:
+            return session_state.save(self.session_payload())
+        except Exception:              # noqa: BLE001
+            return False
+
+    def restore_session(self) -> int:
+        """按 session.json 重建标签页；返回成功恢复的页数。"""
+        data = session_state.load()
+        entries = data.get("tabs") or []
+        if not entries:
+            return 0
+        window = data.get("window") or {}
+        if window.get("geometry"):
+            self._apply_session_geometry(window)
+        self._restoring = True
+        restored, missing = 0, []
+        try:
+            for entry in entries:
+                try:
+                    if self._restore_tab(entry):
+                        restored += 1
+                    else:
+                        missing.append(str(entry.get("path") or "?"))
+                except Exception:      # noqa: BLE001  单个标签失败不影响其他
+                    missing.append(str(entry.get("path") or "?"))
+        finally:
+            self._restoring = False
+        if restored:
+            self._select_restored(data, entries)
+            self.save_session("auto")
+            text = f"已恢复上次的 {restored} 个标签页"
+            if missing:
+                text += f"（{len(missing)} 个视频找不到，已跳过）"
+            self.lbl_status.setText(text)
+        elif missing:
+            self.lbl_status.setText(
+                f"上次的 {len(missing)} 个视频都不在了，没有恢复任何标签页")
+        return restored
+
+    def _restore_tab(self, entry: dict) -> bool:
+        """按会话里的一份记录重建一个 TrackPage（缓存命中则秒开）。"""
+        path = Path(str(entry.get("path") or ""))
+        if not path.is_file():
+            return False
+        try:
+            info = probe(path)
+        except Exception:              # noqa: BLE001
+            return False
+        try:
+            step = max(STEP_MIN, min(STEP_MAX, float(entry.get("step")
+                                                     or DEFAULT_STEP)))
+        except (TypeError, ValueError):
+            step = float(DEFAULT_STEP)
+        threshold = None
+        if entry.get("mode") == "scene":
+            try:
+                threshold = max(0.01, min(0.99,
+                                           float(entry.get("threshold") or 0.30)))
+            except (TypeError, ValueError):
+                threshold = 0.30
+        try:
+            side = int(entry.get("display_side") or DEFAULT_DISPLAY_SIDE)
+        except (TypeError, ValueError):
+            side = DEFAULT_DISPLAY_SIDE
+        tw, th = self._thumb_size_for(info)
+        page = TrackPage(path, step, tw, th, info, self.jobs,
+                         display_side=side,
+                         scene_threshold=threshold,
+                         store=self.cache_store,
+                         restore=entry)
+        return self._insert_page(page, sidebar_width=entry.get("sidebar_width"))
+
+    def _select_restored(self, data: dict, entries: list) -> None:
+        """切回上次停留的那个视频（按路径匹配，跳过恢复失败的页）。"""
+        try:
+            wanted = entries[int(data.get("current") or 0)].get("path")
+        except (IndexError, TypeError, ValueError):
+            wanted = None
+        if not wanted:
+            return
+        for index in range(self.tabs.count()):
+            page = self.tabs.widget(index)
+            if isinstance(page, TrackPage) and str(page.path) == str(wanted):
+                self.tabs.setCurrentIndex(index)
+                return
+
+    def _apply_session_geometry(self, window: dict) -> bool:
+        raw = str(window.get("geometry") or "")
+        if not raw:
+            return False
+        try:
+            state = QByteArray.fromBase64(raw.encode("ascii"))
+            if state.isEmpty():
+                return False
+            self.restoreGeometry(state)
+        except (RuntimeError, ValueError):
+            return False
+        screens = QApplication.screens() or []
+        if screens and not any(s.availableGeometry().intersects(self.frameGeometry())
+                               for s in screens):
+            return False
+        if window.get("maximized"):
+            self.showMaximized()
+        return True
+
     def restore_geometry(self) -> bool:
         """恢复上一次的窗口大小 / 位置（超出所有屏幕就放弃，用默认尺寸）。"""
         state = self.setting.value("ui/window_geometry")
@@ -1286,6 +1466,7 @@ class MainWindow(FramelessWindow):
         if not self._handle_close_cache():
             e.ignore()
             return
+        self.save_session("close")          # 关窗前把标签/帧/片段记下来
         try:
             self.setting.setValue("ui/window_geometry", self.saveGeometry())
             self.setting.setValue("ui/window_maximized", self.isMaximized())

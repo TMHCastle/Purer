@@ -15,7 +15,7 @@ from __future__ import annotations
 from PySide6.QtCore import QSize, QTimer, Qt, Signal
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton
 
-from ..config import APP_VERSION, effective_version
+from ..config import effective_version
 from .style import ACCENT, DIM, OK, WARN
 
 # state -> (圆点色, 边框色, 底色, 文字色)

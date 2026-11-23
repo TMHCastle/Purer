@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (QApplication, QDialog, QFileDialog, QFrame, QHBox
 
 from ..cache import cache_root
 from ..cache_store import CacheStore
-from ..config import (APP_NAME, APP_VERSION, DEFAULT_DISPLAY_SIDE, DEFAULT_STEP,
+from ..config import (APP_NAME, DEFAULT_DISPLAY_SIDE, DEFAULT_STEP,
                       DISPLAY_MAX, DISPLAY_MIN, DISPLAY_PRESETS, DISPLAY_STEP,
                       EXTRACT_LONG_SIDE, JOBS_MAX_CONCURRENT, MAX_THUMBS_WARN,
                       STEP_MAX, STEP_MIN, STEP_PRESETS, STEP_PRESETS_FRACTIONAL,

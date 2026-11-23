@@ -291,6 +291,36 @@ pip install PySide6
 python Purer.py
 ```
 
+## 发布规则（务必遵守）
+
+这是本项目的硬规矩 —— 违反会让用户「看到更新但装不上」，或者「旧代码盖住新 exe」。
+
+### 1. 按改动类型选发布形态
+
+| 改了什么 | 发什么 | 版本号 |
+|---|---|---|
+| 只改 `vff/` 里的纯 Python（逻辑 / 文案 / 小 UI 调整） | **只发** `Purer-code-<ver>.zip` | 正常递增（1.2.1、1.2.2…） |
+| 动了界面资源 / 打包数据 / 依赖 / `purer_boot.py` / 引导层 | **发** `Purer.exe`，并把 `CODE_BASE_VERSION` 抬到这个版本 | 正常递增 |
+| 两者都有 | **只发 exe**（结构变更是主因，包没必要挂） | 同上 |
+
+**同一个版本号不要同时发 exe 和 code 包**：两者版本相同 → 包会被判定为「已过期」，
+客户端直接忽略，等于白挂（还容易让老用户看到「有更新但装不上」）。
+
+### 2. 发布检查清单
+
+- [ ] `vff/config.py` 的 `APP_VERSION` 改好了
+- [ ] 只改代码 → `CODE_BASE_VERSION` 不动；改了结构 → 抬到新版本
+- [ ] 单测 / 界面冒烟 / `tests\hotfix_smoke.py` 全绿
+- [ ] `python build.py`（产出 `Purer.exe` + `Purer-code-<ver>.zip`）
+- [ ] `Purer.exe --selftest` 与 `Purer.exe --code-info` 正常
+- [ ] `git tag v<ver>` 并 push；Release 只挂上表对应的资产
+
+### 3. 客户端怎么选（对照用）
+
+1. 发布里有 `Purer-code-*.zip`，且包比当前 exe 新、`exe_min` 满足 → **热补丁**（不重启）；
+2. 否则有 `Purer.exe` → **无缝重启**（会话快照接上）；
+3. 包比 exe 旧 / `exe_min` 不满足 → 启动时**自动删除**，不干扰。
+
 ## 打包
 
 ```

@@ -42,6 +42,7 @@ from ..update import RELEASES_PAGE, ReleaseChecker
 from ..util import fmt_tc
 from ..version import normalize
 from ..log import debug, debug_enabled
+from .cache_badge import CacheBadge
 from .cache_list import CacheImportDialog, sorted_entries
 from .frameless import FramelessWindow
 from .settings_dialog import CloseCacheDialog, SettingsDialog
@@ -257,6 +258,10 @@ class MainWindow(FramelessWindow):
         bar_palette.setColor(QPalette.Light, QColor(BG))
         bar_palette.setColor(QPalette.Midlight, QColor(BG))
         tab_bar.setPalette(bar_palette)
+        # 缓存红绿灯：蓝色「未缓存」时点一下即可手动保存这一页（旧版功能恢复）
+        self.cache_badge = CacheBadge(self.tabs)
+        self.cache_badge.clicked.connect(self._on_cache_badge_clicked)
+        self.tabs.setCornerWidget(self.cache_badge, Qt.TopLeftCorner)
         self._tab_states: list[str] = []
         self.stack.addWidget(self.empty)
         self.stack.addWidget(self.tabs)
@@ -903,6 +908,30 @@ class MainWindow(FramelessWindow):
                 path = getattr(page, "path", "")
                 self.tabs.setTabToolTip(i, f"{path}\n{tip}" if tip else str(path))
             bar.refresh_states()
+        self._refresh_cache_badge()
+
+    def _refresh_cache_badge(self):
+        badge = getattr(self, "cache_badge", None)
+        if badge is None:
+            return
+        page = self.tabs.currentWidget() if self.tabs.count() else None
+        state = self.page_cache_state(page)
+        tips = {
+            "loading": "正在抽帧 / 加载缓存…",
+            "ready": "图墙已加载，但还没保存缓存\n点这里保存（下次打开直接加载）",
+            "saved": "这一份图墙已经保存到缓存\n下次打开同一个视频会直接加载",
+            "none": "当前没有可保存的缓存",
+        }
+        badge.set_state(state, tips.get(state, ""))
+
+    def _on_cache_badge_clicked(self):
+        page = self.tabs.currentWidget() if self.tabs.count() else None
+        if not isinstance(page, TrackPage):
+            return
+        if self.page_cache_state(page) != "ready":
+            return
+        self._save_page_manually(page)
+        self._refresh_tab_states()
 
     def _auto_save_pass(self) -> int:
         """按自动保存策略把「已完成但还没进库」的页面悄悄存掉（标签会转绿）。"""

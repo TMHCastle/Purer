@@ -369,17 +369,22 @@ def main() -> int:
         check("tab state is ready (blue) after load",
               win.page_cache_state(page2) == "ready" and bar.state_of(2) == "ready",
               f"{win.page_cache_state(page2)} / {bar.state_of(2)}")
+        check("cache badge shows ready", win.cache_badge.state_name() == "ready",
+              win.cache_badge.state_name())
         blue = tab_fill(2)
         check("uncached tab is tinted blue",
               blue.blue() - blue.red() >= 12,
               f"rgb={blue.red(),blue.green(),blue.blue()}")
-        win._save_page_manually(page2)
+        QTest.mouseClick(win.cache_badge, Qt.LeftButton)
         app.processEvents()
         win._refresh_tab_states()
-        check("manual save marks tab green",
+        check("manual cache badge click saves",
               win.page_cache_state(page2) == "saved"
               and win.cache_store.has(page2.cache_digest()),
               win.page_cache_state(page2))
+        check("cache badge turns saved",
+              win.cache_badge.state_name() == "saved",
+              win.cache_badge.state_name())
         green = tab_fill(2)
         check("cached tab is tinted green",
               green.green() - green.red() >= 10

@@ -18,6 +18,8 @@ _screenshots_*/
 *.bak.*
 # 默认的已保存缓存目录（Purer 同目录下，v1.1.9 起）
 /cache/
+# 临时渲染缓存（Purer 同目录，v1.2.6 起；不再放 %TEMP%）
+/cache_tmp/
 # 自更新留下的旧 exe（Purer.exe.old）；注意 gitignore 不支持行尾注释
 *.old
 ffmpeg.ini

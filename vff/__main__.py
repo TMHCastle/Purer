@@ -471,7 +471,7 @@ def main(argv: list[str] | None = None) -> int:
     from .ui.main_window import MainWindow
     from .ui.style import apply_theme
 
-    # 窗口版没有控制台：未捕获异常（含 Qt 槽函数里的）落到 %TEMP%\Purer_cache\error.log
+    # 窗口版没有控制台：未捕获异常（含 Qt 槽函数里的）落到缓存目录的 error.log
     install_crash_log()
     start_debug_watchdog()
 

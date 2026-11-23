@@ -3,7 +3,7 @@
 
 三个东西，全部只在需要时打开：
 
-* ``install_crash_log()`` —— 未捕获异常落到 ``%TEMP%\\Purer_cache\\error.log``
+* ``install_crash_log()`` —— 未捕获异常落到缓存目录的 ``error.log``
   （``PURER_UPDATE_DEBUG`` 不用开，默认就生效）；
 * ``debug()`` —— 调试痕迹写 ``update.log``，需要 ``PURER_UPDATE_DEBUG=1``；
 * ``start_debug_watchdog()`` —— 每 12 秒把所有线程的栈写进 ``debug_stacks.txt``，
@@ -69,7 +69,7 @@ def start_debug_watchdog(interval_s: int = 12):
 
 
 def install_crash_log() -> Path:
-    """把未捕获异常（含 Qt 槽函数里的）落到 ``%TEMP%\\Purer_cache\\error.log``。"""
+    """把未捕获异常（含 Qt 槽函数里的）落到缓存目录的 ``error.log``。"""
     path = log_path("error.log")
 
     def hook(exc_type, exc, tb):

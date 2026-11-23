@@ -6,13 +6,12 @@ from __future__ import annotations
 import configparser
 import os
 import sys
-import tempfile
 from pathlib import Path
 
 APP_NAME = "Purer"
 APP_TAGLINE = "视频抽帧浏览 / 帧精确切片"
 APP_ID = "Purer"
-APP_VERSION = "1.2.5"
+APP_VERSION = "1.2.6"
 # 热补丁包的兼容基线：以后打的代码包只支持 **>= 这个版本** 的 exe。
 # 动了引导层 / 打包数据 / 依赖（这些热补丁改不了的东西）才需要往上抬。
 CODE_BASE_VERSION = "1.2.0"
@@ -128,17 +127,33 @@ def bundle_dir() -> Path | None:
     return Path(base) if base else None
 
 
-def cache_root() -> Path:
-    """缩略图缓存根目录。PURER_CACHE_DIR 可覆盖（测试/便携用）。
+_TEMP_CACHE_ROOT: Path | None = None
 
-    这是「本次渲染用的临时目录」：同一视频同设置重开会秒开，
-    但重启电脑 / 清理临时文件后就没了。要跨重启保留请用
-    :func:`persistent_cache_root`（设置-缓存 里管理）。
+
+def cache_root() -> Path:
+    """缩略图缓存根目录。``PURER_CACHE_DIR`` 可覆盖（测试/便携用）。
+
+    默认放在 **Purer 同目录的 ``cache_tmp\\``**（和持久缓存同盘，硬链接才生效；
+    也避免把几百 MB 塞进 C 盘 ``%TEMP%``）。程序目录不可写时才退回数据目录。
     """
     override = os.environ.get("PURER_CACHE_DIR")
     if override:
         return Path(override)
-    return Path(tempfile.gettempdir()) / f"{APP_ID}_cache"
+    global _TEMP_CACHE_ROOT
+    if _TEMP_CACHE_ROOT is not None:
+        return _TEMP_CACHE_ROOT
+    candidate = app_dir() / "cache_tmp"
+    try:
+        candidate.mkdir(parents=True, exist_ok=True)
+        probe = candidate / ".purer_write_test"
+        probe.write_bytes(b"")
+        probe.unlink()
+        _TEMP_CACHE_ROOT = candidate
+        return candidate
+    except OSError:
+        fallback = data_dir() / "cache_tmp"
+        _TEMP_CACHE_ROOT = fallback
+        return fallback
 
 
 def data_dir() -> Path:

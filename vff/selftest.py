@@ -38,6 +38,7 @@ def run(app) -> int:
     # 自检不能动用户真实的「设置 / 已保存缓存」
     os.environ["PURER_DATA_DIR"] = str(tmp / "data")
     os.environ["PURER_PERSIST_CACHE_DIR"] = str(tmp / "cache")
+    os.environ["PURER_CACHE_DIR"] = str(tmp / "rendercache")
     log: list[str] = []
     ok = True
     try:

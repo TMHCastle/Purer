@@ -83,7 +83,8 @@ vff/
   hotfix.py             窄热补丁：校验 zip / 解包 / 安装 / 回退
   settings.py           应用设置（持久 JSON：缓存策略 / 上限 / 关闭提醒 / 更新提醒）
   session.py            会话快照：标签 / 当前帧 / 入出点 / 片段 / 导出（跨重启恢复）
-  cache.py              临时渲染缓存：缓存 key、目录、7 天回收
+  cache.py              临时渲染缓存：purer 同盘 cache_tmp、缓存 key、7 天回收
+  cache_migrate.py      一次性把旧 C 盘缓存搬到 Purer 同盘（复制校验后删旧）
   cache_store.py        持久缓存库：保存 / 恢复 / 使用统计 / 体积收敛
   export_names.py       批量导出的素材命名（Cut - N_原名 / 去重）
   media.py              MediaInfo、ffprobe JSON 解析、文件发现

@@ -66,7 +66,7 @@ def update_checks_enabled() -> bool:
 def _ui_settings() -> QSettings:
     """界面记忆（间隔 / 显示尺寸 / 窗口位置 / 上次打开目录…）。
 
-    放在**持久数据目录**而不是临时缓存里 —— 重启电脑、清理 `%TEMP%` 之后
+    放在**持久数据目录**而不是临时缓存里 —— 重启电脑、清理临时文件之后
     「记忆上次设置」还得在。
     """
     root = data_dir()
@@ -167,6 +167,13 @@ class TabStrip(QTabWidget):
 
 class MainWindow(FramelessWindow):
     def __init__(self):
+        # 新版本第一次启动（含热补丁重建窗口）时，把旧 C 盘缓存搬到 Purer 同盘。
+        # 失败不影响启动；下次启动会重试（成功才写 marker）。
+        try:
+            from .cache_migrate import migrate_once
+            migrate_once()
+        except Exception:          # noqa: BLE001  迁移失败不能拖垮界面
+            pass
         super().__init__()
         self.setWindowTitle(self._title(DEFAULT_STEP))
         self.resize(1440, 880)

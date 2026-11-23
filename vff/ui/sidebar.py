@@ -352,6 +352,8 @@ class EditSidebar(QWidget):
         self.bar.setValue(0)
         self.bar.setFixedHeight(4)
         self.bar.setTextVisible(False)
+        self.bar.setMinimumWidth(0)
+        self.bar.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         lay.addWidget(self.bar)
         return box
 
@@ -409,6 +411,8 @@ class EditSidebar(QWidget):
         self.play_bar.setValue(0)
         self.play_bar.setFixedHeight(3)
         self.play_bar.setTextVisible(False)
+        self.play_bar.setMinimumWidth(0)
+        self.play_bar.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         lay.addWidget(self.play_bar)
         return box
 
@@ -603,6 +607,8 @@ class EditSidebar(QWidget):
         self.exp_bar.setValue(0)
         self.exp_bar.setFixedHeight(4)
         self.exp_bar.setTextVisible(False)
+        self.exp_bar.setMinimumWidth(0)
+        self.exp_bar.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.exp_bar.setVisible(False)
         lay.addWidget(self.exp_bar)
         return box
@@ -626,6 +632,7 @@ class EditSidebar(QWidget):
         if value >= 0:
             self.bar.setValue(value)
         self.btn_stop.setVisible(running)
+        self._clamp_bar_width()
 
     def set_frame(self, pixmap: QPixmap | None, title: str):
         self._pixmap = pixmap if (pixmap is not None and not pixmap.isNull()) else None
@@ -824,7 +831,32 @@ class EditSidebar(QWidget):
         super().resizeEvent(event)
         self._apply_preview_height()
         self._update_segment_height()
+        self._clamp_bar_width()
         self._fit()
+
+    def _clamp_bar_width(self):
+        """进度条宽度不得超过侧栏可视宽度。
+
+        卡片/滚动区在这些情况下可能先按 sizeHint 把内容撑宽（尤其在
+        高 DPI、窄窗口、载入中切换可见性时），QProgressBar 会跟着画到卡片外。
+        这里给三条进度条一个以 scroll viewport 为准的硬上限。
+        """
+        try:
+            viewport = self.scroll.viewport().width()
+        except (AttributeError, RuntimeError):
+            viewport = self.width()
+        limit = max(60, int(viewport) - 32)
+        try:
+            content = self.scroll.widget()
+            if content is not None:
+                content.setMaximumWidth(max(120, int(viewport)))
+        except (AttributeError, RuntimeError):
+            pass
+        for bar in (getattr(self, "bar", None),
+                    getattr(self, "play_bar", None),
+                    getattr(self, "exp_bar", None)):
+            if bar is not None:
+                bar.setMaximumWidth(limit)
 
     def _apply_preview_height(self):
         """预览高度 = 原始比例算出的自然高度，并保证片段列表有足够空间。"""

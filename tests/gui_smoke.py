@@ -632,6 +632,11 @@ def main() -> int:
         probe.resize(372, 760)
         probe.show()
         app.processEvents()
+        probe.set_extract_progress(50, True, True)
+        app.processEvents()
+        check("loading bar fits sidebar",
+              probe.bar.width() <= probe.scroll.viewport().width(),
+              f"bar={probe.bar.width()} viewport={probe.scroll.viewport().width()}")
 
         def seg_h(count):
             probe.set_segments([(i, i + 1, None, "") for i in range(count)])

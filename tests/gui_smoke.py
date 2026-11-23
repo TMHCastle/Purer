@@ -19,6 +19,8 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ["PURER_NO_UPDATE"] = "1"        # 冒烟测试不联网
+os.environ["PURER_DOWNLOAD_MIRRORS"] = ("https://m1.example/,"
+                                        "https://m2.example/")
 # 用独立缓存目录：别读到你自己 ui.ini 里的 抽帧方式/显示尺寸（否则结果不可复现）
 os.environ["PURER_CACHE_DIR"] = tempfile.mkdtemp(prefix="purer_smoke_cache_")
 # 设置 / 已保存缓存也放临时目录：冒烟测试不能碰真实用户数据
@@ -1172,6 +1174,27 @@ def main() -> int:
         check("settings shows no hotfix by default",
               "没有热补丁" in settings_dlg.lbl_hotfix.text(),
               settings_dlg.lbl_hotfix.text())
+
+        # 下载时把「原址 + 镜像」一起交给下载器（国内直连 GitHub 常常几十 KB/s）
+        started = {}
+        orig_start = win.downloader.start
+
+        def _fake_start(url, size, digest, dest, mirrors=()):
+            started.update(url=url, mirrors=list(mirrors))
+            return True
+
+        win.downloader.start = _fake_start
+        try:
+            win._start_download(CheckResult(
+                True, "v9.9.11", "", "", "",
+                "https://github.com/o/r/releases/download/v9/Purer.exe", 1000, ""))
+        finally:
+            win.downloader.start = orig_start
+            win.badge.set_state("idle")
+        check("download passes mirrors to the downloader",
+              started.get("url", "").endswith("Purer.exe")
+              and len(started.get("mirrors") or []) >= 2,
+              str(started))
 
         # ---- 4. 会话快照：保存 → 换个窗口恢复（更新重启 / 崩溃恢复都靠它） ----
         from vff import session as session_state

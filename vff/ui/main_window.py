@@ -394,6 +394,7 @@ class MainWindow(FramelessWindow):
         self.updater.finished.connect(self._on_update_result)
         self.downloader = UpdateDownloader(self)
         self.downloader.progress.connect(self._on_download_progress)
+        self.downloader.status.connect(self._on_download_status)
         self.downloader.finished.connect(self._on_download_finished)
         self._update_result = None          # 最近一次「有新版本」的结果
         self._pending_exe = ""              # 已下载并校验通过的新 exe
@@ -646,8 +647,10 @@ class MainWindow(FramelessWindow):
         self._download_kind = "exe"
         self.badge.set_state("downloading", tag=tag, detail="0%",
                              tip=f"正在下载 {tag}（{result.asset_size} 字节）")
-        started = self.downloader.start(result.asset_url, result.asset_size,
-                                        result.digest, dest)
+        urls = result.asset_urls()
+        started = self.downloader.start(result.asset_url or urls[0],
+                                        result.asset_size, result.digest, dest,
+                                        mirrors=urls[1:])
         if not started:
             self.badge.set_state("error", tip="下载没能开始，点击重试")
         return started
@@ -658,14 +661,23 @@ class MainWindow(FramelessWindow):
         self._download_kind = "code"
         self.badge.set_state("downloading", tag=tag, detail="0%",
                              tip=f"正在下载热修复 {tag}（{result.code_size} 字节）")
-        started = self.downloader.start(result.code_url, result.code_size,
-                                        result.code_digest, dest)
+        urls = result.code_urls()
+        started = self.downloader.start(result.code_url or urls[0],
+                                        result.code_size, result.code_digest, dest,
+                                        mirrors=urls[1:])
         if not started:
             self.badge.set_state("error", tip="下载没能开始，点击重试")
         return started
 
     def _on_download_progress(self, pct: int, got: int, total: int):
         self.badge.set_progress(pct if pct >= 0 else 0)
+
+    def _on_download_status(self, text: str):
+        """下载器换源 / 放弃某个源时的一句话（不打扰，只写在状态栏）。"""
+        try:
+            self.lbl_status.setText(f"下载：{text}")
+        except RuntimeError:
+            pass
 
     def _on_download_finished(self, ok: bool, path: str, error: str):
         result = self._update_result

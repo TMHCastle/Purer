@@ -40,6 +40,47 @@ DEADLINE_S = 18            # 一整轮检查的总预算
 _UA = f"{APP_NAME}/{APP_VERSION}"
 _TAG_IN_URL = re.compile(r"/tag/([^/?#]+)")
 
+# 国内直连 GitHub 大文件常常只有几十 KB/s → 下载时按顺序换源。
+# 只影响**下载**（字节由 sha256 兜底），不影响"哪个版本"的判断（那仍然问 GitHub API）。
+MIRROR_PREFIXES = ("https://ghfast.top/", "https://gh-proxy.com/")
+
+
+def _mirror_prefixes() -> tuple[str, ...]:
+    """``PURER_DOWNLOAD_MIRRORS`` 可覆盖（逗号分隔；支持 ``{url}`` 占位）。
+
+    显式设成空串 = 只用 GitHub；不设 = 用上面默认的两个国内镜像。
+    """
+    raw = os.environ.get("PURER_DOWNLOAD_MIRRORS")
+    if raw is not None:
+        return tuple(part.strip() for part in raw.split(",") if part.strip())
+    return MIRROR_PREFIXES
+
+
+def mirror_url(url: str, prefix: str) -> str:
+    """``https://ghfast.top/`` + 原地址；也支持 ``https://x/?to={url}`` 这种模板。"""
+    text = str(prefix or "").strip()
+    if not text:
+        return ""
+    if "{url}" in text:
+        return text.replace("{url}", url)
+    return text.rstrip("/") + "/" + url
+
+
+def mirror_urls(url: str, prefixes=None) -> list[str]:
+    """原址 + 各镜像（去重；空地址返回空表）。"""
+    text = str(url or "").strip()
+    if not text:
+        return []
+    out = [text]
+    for prefix in (prefixes if prefixes is not None else _mirror_prefixes()):
+        try:
+            candidate = mirror_url(text, prefix)
+        except Exception:      # noqa: BLE001  配置写错不能影响更新
+            continue
+        if candidate and candidate not in out:
+            out.append(candidate)
+    return out
+
 
 class CheckResult(NamedTuple):
     """一次检查的结果（ok=False 时只有 error 有意义）。"""
@@ -66,6 +107,14 @@ class CheckResult(NamedTuple):
     def can_hotfix(self) -> bool:
         """这个版本有没有可以热补的代码包（不用重启的那条路）。"""
         return bool(self.code_url and self.code_size > 0)
+
+    def asset_urls(self) -> list[str]:
+        """exe 的「原址 + 镜像」列表（下载时按顺序试）。"""
+        return mirror_urls(self.asset_url)
+
+    def code_urls(self) -> list[str]:
+        """热补丁包的「原址 + 镜像」列表。"""
+        return mirror_urls(self.code_url)
 
 
 # --------------------------------------------------------------------------- #
@@ -433,4 +482,5 @@ class ReleaseChecker(QObject):
 __all__ = ["CheckResult", "ReleaseChecker", "system_proxy", "pick_proxy",
            "curl_path", "curl_args", "tag_from_json", "tag_from_url",
            "asset_from_json", "code_asset_from_json",
+           "mirror_url", "mirror_urls", "MIRROR_PREFIXES",
            "API_URL", "REDIRECT_URL", "RELEASES_PAGE", "TIMEOUT_S", "DEADLINE_S"]

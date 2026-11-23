@@ -13,6 +13,9 @@ APP_NAME = "Purer"
 APP_TAGLINE = "视频抽帧浏览 / 帧精确切片"
 APP_ID = "Purer"
 APP_VERSION = "1.2.0"
+# 热补丁包的兼容基线：以后打的代码包只支持 **>= 这个版本** 的 exe。
+# 动了引导层 / 打包数据 / 依赖（这些热补丁改不了的东西）才需要往上抬。
+CODE_BASE_VERSION = "1.2.0"
 # 「检查更新」查的是这里（公开仓库，只读 API，不需要 token）
 GITHUB_REPO = "TMHCastle/Purer"
 
@@ -222,3 +225,18 @@ def read_ffmpeg_dir_from_ini() -> Path | None:
     first = next((ln.strip() for ln in text.splitlines() if ln.strip()
                   and not ln.strip().startswith(("#", ";", "["))), "")
     return Path(first) if first else None
+
+
+# --------------------------------------------------------------------------- #
+# 版本（exe 里编死的 + 热补丁包可能更高）
+# --------------------------------------------------------------------------- #
+def effective_version() -> str:
+    """对外显示的版本：有生效的热补丁包取包版本，否则就是 exe 版本。"""
+    try:
+        import purer_boot
+    except Exception:          # noqa: BLE001  源码 / 单测环境没有引导层
+        return APP_VERSION
+    try:
+        return purer_boot.effective_version(APP_VERSION) or APP_VERSION
+    except Exception:          # noqa: BLE001
+        return APP_VERSION

@@ -27,7 +27,7 @@ from typing import NamedTuple
 
 from PySide6.QtCore import QObject, QProcess, QTimer, Signal
 
-from .config import APP_NAME, APP_VERSION, GITHUB_REPO
+from .config import APP_NAME, APP_VERSION, GITHUB_REPO, effective_version
 from .log import debug
 from .version import state_for
 
@@ -52,13 +52,20 @@ class CheckResult(NamedTuple):
     asset_url: str = ""         # 新版 exe 的下载地址
     asset_size: int = 0         # 字节数（GitHub 给的就是这个）
     digest: str = ""            # "sha256:…"（GitHub 的资产校验值）
+    code_url: str = ""          # 热补丁包（Purer-code-*.zip）的下载地址
+    code_size: int = 0
+    code_digest: str = ""
 
-    def state(self, current: str = APP_VERSION) -> str:
-        return state_for(self.ok, self.tag, current)
+    def state(self, current: str | None = None) -> str:
+        return state_for(self.ok, self.tag, current or effective_version())
 
     def can_install(self) -> bool:
         """能不能自己下载安装（要 exe 地址 + 大小；有 digest 更放心）。"""
         return bool(self.asset_url and self.asset_size > 0)
+
+    def can_hotfix(self) -> bool:
+        """这个版本有没有可以热补的代码包（不用重启的那条路）。"""
+        return bool(self.code_url and self.code_size > 0)
 
 
 # --------------------------------------------------------------------------- #
@@ -151,6 +158,24 @@ def asset_from_json(data) -> dict:
     }
 
 
+def code_asset_from_json(data) -> dict:
+    """挑出热补丁包（``Purer-code-*.zip``）；没有就返回空 dict。"""
+    for item in (data.get("assets") or []) if isinstance(data, dict) else []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip().lower()
+        if not name.endswith(".zip"):
+            continue
+        if "purer-code" not in name and "purer_code" not in name:
+            continue
+        return {
+            "url": str(item.get("browser_download_url") or ""),
+            "size": int(item.get("size") or 0),
+            "digest": str(item.get("digest") or ""),
+        }
+    return {}
+
+
 def tag_from_json(body: str):
     """release JSON → ``(tag, html_url, 失败原因)``（不含资产信息）。"""
     result = result_from_json(body)
@@ -172,9 +197,12 @@ def result_from_json(body: str) -> CheckResult:
         return CheckResult(False, "", "", "接口返回里没有 tag_name")
     url = str(data.get("html_url") or "").strip() or RELEASES_PAGE
     asset = asset_from_json(data)
+    code = code_asset_from_json(data)
     return CheckResult(True, tag, url, "", "",
                        asset.get("url", ""), asset.get("size", 0),
-                       asset.get("digest", ""))
+                       asset.get("digest", ""),
+                       code.get("url", ""), code.get("size", 0),
+                       code.get("digest", ""))
 
 
 def tag_from_url(final: str) -> str:
@@ -404,4 +432,5 @@ class ReleaseChecker(QObject):
 
 __all__ = ["CheckResult", "ReleaseChecker", "system_proxy", "pick_proxy",
            "curl_path", "curl_args", "tag_from_json", "tag_from_url",
+           "asset_from_json", "code_asset_from_json",
            "API_URL", "REDIRECT_URL", "RELEASES_PAGE", "TIMEOUT_S", "DEADLINE_S"]

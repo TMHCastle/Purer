@@ -13,6 +13,8 @@ import sys
 import time
 from pathlib import Path
 
+import purer_boot
+
 from PySide6.QtCore import Qt, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices, QFont
 from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QFileDialog, QFrame,
@@ -21,6 +23,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QFileDialog, QF
                                QTabWidget, QVBoxLayout, QWidget)
 
 from .. import APP_NAME, APP_TAGLINE, APP_VERSION
+from ..config import effective_version
 from ..cache import cache_root, temp_cache_bytes, wall_bytes
 from ..cache_store import INDEX_NAME, CacheStore
 from ..config import GITHUB_REPO, app_dir, persistent_cache_root
@@ -150,7 +153,7 @@ class SettingsDialog(QDialog):
         font.setPointSizeF(font.pointSizeF() + 3)
         font.setWeight(QFont.DemiBold)
         title.setFont(font)
-        sub = QLabel(f"{APP_NAME} v{APP_VERSION} · {APP_TAGLINE}")
+        sub = QLabel(f"{APP_NAME} v{effective_version()} · {APP_TAGLINE}")
         sub.setObjectName("dim")
         titles.addWidget(title)
         titles.addWidget(sub)
@@ -199,8 +202,11 @@ class SettingsDialog(QDialog):
         # ---- 版本信息 ----
         box, box_lay = _card("版本信息")
         frozen = bool(getattr(sys, "frozen", False))
+        active = purer_boot.active_pack()
         rows = [
-            ("当前版本", f"v{APP_VERSION}"),
+            ("当前版本", f"v{effective_version()}"
+             + (f"（exe v{APP_VERSION} + 热补丁 v{active['version']}）"
+                if active else "")),
             ("运行方式", "打包 exe" if frozen else "源码运行（python Purer.py）"),
             ("发布仓库", f"github.com/{GITHUB_REPO}"),
             ("更新检查", "启动后自动查一次 GitHub 发布（可点顶部药丸）"),
@@ -299,7 +305,7 @@ class SettingsDialog(QDialog):
         callback()
 
     def _copy_info(self):
-        lines = [f"{APP_NAME} v{APP_VERSION} · {APP_TAGLINE}",
+        lines = [f"{APP_NAME} v{effective_version()} · {APP_TAGLINE}",
                  f"程序目录: {app_dir()}",
                  f"已保存缓存: {persistent_cache_root()}",
                  f"临时缓存: {cache_root()}",
@@ -757,16 +763,25 @@ class SettingsDialog(QDialog):
         lay.addWidget(box)
 
         box2, box2_lay = _card(
-            "版本",
-            "更新包从 GitHub Releases 下载，下载完先校验 sha256 再替换。")
-        self.lbl_update_ver = QLabel(f"当前版本 v{APP_VERSION}")
+            "版本与热补丁",
+            "更新包从 GitHub Releases 下载，下载完先校验 sha256 再替换。"
+            "「热补丁」只换 Python 代码，装完不用重启；改到界面资源 / 打包数据时只能整包更新。")
+        self.lbl_update_ver = QLabel(f"当前版本 v{effective_version()}")
         self.lbl_update_ver.setObjectName("cfgVal")
         box2_lay.addWidget(self.lbl_update_ver)
+        self.lbl_hotfix = QLabel("")
+        self.lbl_hotfix.setObjectName("cfgNote")
+        self.lbl_hotfix.setWordWrap(True)
+        box2_lay.addWidget(self.lbl_hotfix)
         check_row = QHBoxLayout()
         check_row.setSpacing(8)
         self.btn_check_now = _button("立即检查", self._check_now, ghost=True)
         self.btn_check_now.setEnabled(self._check_update is not None)
         check_row.addWidget(self.btn_check_now)
+        self.btn_drop_hotfix = _button("移除热补丁", self._drop_hotfix, ghost=True)
+        self.btn_drop_hotfix.setToolTip(
+            "删掉代码包文件，下次启动回到 exe 内置代码（当前窗口不受影响）")
+        check_row.addWidget(self.btn_drop_hotfix)
         self.lbl_update_check = QLabel("")
         self.lbl_update_check.setObjectName("cfgNote")
         check_row.addWidget(self.lbl_update_check, 1)
@@ -777,6 +792,29 @@ class SettingsDialog(QDialog):
         scroll.setWidget(body)
         self._refresh_update_labels()
         return scroll
+
+    def _refresh_hotfix_label(self):
+        if not hasattr(self, "lbl_hotfix"):
+            return
+        active = purer_boot.active_pack()
+        installed = purer_boot.read_pack()
+        if active:
+            text = (f"热补丁 v{active.get('version')} 生效中"
+                    f"（exe v{APP_VERSION}）"
+                    f" · {purer_boot.pack_dir()}")
+        elif installed:
+            text = (f"代码包 v{installed.get('version')} 已就位但未生效"
+                    f"（{purer_boot.last_error() or '需要重启'}）")
+        else:
+            text = "没有热补丁，正在运行 exe 内置代码"
+        self.lbl_hotfix.setText(text)
+        self.btn_drop_hotfix.setEnabled(bool(active or installed))
+
+    def _drop_hotfix(self):
+        from .. import hotfix
+        hotfix.purge_files()
+        self.lbl_update_check.setText("已删除代码包，下次启动回到内置代码")
+        self._refresh_hotfix_label()
 
     def _refresh_update_labels(self):
         if not hasattr(self, "lbl_update_state"):
@@ -797,6 +835,7 @@ class SettingsDialog(QDialog):
                          + time.strftime("%m-%d %H:%M", time.localtime(snooze)))
         self.lbl_update_state.setText(" · ".join(parts) if parts
                                       else "目前没有忽略任何版本")
+        self._refresh_hotfix_label()
 
     def _reset_update_prefs(self):
         if self.settings is None:

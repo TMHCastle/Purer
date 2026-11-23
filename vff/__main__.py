@@ -34,6 +34,7 @@ USAGE = """Purer {ver} · 视频抽帧浏览 / 帧精确切片
   <视频|文件夹> ...         直接打开
   --selftest               无窗口自检（结果在 %TEMP%\\Purer_selftest.log）
   --where                  打印 ffmpeg / ffprobe / 缓存位置
+  --code-info              打印版本 / 热补丁状态（JSON）
   --probe <文件...>         打印媒体信息（JSON）
   --extract <文件|目录...>  批量抽帧
         -o, --out <目录>      输出根目录（默认当前目录）
@@ -374,6 +375,29 @@ def cmd_help() -> int:
     return 0
 
 
+def cmd_code_info() -> int:
+    """版本 / 热补丁状态（诊断用；``--code-info`` 打 JSON）。"""
+    import purer_boot
+
+    from . import hotfix
+    from .config import effective_version
+
+    try:
+        module_file = getattr(__import__("vff"), "__file__", "") or ""
+    except Exception:      # noqa: BLE001
+        module_file = ""
+    payload = {
+        "exe_version": APP_VERSION,
+        "effective_version": effective_version(),
+        "module_file": module_file,
+        "active": purer_boot.active_pack(),
+        "installed": purer_boot.read_pack(),
+        "state": hotfix.state(),
+    }
+    _p(json.dumps(payload, ensure_ascii=False, indent=1))
+    return 0
+
+
 # --------------------------------------------------------------------------- #
 # 入口
 # --------------------------------------------------------------------------- #
@@ -381,7 +405,7 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
 
     cli_hints = {"--selftest", "--where", "--probe", "--extract", "--export",
-                 "--help", "-h", "--version", "-V"}
+                 "--help", "-h", "--version", "-V", "--code-info"}
     if cli_hints.intersection(argv):
         _attach_console()
 
@@ -392,6 +416,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if _pop_flag(argv, "--where"):
         return cmd_where()
+    if _pop_flag(argv, "--code-info"):
+        return cmd_code_info()
 
     mode = None
     if _pop_flag(argv, "--selftest"):
@@ -475,7 +501,11 @@ def main(argv: list[str] | None = None) -> int:
     from .cache import clean_cache
     clean_cache()
 
+    import purer_boot
+
+    purer_boot.prune_stale()          # exe 已经更新过：旧代码包没必要留着
     win = MainWindow()
+    purer_boot.hold(win)              # 热替换时由引导层换掉这个引用
     screen = app.primaryScreen()
     restored = win.restore_geometry()
     if not restored and screen is not None:

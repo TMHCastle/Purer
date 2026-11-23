@@ -26,3 +26,6 @@ ffmpeg.ini
 # 编辑器
 .vscode/
 .idea/
+
+# 窄热补丁包（构建产物：python build.py 会生成 Purer-code-<ver>.zip）
+Purer-code-*.zip

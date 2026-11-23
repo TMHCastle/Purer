@@ -61,6 +61,13 @@ def download_path(tag: str) -> Path:
     return download_dir() / f"{APP_ID}-{safe}.exe"
 
 
+def code_download_path(tag: str) -> Path:
+    """热补丁包（``.zip``）的下载落点。"""
+    safe = "".join(ch for ch in str(tag or "new")
+                   if ch.isalnum() or ch in ".-_") or "new"
+    return download_dir() / f"{APP_ID}-code-{safe}.zip"
+
+
 def backup_path(exe) -> Path:
     exe = Path(exe)
     return exe.with_name(exe.name + ".old")

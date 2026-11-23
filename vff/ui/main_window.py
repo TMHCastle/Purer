@@ -23,14 +23,17 @@ from ..config import (APP_NAME, APP_VERSION, DEFAULT_DISPLAY_SIDE, DEFAULT_STEP,
                       DISPLAY_MAX, DISPLAY_MIN, DISPLAY_PRESETS, DISPLAY_STEP,
                       EXTRACT_LONG_SIDE, JOBS_MAX_CONCURRENT, MAX_THUMBS_WARN,
                       STEP_MAX, STEP_MIN, STEP_PRESETS, STEP_PRESETS_FRACTIONAL,
-                      VIDEO_EXTS, data_dir, extract_mode_items,
+                      VIDEO_EXTS, data_dir, effective_version, extract_mode_items,
                       parse_extract_mode, preset_label, snap_step)
 from ..download import UpdateDownloader
 from ..ffmpeg import probe
+from ..hotfix import install as install_hotfix, remove as remove_hotfix, \
+    state as hotfix_state
 from ..jobs import JobQueue
 from ..media import find_videos, thumb_size_for
 from ..selfupdate import (app_exe, apply_update, auto_install_enabled,
-                          can_self_update, download_path, verify_file)
+                          can_self_update, code_download_path, download_path,
+                          verify_file)
 from .. import session as session_state
 from ..settings import (CACHE_MODE_NEVER, CACHE_MODE_USAGE, Settings,
                         close_prompt_needed, update_apply_choice,
@@ -397,6 +400,8 @@ class MainWindow(FramelessWindow):
         self._update_prompt = None          # 正在显示的「发现新版本」弹窗
         self._update_manual = False         # 这次检查是不是用户手动点的
         self._update_retries = 0            # 队列没空时等了几轮
+        self._download_kind = "exe"         # 正在下载的是 exe 还是热补丁包
+        self._reloading = False             # True = 正在热替换界面（别弹关闭提示）
         self._update_retry = QTimer(self)
         self._update_retry.setSingleShot(True)
         self._update_retry.setInterval(10000)
@@ -439,7 +444,9 @@ class MainWindow(FramelessWindow):
         tag = normalize(result.tag) or result.tag
         if state == "stale":
             self._update_result = result
-            if result.can_install() and auto_install_enabled():
+            if result.can_hotfix():
+                hint = "热修复包（装完不用重启，界面自动接上）\n右键重新检查"
+            elif result.can_install() and auto_install_enabled():
                 hint = "点击下载并自动安装（右键重新检查）"
             else:
                 hint = "点击打开发布页下载（右键重新检查）"
@@ -449,7 +456,7 @@ class MainWindow(FramelessWindow):
         elif state == "latest":
             self.badge.set_state(
                 "latest", tag=tag,
-                tip=f"当前已经是最新版本 v{APP_VERSION}\n点击重新检查")
+                tip=f"当前已经是最新版本 v{effective_version()}\n点击重新检查")
         else:
             self.badge.set_state(
                 "error",
@@ -504,8 +511,8 @@ class MainWindow(FramelessWindow):
         """弹小窗，按用户的选择落策略（不做任何自动决定）。"""
         tag = normalize(result.tag) or result.tag
         dialog = UpdatePromptDialog(
-            self, tag=tag, current=APP_VERSION,
-            size=int(result.asset_size or 0),
+            self, tag=tag, current=effective_version(),
+            size=int(result.asset_size or result.code_size or 0),
             url=result.url or RELEASES_PAGE)
         self._update_prompt = dialog
         manual = self._update_manual
@@ -521,7 +528,7 @@ class MainWindow(FramelessWindow):
         self.app_settings.save()
         debug(f"更新弹窗选择：{choice}（tag={tag} manual={manual}）")
         if choice == "now":
-            self._start_download(result)
+            self._start_update(result)
         elif choice == "week":
             self.lbl_status.setText(
                 f"好，一周后再提醒 {tag}（期间出现更高版本会立刻提醒）")
@@ -548,7 +555,12 @@ class MainWindow(FramelessWindow):
     # -------------------------------------------------- 下载 → 校验 → 替换重启
     def _ask_download(self):
         result = self._update_result
-        if result is None or not result.can_install() or not auto_install_enabled():
+        if result is None:
+            return
+        if result.can_hotfix():             # 有热补丁包：优先走不用重启的那条路
+            self._ask_hotfix()
+            return
+        if not result.can_install() or not auto_install_enabled():
             QDesktopServices.openUrl(QUrl(self.badge.url() or RELEASES_PAGE))
             return
         ok, why = can_self_update()
@@ -570,13 +582,84 @@ class MainWindow(FramelessWindow):
         if answer == QMessageBox.Yes:
             self._start_download(result)
 
+    def _ask_hotfix(self):
+        result = self._update_result
+        if result is None:
+            return
+        tag = normalize(result.tag) or result.tag
+        size = (f"{result.code_size / 1024:.0f} KB" if result.code_size
+                else "未知大小")
+        answer = QMessageBox.question(
+            self, "安装热修复",
+            f"热修复 {tag}（{size}）\n\n"
+            "这个版本只改了 Python 代码：装完**不用重启**，"
+            "界面会自己重建一次并接上当前标签页。\n\n"
+            "装坏了会自动回退，不会打不开。现在下载吗？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if answer == QMessageBox.Yes:
+            self._start_code_download(result)
+
+    def _start_update(self, result) -> bool:
+        """按可用资产选路：热补丁包优先（不用重启），否则整包 exe。"""
+        if result.can_hotfix():
+            return self._start_code_download(result)
+        if result.can_install() and auto_install_enabled():
+            return self._start_download(result)
+        QDesktopServices.openUrl(QUrl(result.url or RELEASES_PAGE))
+        return False
+
+    def _apply_hotfix(self, path: str) -> bool:
+        """装代码包并重建界面。
+
+        成功时 **旧窗口已经被新窗口取代**，这里不能再碰 ``self``。
+        """
+        self.save_session("hotfix")
+        self._flush_all_usage()
+        try:
+            self.setting.sync()
+        except (RuntimeError, OSError):
+            pass
+        try:
+            ok, why, new_win = install_hotfix(path, old_window=self)
+        except Exception as exc:            # noqa: BLE001  兜底：退回内置代码
+            try:
+                ok, why, new_win = remove_hotfix(old_window=None)
+            except Exception as exc2:       # noqa: BLE001
+                ok, why, new_win = False, f"{exc} / {exc2}", None
+        if ok:
+            return True
+        info = hotfix_state()
+        QMessageBox.warning(
+            new_win, "热修复",
+            f"{why}\n\n当前仍然可用（v{info.get('effective_version') or '?'}）。\n"
+            f"代码包位置：{info.get('installed_path') or '—'}")
+        if new_win is not None:
+            try:
+                new_win.badge.set_state("error", tip=f"热修复没装上：{why}")
+            except Exception:               # noqa: BLE001
+                pass
+        return False
+
     def _start_download(self, result) -> bool:
         tag = normalize(result.tag) or result.tag
         dest = download_path(result.tag)
+        self._download_kind = "exe"
         self.badge.set_state("downloading", tag=tag, detail="0%",
                              tip=f"正在下载 {tag}（{result.asset_size} 字节）")
         started = self.downloader.start(result.asset_url, result.asset_size,
                                         result.digest, dest)
+        if not started:
+            self.badge.set_state("error", tip="下载没能开始，点击重试")
+        return started
+
+    def _start_code_download(self, result) -> bool:
+        tag = normalize(result.tag) or result.tag
+        dest = code_download_path(result.tag)
+        self._download_kind = "code"
+        self.badge.set_state("downloading", tag=tag, detail="0%",
+                             tip=f"正在下载热修复 {tag}（{result.code_size} 字节）")
+        started = self.downloader.start(result.code_url, result.code_size,
+                                        result.code_digest, dest)
         if not started:
             self.badge.set_state("error", tip="下载没能开始，点击重试")
         return started
@@ -590,6 +673,9 @@ class MainWindow(FramelessWindow):
         if not ok:
             self.badge.set_state(
                 "error", tip=f"下载失败：{error}\n点击重试（右键重新检查）")
+            return
+        if self._download_kind == "code":
+            self._apply_hotfix(path)
             return
         self._pending_exe = path
         self.badge.set_state(
@@ -954,8 +1040,8 @@ class MainWindow(FramelessWindow):
     @staticmethod
     def _title(step: float, mode: str = "step") -> str:
         if mode == "scene":
-            return f"{APP_NAME} {APP_VERSION} · 按镜头抽帧"
-        return f"{APP_NAME} {APP_VERSION} · 每 {float(step):g} 帧一帧"
+            return f"{APP_NAME} {effective_version()} · 按镜头抽帧"
+        return f"{APP_NAME} {effective_version()} · 每 {float(step):g} 帧一帧"
 
     def _subtitle(self, step: float) -> str:
         if self._extract_mode == "scene":
@@ -1563,7 +1649,40 @@ class MainWindow(FramelessWindow):
             self.showMaximized()
         return True
 
+    def prepare_rebuild(self) -> None:
+        """热替换前把自己停干净：不弹关闭提示、不留定时器、不写盘。"""
+        self._reloading = True
+        try:
+            self.save_session("hotfix")
+        except Exception:              # noqa: BLE001
+            pass
+        for name in ("_state_timer", "_session_timer", "_usage_timer",
+                     "_update_retry"):
+            timer = getattr(self, name, None)
+            try:
+                timer.stop()
+            except (AttributeError, RuntimeError):
+                pass
+        for worker in ("updater", "downloader"):
+            try:
+                getattr(self, worker).cancel()
+            except (AttributeError, RuntimeError):
+                pass
+        try:
+            self.jobs.cancel_all()
+        except Exception:              # noqa: BLE001
+            pass
+        for page in list(self._pages):
+            try:
+                page.shutdown()
+            except Exception:          # noqa: BLE001
+                pass
+
     def closeEvent(self, e):
+        if getattr(self, "_reloading", False):
+            # 正在热替换：不弹「保存缓存」、不写会话，直接让窗口消失
+            super().closeEvent(e)
+            return
         if not self._handle_close_cache():
             e.ignore()
             return

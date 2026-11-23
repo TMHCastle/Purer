@@ -1151,6 +1151,28 @@ def main() -> int:
             win.app_settings.save()
             win.badge.set_state("idle")
 
+        # 热补丁包优先：有 code 资产时走「不用重启」那条路（不真的下载）
+        hotfix_calls = []
+        orig_start_code = win._start_code_download
+        orig_question = QMessageBox.question
+        win._start_code_download = (
+            lambda r: hotfix_calls.append(r.code_url) or True)
+        QMessageBox.question = lambda *a, **k: QMessageBox.Yes
+        try:
+            win._update_result = CheckResult(
+                True, "v9.9.10", "https://example.invalid/r", "", "冒烟",
+                "", 0, "", "https://example.invalid/c.zip", 2048, "")
+            win._ask_download()
+        finally:
+            win._start_code_download = orig_start_code
+            QMessageBox.question = orig_question
+            win._update_result = None
+        check("hotfix pack takes the no-restart path",
+              hotfix_calls == ["https://example.invalid/c.zip"], str(hotfix_calls))
+        check("settings shows no hotfix by default",
+              "没有热补丁" in settings_dlg.lbl_hotfix.text(),
+              settings_dlg.lbl_hotfix.text())
+
         # ---- 4. 会话快照：保存 → 换个窗口恢复（更新重启 / 崩溃恢复都靠它） ----
         from vff import session as session_state
 

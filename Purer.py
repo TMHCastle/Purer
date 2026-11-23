@@ -11,7 +11,13 @@ from __future__ import annotations
 
 import sys
 
-from vff.__main__ import main
+import purer_boot
+
+# **顺序要紧**：先让引导层判断「有没有热补丁包」并装好查找器，再 import vff。
+# 反过来的话 vff 已经按内置代码缓存进 sys.modules，补丁就白装了。
+purer_boot.install()
+
+from vff.__main__ import main  # noqa: E402  （必须在 install() 之后）
 
 
 def make_icon():

@@ -15,7 +15,7 @@ from __future__ import annotations
 from PySide6.QtCore import QSize, QTimer, Qt, Signal
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton
 
-from ..config import APP_VERSION
+from ..config import APP_VERSION, effective_version
 from .style import ACCENT, DIM, OK, WARN
 
 # state -> (圆点色, 边框色, 底色, 文字色)
@@ -132,7 +132,7 @@ class UpdateBadge(QPushButton):
 
     def _text_for(self, state: str, tag: str, detail: str = "") -> str:
         if state == "latest":
-            return f"已是最新 v{APP_VERSION}"
+            return f"已是最新 v{effective_version()}"
         if state == "stale":
             return f"有新版本 {tag}" if tag else "有新版本"
         if state == "downloading":
@@ -149,7 +149,7 @@ class UpdateBadge(QPushButton):
         if state == "checking":
             return "正在向 GitHub 查询最新发布版本…"
         if state == "latest":
-            return f"当前就是最新版 v{APP_VERSION}\n点击重新检查"
+            return f"当前就是最新版 v{effective_version()}\n点击重新检查"
         if state == "stale":
             return (f"GitHub 上有更新的版本 {tag or ''}\n"
                     "点击下载并自动安装（右键重新检查）")

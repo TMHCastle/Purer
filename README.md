@@ -123,6 +123,7 @@ Purer 是一个 Windows 上的视频抽帧浏览 / 切片小工具（单文件 e
 ```
 Purer.exe --help
 Purer.exe --where                                  # ffmpeg / 缓存位置
+Purer.exe --code-info                              # 版本 / 热补丁状态（JSON）
 Purer.exe --probe A.mp4 B.mkv                      # 媒体信息（JSON）
 Purer.exe --extract A.mp4 -o 输出目录 --step 24 --long 320
 Purer.exe --export A.mp4 12.5 24 -o 切片.mp4       # 时间支持 12.5 或 00:01:23.456
@@ -147,6 +148,27 @@ Purer.exe --no-restore                             # 这次不恢复上次的标
 （「关闭全部」）—— 空会话不会被恢复。
 
 > 会话只记「怎么重新打开」，不存缩略图本身；缩略图丢了会按同样的设置重新抽。
+
+## 窄热补丁（装完不用重启）
+
+从 1.2.0 起，**只动了 `vff/` 纯 Python 代码**的小版本可以走"热补丁"：
+下载一个约 180 KB 的 `Purer-code-<版本>.zip`，换掉代码 → 清模块 → **重建界面**
+→ 按会话快照接上刚才的标签页。**进程不重启**（任务栏图标不闪、窗口位置不变）。
+
+- **能改**：逻辑、文案、少量界面调整。
+- **改不了**：Qt 资源、打包数据、C 层行为、ffmpeg 参数语义 —— 这些只能整包更新。
+- **安装位置**：`%LOCALAPPDATA%\Purer\code\current\`（上一个包留 `previous\` 供回退）。
+- **安全**：装坏了（import 抛异常）自动回滚到上一个包 / 内置代码，并重建窗口，
+  绝不会卡在"打不开"。exe 比自己新时也会**忽略**过期补丁。
+- **查看状态**：`Purer.exe --code-info`（JSON：exe 版本 / 生效版本 / 包路径）；
+  设置-更新 里也会显示「热补丁 v1.2.1 生效中」，旁边可以「移除热补丁」（下次启动回内置代码）。
+
+发布侧：`python build.py` 除了 `Purer.exe`，还会生成 `Purer-code-<版本>.zip`
+（`pack.json` 里带 `exe_min`，默认取 `vff/config.py` 的 `CODE_BASE_VERSION`）。
+把它作为 Release 资产上传，客户端会**优先**走热补丁；没有这个资产就走整包更新。
+
+> 只改代码的版本建议**只发 code 包**，不要同时发 exe —— 否则老用户（exe 低于
+> `exe_min`）会看到"有更新但装不上"。
 
 ## 缓存
 
@@ -289,11 +311,13 @@ python tests\gui_smoke.py
 ## 目录结构
 
 ```
-Purer.py                入口薄壳（真正的实现在 vff/）
+Purer.py                入口薄壳（先装热补丁查找器，再 import vff）
+purer_boot.py           稳定引导层：vff 从内置还是代码包加载 + 热替换/回退
 vff/
   __main__.py           命令行 / GUI 入口
   config.py             版本、常量、路径、ffmpeg.ini
-  settings.py           应用设置（持久 JSON：缓存策略 / 上限 / 关闭提醒）
+  hotfix.py             窄热补丁：校验 zip / 解包 / 安装 / 回退
+  settings.py           应用设置（持久 JSON：缓存策略 / 上限 / 关闭提醒 / 更新提醒）
   session.py            会话快照：标签 / 当前帧 / 入出点 / 片段 / 导出（跨重启恢复）
   cache.py              临时渲染缓存：缓存 key、目录、7 天回收
   cache_store.py        持久缓存库：保存 / 恢复 / 使用统计 / 体积收敛

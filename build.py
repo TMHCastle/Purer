@@ -5,11 +5,14 @@
 依赖：  PySide6、PyInstaller
 产物：  Purer.exe（本目录）
 """
+import json
 import os
 import shutil
 import struct
 import subprocess
 import sys
+import time
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -97,6 +100,36 @@ def write_version() -> Path:
     return path
 
 
+def build_code_pack() -> Path:
+    """打一个「窄热补丁包」：只有 vff/*.py + pack.json（~160 KB）。
+
+    ``exe_min`` 决定它能装在哪些 exe 上：默认取 ``CODE_BASE_VERSION``
+    （动过引导层/打包数据/依赖时才往上抬）。
+    """
+    sys.path.insert(0, str(ROOT))
+    from vff.config import APP_VERSION, CODE_BASE_VERSION
+
+    files = [p for p in sorted((ROOT / "vff").rglob("*.py"))
+             if ".bak." not in p.name]
+    target = ROOT / f"Purer-code-{APP_VERSION}.zip"
+    meta = {
+        "version": APP_VERSION,
+        "exe_min": CODE_BASE_VERSION,
+        "built_at": time.time(),
+        "files": len(files),
+        "note": "",
+    }
+    with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED, 9) as archive:
+        for path in files:
+            archive.write(path, path.relative_to(ROOT).as_posix())
+        archive.writestr("pack.json",
+                         json.dumps(meta, ensure_ascii=False, indent=1) + "\n")
+    size = target.stat().st_size
+    print(f"code pack -> {target.name}  {size / 1024:.0f} KB  "
+          f"({len(files)} files, exe_min {CODE_BASE_VERSION})")
+    return target
+
+
 def build():
     args = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
             "--onefile", "--windowed", "--name", APP_EXE,
@@ -116,6 +149,7 @@ def build():
         raise SystemExit("未生成 exe")
     print(f"exe -> {exe}  {exe.stat().st_size / 1048576:.1f} MB")
     shutil.rmtree(ROOT / "build", ignore_errors=True)
+    build_code_pack()
 
 
 if __name__ == "__main__":

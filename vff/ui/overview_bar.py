@@ -2,7 +2,7 @@
 """底部「总进度条」：整段视频缩成一条，光标 / 入点 / 出点 / 片段标记都能直接操作。
 
 这里不存任何状态 —— ``TrackPage._sync_overview()`` 每次都把同一份
-``cursor_frame`` / ``in_frame`` / ``out_frame`` / ``segments`` 推过来；
+``cursor_frame`` / ``in_frame`` / ``out_frame`` / ``segments`` / ``markers`` 推过来；
 用户在这里点/拖只发信号，回去走的仍是墙上时间轴那套回调
 （``_set_cursor`` / ``_on_range_drag`` / ``_end_range_drag``），所以两边永远一致。
 
@@ -10,7 +10,8 @@
   * 点 / 拖轨道 = 移动光标（精确到帧）；
   * 拖两端的旗子 = 改入点 / 出点；
   * 点琥珀色的片段标记 = 选中并跳到该片段；
-  * 右键 = 设入点 / 设出点 / 清除区间 / 用当前选区新建片段。
+  * 点轨道下方的绿色短线 = 跳到 M 标记；
+  * 右键 = 设入点 / 设出点 / 清除区间 / 用当前选区新建片段 / 加删标记。
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ MIN_WIDTH = 240
 
 SEG_COLOR = QColor(WARN)
 SEG_COLOR.setAlpha(190)
+MARKER_COLOR = QColor("#45C995")
 RANGE_COLOR = QColor(ACCENT)
 RANGE_FILL = QColor(ACCENT)
 RANGE_FILL.setAlpha(110)
@@ -52,6 +54,10 @@ class OverviewBar(QWidget):
     clearRangeRequested = Signal()       # 右键：清除区间
     addSegmentRequested = Signal()       # 右键：用当前选区新建片段
     segmentActivated = Signal(int)       # 点片段标记：选中该片段
+    markerActivated = Signal(int)        # 点绿色标记：跳到该帧
+    addMarkerRequested = Signal(int)     # 右键：在这一帧加标记
+    removeMarkerRequested = Signal(int)  # 右键：删掉这个标记
+    zoomRequested = Signal(int)          # Alt+滚轮：+1 放大 / -1 缩小
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -68,6 +74,7 @@ class OverviewBar(QWidget):
         self.in_frame: int | None = None
         self.out_frame: int | None = None
         self._segments: list[tuple[float, float, str]] = []
+        self.markers: list[int] = []
         self._drag: str | None = None
         self._scrubbing = False
         self._hover: str | None = None
@@ -100,6 +107,13 @@ class OverviewBar(QWidget):
             cleaned.append((max(0.0, start), max(0.0, end), name))
         if cleaned != self._segments:
             self._segments = cleaned
+            self.update()
+
+    def set_markers(self, markers):
+        """M 键标记：单点帧号（和入点/出点无关）。"""
+        cleaned = sorted({int(m) for m in (markers or ()) if int(m) >= 0})
+        if cleaned != self.markers:
+            self.markers = cleaned
             self.update()
 
     # ------------------------------------------------------------------ 几何
@@ -153,6 +167,16 @@ class OverviewBar(QWidget):
                 return index
         return None
 
+    def _marker_at(self, pos, strict_y: bool = True) -> int | None:
+        """鼠标落在绿色标记附近就返回帧号（strict_y=False 时只看横向）。"""
+        if strict_y and not (TRACK_Y - 10 <= pos.y() <= TRACK_Y - 1):
+            return None
+        for frame in self.markers:
+            x = self._x_for_frame(frame)
+            if abs(pos.x() - x) <= 5:
+                return int(frame)
+        return None
+
     # ------------------------------------------------------------------ 绘制
     def paintEvent(self, _event):             # noqa: N802
         painter = QPainter(self)
@@ -194,6 +218,12 @@ class OverviewBar(QWidget):
                 QRectF(x1, y - 11, max(3.0, x2 - x1), 3), 1.5, 1.5)
             painter.drawRect(QRectF(x1, y - 11, 1, 5))
             painter.drawRect(QRectF(max(x1, x2 - 1), y - 11, 1, 5))
+
+        # M 键标记：轨道上方绿色短竖线（单点，不和片段/入出点混）
+        for frame in self.markers:
+            x = self._x_for_frame(frame)
+            painter.setPen(QPen(MARKER_COLOR, 2))
+            painter.drawLine(QPointF(x, y - 7), QPointF(x, y - 3))
 
         # 两端小旗
         if self.in_frame is not None:
@@ -247,6 +277,16 @@ class OverviewBar(QWidget):
         painter.drawPolygon(QPolygonF(points))
 
     # ------------------------------------------------------------------ 鼠标
+    def wheelEvent(self, event):              # noqa: N802
+        """Alt+滚轮缩略图缩放（和墙上时间轴同一套）。"""
+        if event.modifiers() & Qt.AltModifier:
+            delta = event.angleDelta().y()
+            if delta:
+                self.zoomRequested.emit(1 if delta > 0 else -1)
+                event.accept()
+                return
+        super().wheelEvent(event)
+
     def mousePressEvent(self, event):         # noqa: N802
         if event.button() != Qt.LeftButton:
             super().mousePressEvent(event)
@@ -263,6 +303,11 @@ class OverviewBar(QWidget):
         index = self._segment_at(pos)
         if index is not None:
             self.segmentActivated.emit(index)
+            event.accept()
+            return
+        marker = self._marker_at(pos)
+        if marker is not None:
+            self.markerActivated.emit(marker)
             event.accept()
             return
         self._scrubbing = True
@@ -288,6 +333,10 @@ class OverviewBar(QWidget):
             self._hover = kind
             self.setCursor(Qt.SizeHorCursor if kind else Qt.ArrowCursor)
             self.update()
+        if kind is None:
+            marker = self._marker_at(pos)
+            self.setCursor(Qt.PointingHandCursor if marker is not None
+                           else Qt.ArrowCursor)
         self._update_tooltip(pos)
         super().mouseMoveEvent(event)
 
@@ -336,6 +385,10 @@ class OverviewBar(QWidget):
                 label = f"片段「{name}」" if name else "片段"
                 lines.append(f"{label}：{fmt_tc(start)} → {fmt_tc(end)}")
                 break
+        for frame in self.markers:
+            if abs(pos.x() - self._x_for_frame(frame)) <= 5:
+                lines.append(f"标记：第 {frame} 帧 · {fmt_tc(frame / self.fps)}")
+                break
         self.setToolTip("\n".join(lines))
 
     # ------------------------------------------------------------------ 右键
@@ -353,6 +406,12 @@ class OverviewBar(QWidget):
         act_seg = menu.addAction("用当前选区新建片段")
         act_seg.setEnabled(self.in_frame is not None and self.out_frame is not None
                            and self.out_frame > self.in_frame)
+        menu.addSeparator()
+        marker = self._marker_at(pos, strict_y=False)
+        act_mark = menu.addAction(f"在这里添加标记（第 {frame} 帧）")
+        act_unmark = None
+        if marker is not None:
+            act_unmark = menu.addAction(f"删除标记（第 {marker} 帧）")
         index = self._segment_at(pos)
         act_jump = None
         if index is not None:
@@ -369,6 +428,10 @@ class OverviewBar(QWidget):
             self.clearRangeRequested.emit()
         elif chosen is act_seg:
             self.addSegmentRequested.emit()
+        elif chosen is act_mark:
+            self.addMarkerRequested.emit(frame)
+        elif act_unmark is not None and chosen is act_unmark:
+            self.removeMarkerRequested.emit(marker)
         elif act_jump is not None and chosen is act_jump:
             self.segmentActivated.emit(index)
         elif chosen is act_seek:

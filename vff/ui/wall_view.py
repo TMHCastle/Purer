@@ -23,23 +23,26 @@ TICK_COLOR = QColor("#454D5E")
 MAJOR_COLOR = QColor("#5E6879")
 RANGE_COLOR = QColor("#668CFF")
 CURSOR_COLOR = QColor("#E5B65C")
+MARKER_COLOR = QColor("#45C995")
 
 HANDLE_HALF_W = 8      # 手柄命中宽度（左右各 8px）
 HANDLE_TOL_Y = 9       # 垂直命中容差
 
 
 class WallView(QListView):
-    zoomRequested = Signal(int)          # Ctrl+滚轮：+1 放大 / -1 缩小
+    zoomRequested = Signal(int)          # Alt+滚轮：+1 放大 / -1 缩小
     rangeMoved = Signal(str, int)        # 拖动入/出点："in"/"out", 帧号
     rangeEdited = Signal(str)            # 拖动结束
     rangeDragged = Signal(int, int)      # 随意框选进行中：(按下点, 当前点)
     rangeSelected = Signal(int, int)     # 随意框选松手：按下点 → 松手点
+    markerActivated = Signal(int)        # 点了绿色标记：跳到该帧
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.in_frame: int | None = None
         self.out_frame: int | None = None
         self.cursor_frame: int | None = None
+        self.range_markers: list[int] = []   # M 键加的标记（和入点/出点无关）
         self.timeline: Timeline = StepTimeline(24)
         self._drag: str | None = None
         self._drag_bucket: list[int] | None = None
@@ -68,10 +71,17 @@ class WallView(QListView):
         self.cursor_frame = cursor_frame
         self.viewport().update()
 
+    def set_range_marks(self, markers):
+        """M 键标记（单点，不是入点/出点）。"""
+        cleaned = sorted({int(m) for m in (markers or ()) if int(m) >= 0})
+        if cleaned != self.range_markers:
+            self.range_markers = cleaned
+            self.viewport().update()
+
     # ---------------- 滚轮 ----------------
     def wheelEvent(self, event):
-        # Ctrl+滚轮只改显示尺寸；普通滚轮照常滚动
-        if event.modifiers() & Qt.ControlModifier:
+        # Alt+滚轮只改显示尺寸；普通滚轮照常滚动（和 Premiere 的缩放改键一致）
+        if event.modifiers() & Qt.AltModifier:
             delta = event.angleDelta().y()
             if delta:
                 self.zoomRequested.emit(1 if delta > 0 else -1)
@@ -246,6 +256,20 @@ class WallView(QListView):
         """正在随意框选？（TrackPage 用它忽略原生多选信号，免得覆盖精确帧）"""
         return self._boxing
 
+    def marker_at(self, pos: QPoint) -> int | None:
+        """鼠标落在绿色标记附近就返回那个帧号。"""
+        if not self.range_markers:
+            return None
+        hit = self._row_at_y(pos.y())
+        if hit is None:
+            return None
+        bucket, rects = hit
+        for frame in self.range_markers:
+            x = self._x_for_frame(bucket, rects, frame)
+            if x is not None and abs(pos.x() - x) <= 5:
+                return int(frame)
+        return None
+
     def _handle_at(self, pos: QPoint):
         """命中入/出点手柄就返回 "in"/"out"。"""
         if self.in_frame is None and self.out_frame is None:
@@ -286,6 +310,11 @@ class WallView(QListView):
                     return
             # 不拖小旗 = 可能开始随意框选：先记住按下点的精确帧
             pos = event.position().toPoint()
+            marker = self.marker_at(pos)
+            if marker is not None:
+                self.markerActivated.emit(marker)
+                event.accept()
+                return
             self._press_pos = pos
             self._press_frame = self._frame_at_pos(pos)
         super().mousePressEvent(event)
@@ -399,6 +428,23 @@ class WallView(QListView):
                 if x2 > x1:
                     painter.setPen(QPen(RANGE_COLOR, 3))
                     painter.drawLine(int(x1), y, int(x2), y)
+
+        # M 键标记：绿色小菱形（单点，不参与入点/出点）
+        row_start = self.timeline.frame_at(bucket[0])
+        row_end = self.timeline.span(bucket[-1])[1]
+        for frame in self.range_markers:
+            if frame < row_start or frame > row_end:
+                continue
+            x = self._x_for_frame(bucket, rects, frame)
+            if x is None or not (left - 4 <= x <= right + 4):
+                continue
+            xi = int(round(x))
+            painter.setPen(QPen(MARKER_COLOR, 1))
+            painter.drawLine(xi, y + 1, xi, y - 3)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(MARKER_COLOR)
+            painter.drawPolygon(QPolygon([QPoint(xi, y - 7), QPoint(xi + 3, y - 4),
+                                          QPoint(xi, y - 1), QPoint(xi - 3, y - 4)]))
 
         # 入点 / 出点手柄（可拖）
         if self.in_frame is not None:

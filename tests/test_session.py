@@ -25,6 +25,7 @@ def _tab(path="D:/v/a.mp4", **extra) -> dict:
             "cursor_frame": 120, "in_frame": 100, "out_frame": 200,
             "scroll_row": 3,
             "segments": [{"t_in": 1.0, "t_end": 2.5, "name": "开场"}],
+            "markers": [120, 300],
             "exports": [{"path": "D:/out/a.mp4", "at": 1.0, "size": 1024,
                          "kind": "帧精确"}]}
     data.update(extra)
@@ -52,6 +53,7 @@ class TestSessionFile(unittest.TestCase):
         self.assertEqual(len(back["tabs"]), 2)
         self.assertEqual(back["tabs"][0]["path"], "D:/v/a.mp4")
         self.assertEqual(back["tabs"][0]["segments"][0]["name"], "开场")
+        self.assertEqual(back["tabs"][0]["markers"], [120, 300])
         self.assertEqual(back["tabs"][1]["cursor_frame"], None)
         self.assertEqual(back["current"], 1)
         self.assertEqual(back["reason"], "update")
@@ -126,6 +128,14 @@ class TestSessionFile(unittest.TestCase):
         self.assertEqual(tab["segments"][0]["name"], "ok")
         self.assertEqual(len(tab["exports"]), 1)
         self.assertEqual(tab["exports"][0]["path"], "D:/out/b.mp4")
+
+    def test_markers_are_sorted_and_limited(self):
+        tab = session.sanitize({"tabs": [_tab(
+            markers=[300, -5, "x", 120, 300, 4.7])]})["tabs"][0]
+        self.assertEqual(tab["markers"], [4, 120, 300])
+        many = list(range(session.MAX_MARKERS + 20))
+        tab = session.sanitize({"tabs": [_tab(markers=many)]})["tabs"][0]
+        self.assertEqual(len(tab["markers"]), session.MAX_MARKERS)
 
     def test_tab_limit(self):
         tabs = [_tab(f"D:/v/{i}.mp4") for i in range(session.MAX_TABS + 10)]

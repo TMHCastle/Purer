@@ -152,6 +152,7 @@ class EditSidebar(QWidget):
     stepRequested = Signal(int)
     setInRequested = Signal()
     setOutRequested = Signal()
+    markerAddRequested = Signal()
     copyTimecodeRequested = Signal()
     copyFrameRequested = Signal()
     playRequested = Signal()
@@ -342,6 +343,11 @@ class EditSidebar(QWidget):
         marks.addWidget(self.btn_in, 1)
         marks.addWidget(self.btn_out, 1)
         lay.addLayout(marks)
+
+        self.btn_marker = QPushButton("＋ 标记  M")
+        self.btn_marker.setToolTip("在当前帧加一个标记（Premiere 的 M；和入点/出点无关）")
+        self.btn_marker.clicked.connect(self.markerAddRequested)
+        lay.addWidget(self.btn_marker)
         return box
 
     # ------------------------------------------------------------ 模块 D
@@ -365,6 +371,11 @@ class EditSidebar(QWidget):
         line.addWidget(self.lbl_range, 1)
         line.addWidget(self.lbl_dur)
         lay.addLayout(line)
+
+        self.lbl_markers = QLabel("")
+        self.lbl_markers.setObjectName("cfgNote")
+        self.lbl_markers.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        lay.addWidget(self.lbl_markers)
 
         act = QHBoxLayout()
         act.setSpacing(4)
@@ -536,6 +547,18 @@ class EditSidebar(QWidget):
     def set_range(self, main: str, sub: str = ""):
         self.lbl_range.setText(main)
         self.lbl_dur.setText(sub)
+
+    def set_marker_info(self, count: int, frames=()):
+        """底部一行标记数量；具体帧号放 tooltip，不占横向空间。"""
+        count = max(0, int(count or 0))
+        if count:
+            self.lbl_markers.setText(f"标记 {count} 个 · M 添加 / Shift+M 下一个")
+            sample = "、".join(f"第 {int(f)} 帧" for f in list(frames)[:24])
+            more = " …" if len(list(frames)) > 24 else ""
+            self.lbl_markers.setToolTip(f"已标记：{sample}{more}")
+        else:
+            self.lbl_markers.setText("标记 0 个 · M 添加")
+            self.lbl_markers.setToolTip("在播放头所在帧按 M 加标记（和入点/出点无关）")
 
     def set_range_text(self, text: str):
         self.lbl_range.setText(text)

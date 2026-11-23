@@ -35,6 +35,7 @@ SESSION_NAME = "session.json"
 MAX_TABS = 50
 MAX_SEGMENTS = 200
 MAX_EXPORTS = 100
+MAX_MARKERS = 500
 MAX_NAME = 200
 
 
@@ -137,6 +138,15 @@ def sanitize_tab(raw) -> dict | None:
         if clean is not None:
             exports.append(clean)
 
+    markers: list[int] = []
+    values = raw.get("markers") or []
+    if isinstance(values, (list, tuple)):
+        for item in values[:MAX_MARKERS]:
+            frame = _int_or_none(item, 0)
+            if frame is not None and frame not in markers:
+                markers.append(frame)
+    markers.sort()
+
     return {
         "path": path,
         "step": step,
@@ -150,6 +160,7 @@ def sanitize_tab(raw) -> dict | None:
         "scroll_row": scroll_row,
         "segments": segments,
         "exports": exports,
+        "markers": markers,
     }
 
 

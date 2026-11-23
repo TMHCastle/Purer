@@ -32,7 +32,8 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from PySide6.QtCore import QItemSelection, QItemSelectionModel, QPoint, Qt  # noqa: E402
+from PySide6.QtCore import QItemSelection, QItemSelectionModel, QPoint, QPointF, Qt  # noqa: E402
+from PySide6.QtGui import QWheelEvent  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QMessageBox, QTabBar  # noqa: E402
 
@@ -514,6 +515,75 @@ def main() -> int:
               str(bar._segments))
         page.clear_segments()
         page.clear_range()
+        app.processEvents()
+
+        # ---- B1.6: PR 式标记（M）+ Alt 缩放 ----
+        page.clear_markers()
+        page.view.setFocus()
+        page._set_cursor(30, sync_wall=True)
+        app.processEvents()
+        QTest.keyClick(page.view, Qt.Key_M)
+        app.processEvents()
+        check("M adds marker at playhead", page.markers == [30], str(page.markers))
+        check("wall shows marker", page.view.range_markers == [30],
+              str(page.view.range_markers))
+        check("overview shows marker", bar.markers == [30], str(bar.markers))
+        page._set_cursor(90, sync_wall=True)
+        page.add_marker()
+        app.processEvents()
+        check("second marker added", page.markers == [30, 90], str(page.markers))
+        check("sidebar shows marker count",
+              "标记 2 个" in page.side.lbl_markers.text(),
+              page.side.lbl_markers.text())
+        page._set_cursor(90, sync_wall=True)
+        QTest.mouseClick(bar, Qt.LeftButton,
+                         pos=QPoint(int(bar._x_for_frame(30)), 20))
+        app.processEvents()
+        check("click overview marker jumps", page.cursor_frame == 30,
+              str(page.cursor_frame))
+        page._set_cursor(0, sync_wall=True)
+        QTest.keyClick(page.view, Qt.Key_M, Qt.ShiftModifier)
+        app.processEvents()
+        check("shift+M next marker", page.cursor_frame == 30,
+              str(page.cursor_frame))
+        QTest.keyClick(page.view, Qt.Key_M, Qt.ShiftModifier)
+        app.processEvents()
+        check("shift+M last marker", page.cursor_frame == 90, str(page.cursor_frame))
+        QTest.keyClick(page.view, Qt.Key_M, Qt.ShiftModifier | Qt.ControlModifier)
+        app.processEvents()
+        check("ctrl+shift+M previous marker", page.cursor_frame == 30,
+              str(page.cursor_frame))
+        before_side = page.display_side
+        event = QWheelEvent(QPointF(20, 20), QPointF(20, 20),
+                            QPoint(0, 0), QPoint(0, 120), Qt.NoButton,
+                            Qt.AltModifier, Qt.NoScrollPhase, False)
+        page.view.wheelEvent(event)
+        app.processEvents()
+        check("alt+wheel zooms", page.display_side > before_side,
+              f"{before_side} -> {page.display_side}")
+        before_ctrl = page.display_side
+        event = QWheelEvent(QPointF(20, 20), QPointF(20, 20),
+                            QPoint(0, 0), QPoint(0, 120), Qt.NoButton,
+                            Qt.ControlModifier, Qt.NoScrollPhase, False)
+        page.view.wheelEvent(event)
+        app.processEvents()
+        check("ctrl+wheel no longer zooms", page.display_side == before_ctrl,
+              f"{before_ctrl} -> {page.display_side}")
+        page.set_display_side(before_side)
+        before_bar = page.display_side
+        event = QWheelEvent(QPointF(20, 20), QPointF(20, 20),
+                            QPoint(0, 0), QPoint(0, 120), Qt.NoButton,
+                            Qt.AltModifier, Qt.NoScrollPhase, False)
+        bar.wheelEvent(event)
+        app.processEvents()
+        check("alt+wheel on bottom bar zooms", page.display_side > before_bar,
+              f"{before_bar} -> {page.display_side}")
+        page.set_display_side(before_side)
+        page.save_state()
+        saved = page._read_state()
+        check("markers saved with cache", saved.get("markers") == [30, 90],
+              str(saved.get("markers")))
+        page.clear_markers()
         app.processEvents()
 
         # ---- B2: 时间轴手柄「垂直拖动」+ 预览跟随被拖的帧 ----
@@ -1327,6 +1397,7 @@ def main() -> int:
                  "threshold": None, "display_side": 200, "sidebar_width": 380,
                  "cursor_frame": 60, "in_frame": 24, "out_frame": 90,
                  "scroll_row": 2,
+                 "markers": [50, 70],
                  "segments": [{"t_in": 1.0, "t_end": 2.0, "name": "开场"}],
                  "exports": [{"path": str(tmp / "old.mp4"), "at": 1.0,
                               "size": 4096, "kind": "帧精确"}]},
@@ -1370,6 +1441,11 @@ def main() -> int:
                   len(page_a.segments) == 1
                   and page_a.segments[0]["name"] == "开场",
                   str(page_a.segments))
+            check("session restores markers",
+                  page_a.markers == [50, 70]
+                  and page_a.view.range_markers == [50, 70]
+                  and page_a.overview.markers == [50, 70],
+                  str(page_a.markers))
             check("session restores export list",
                   any("old.mp4" in str(e.get("path")) for e in page_a.exports),
                   str(page_a.exports[:2]))

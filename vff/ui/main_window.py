@@ -260,7 +260,7 @@ class MainWindow(FramelessWindow):
         QShortcut(QKeySequence("Ctrl+W"), self, activated=self._close_current)
         QShortcut(QKeySequence("Ctrl+,"), self, activated=self.open_settings)
         for i in range(len(DISPLAY_PRESETS)):
-            QShortcut(QKeySequence(f"Ctrl+{i + 1}"), self,
+            QShortcut(QKeySequence(f"Alt+{i + 1}"), self,
                       activated=lambda n=i: self._pick_size(n))
 
     # ------------------------------------------------------------ 工具栏
@@ -333,21 +333,21 @@ class MainWindow(FramelessWindow):
         self.btn_zoom_out = QPushButton("－")
         self.btn_zoom_out.setObjectName("mini")
         self.btn_zoom_out.setFixedWidth(26)
-        self.btn_zoom_out.setToolTip("缩小缩略图（Ctrl+滚轮 也可以）")
+        self.btn_zoom_out.setToolTip("缩小缩略图（Alt+滚轮 / - 也可以）")
         self.btn_zoom_out.clicked.connect(lambda: self._zoom(-1))
         self.combo_size = ArrowCombo()
         for label, px in DISPLAY_PRESETS:
             self.combo_size.addItem(f"{label} · {px}", px)
         self.combo_size.addItem("自定义", None)
         self.combo_size.setFixedWidth(118)
-        self.combo_size.setToolTip("缩略图「显示」尺寸（Ctrl+1~4 / Ctrl+滚轮实时缩放）\n"
+        self.combo_size.setToolTip("缩略图「显示」尺寸（Alt+1~4 / Alt+滚轮 / = - 实时缩放）\n"
                                    "只改显示大小，不会重新抽帧")
         self._sync_size_combo(self._display_side)
         self.combo_size.currentIndexChanged.connect(self._on_size_changed)
         self.btn_zoom_in = QPushButton("＋")
         self.btn_zoom_in.setObjectName("mini")
         self.btn_zoom_in.setFixedWidth(26)
-        self.btn_zoom_in.setToolTip("放大缩略图（Ctrl+滚轮 也可以）")
+        self.btn_zoom_in.setToolTip("放大缩略图（Alt+滚轮 / = 也可以）")
         self.btn_zoom_in.clicked.connect(lambda: self._zoom(1))
         bar.addWidget(self.btn_zoom_out)
         bar.addWidget(self.combo_size)

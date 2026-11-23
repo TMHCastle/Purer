@@ -83,6 +83,7 @@ class TrackPage(QWidget):
         self.cursor_frame: int | None = None
         self.in_frame: int | None = None
         self.out_frame: int | None = None
+        self.markers: list[int] = []       # M 键标记（单点，和入点/出点无关）
         self.segments: list[dict] = []
         self.exports: list[dict] = []      # 已导出的片段文件（打开 / 打开文件夹用）
         self._restore_pending: dict | None = dict(restore) if restore else None
@@ -170,6 +171,7 @@ class TrackPage(QWidget):
         self.view.rangeEdited.connect(self._end_range_drag)
         self.view.rangeDragged.connect(self._on_wall_range_drag)
         self.view.rangeSelected.connect(self._on_wall_range_selected)
+        self.view.markerActivated.connect(self._goto_marker_frame)
 
         self.side = EditSidebar()
         self.side.stopRequested.connect(self.stop_extract)
@@ -178,6 +180,7 @@ class TrackPage(QWidget):
         self.side.stepRequested.connect(self._on_sidebar_step)
         self.side.setInRequested.connect(lambda: self.set_in_point())
         self.side.setOutRequested.connect(lambda: self.set_out_point())
+        self.side.markerAddRequested.connect(lambda: self.add_marker())
         self.side.copyTimecodeRequested.connect(self._copy_tc)
         self.side.copyFrameRequested.connect(self._copy_img)
         self.side.playRequested.connect(self.toggle_playback)
@@ -214,6 +217,11 @@ class TrackPage(QWidget):
         self.overview.clearRangeRequested.connect(self.clear_range)
         self.overview.addSegmentRequested.connect(self.add_segment)
         self.overview.segmentActivated.connect(self.select_segment)
+        self.overview.markerActivated.connect(self._goto_marker_frame)
+        self.overview.addMarkerRequested.connect(self.add_marker)
+        self.overview.removeMarkerRequested.connect(self.remove_marker)
+        self.overview.zoomRequested.connect(self._on_wheel_zoom)
+        self._refresh_markers()
 
         # 兼容别名：导出/批处理等既有逻辑继续用原来的控件名
         self.lbl_meta = self.side.lbl_info
@@ -253,6 +261,12 @@ class TrackPage(QWidget):
             bind("I", lambda: self.set_in_point()),
             bind("O", lambda: self.set_out_point()),
             bind("A", self.add_segment),
+            bind("M", self.add_marker),
+            bind("Shift+M", lambda: self.goto_marker(1)),
+            bind("Ctrl+Shift+M", lambda: self.goto_marker(-1)),
+            bind("=", lambda: self._on_wheel_zoom(1)),
+            bind("+", lambda: self._on_wheel_zoom(1)),
+            bind("-", lambda: self._on_wheel_zoom(-1)),
             bind("Space", self.toggle_playback),
             bind("Escape", self._on_escape),
         ]
@@ -528,6 +542,7 @@ class TrackPage(QWidget):
                  "name": str(s.get("name") or "")}
                 for s in self.segments],
             "range": {"in": self.in_frame, "out": self.out_frame},
+            "markers": sorted(int(m) for m in self.markers),
             "exports": [dict(item) for item in self.exports[-200:]],
             "updated_at": time.time(),
         }
@@ -581,16 +596,26 @@ class TrackPage(QWidget):
                              "name": str(item.get("name") or "")})
         self.segments = segments
         rng = payload.get("range") or {}
+        limit = max(0, int(self.info.frames or 0) - 1)
         try:
             in_frame = rng.get("in")
             out_frame = rng.get("out")
-            limit = max(0, int(self.info.frames or 0) - 1)
             if in_frame is not None:
                 self.in_frame = max(0, min(limit, int(in_frame)))
             if out_frame is not None:
                 self.out_frame = max(0, min(limit, int(out_frame)))
         except (TypeError, ValueError):
             pass
+        markers = []
+        for value in payload.get("markers") or []:
+            try:
+                frame = int(value)
+            except (TypeError, ValueError):
+                continue
+            frame = max(0, min(limit, frame))
+            if frame not in markers:
+                markers.append(frame)
+        self.markers = sorted(markers)
         exports = []
         for item in payload.get("exports") or []:
             if not isinstance(item, dict):
@@ -604,9 +629,10 @@ class TrackPage(QWidget):
                             "kind": str(item.get("kind") or "")})
         self.exports = exports
         self._refresh_segments()
+        self._refresh_markers()
         self.side.set_exports(self.exports)
         self._refresh_range()
-        return bool(segments or exports or rng)
+        return bool(segments or exports or rng or self.markers)
 
     # ------------------------------------------------- 会话快照（跨重启恢复）
     def session_snapshot(self) -> dict:
@@ -633,6 +659,9 @@ class TrackPage(QWidget):
         exports = [dict(item) for item in self.exports[-100:]]
         if not exports:
             exports = list(pending.get("exports") or [])
+        markers = sorted({int(m) for m in self.markers})
+        if not markers:
+            markers = list(pending.get("markers") or [])
 
         def _pick(key, value):
             return value if value is not None else pending.get(key)
@@ -650,6 +679,7 @@ class TrackPage(QWidget):
             "scroll_row": row or int(pending.get("scroll_row") or 0),
             "segments": segments,
             "exports": exports,
+            "markers": markers,
         }
 
     def session_restore(self, data: dict) -> bool:
@@ -674,11 +704,14 @@ class TrackPage(QWidget):
 
         segments = data.get("segments") or []
         exports = data.get("exports") or []
-        if segments or exports:
+        markers = data.get("markers") or []
+        if segments or exports or markers:
             self.apply_state({"segments": segments,
                               "range": {"in": in_frame, "out": out_frame},
-                              "exports": exports})
+                              "exports": exports,
+                              "markers": markers})
         else:
+            self._refresh_markers()
             self._refresh_range()
 
         cursor = _frame("cursor_frame")
@@ -1244,6 +1277,88 @@ class TrackPage(QWidget):
                               for s in self.segments])
         except (RuntimeError, KeyError, TypeError, ValueError):
             pass
+
+    # ------------------------------------------------------- 标记（PR 的 M）
+    def _refresh_markers(self):
+        """标记只存帧号；墙上时间轴和底部总进度条各画一份。"""
+        marks = sorted({int(m) for m in self.markers})
+        self.markers = marks
+        bar = getattr(self, "overview", None)
+        if bar is not None:
+            try:
+                bar.set_markers(marks)
+            except RuntimeError:
+                pass
+        try:
+            self.view.set_range_marks(marks)
+        except RuntimeError:
+            pass
+        side = getattr(self, "side", None)
+        if side is not None:
+            side.set_marker_info(len(marks), marks)
+
+    def add_marker(self, frame: int | None = None):
+        frame = self.cursor_frame if frame is None else frame
+        if frame is None:
+            self.side.set_export_text("先点一帧，再按 M 加标记")
+            return
+        total = max(1, int(self.info.frames or 0))
+        frame = max(0, min(total - 1, int(frame)))
+        if frame in self.markers:
+            self.side.set_export_text(f"第 {frame} 帧已经有标记了")
+            return
+        self.markers.append(frame)
+        self._refresh_markers()
+        index = self.markers.index(frame) + 1
+        self.side.set_export_text(
+            f"已添加标记 #{index}（第 {frame} 帧 · {fmt_tc(frame / self._fps())}）")
+        self._save_range_state()
+
+    def remove_marker(self, frame: int | None = None):
+        frame = self.cursor_frame if frame is None else frame
+        if frame is None:
+            return
+        frame = int(frame)
+        if frame not in self.markers:
+            self.side.set_export_text(f"第 {frame} 帧没有标记")
+            return
+        self.markers.remove(frame)
+        self._refresh_markers()
+        self.side.set_export_text(f"已删除第 {frame} 帧的标记")
+        self._save_range_state()
+
+    def clear_markers(self):
+        if not self.markers:
+            return
+        self.markers.clear()
+        self._refresh_markers()
+        self.side.set_export_text("已清除全部标记")
+        self._save_range_state()
+
+    def goto_marker(self, direction: int = 1):
+        """Shift+M 下一个；Ctrl+Shift+M 上一个（和 Premiere 一致）。"""
+        if not self.markers:
+            self.side.set_export_text("还没有标记（M 添加）")
+            return
+        current = self.cursor_frame
+        if direction >= 0:
+            target = next((m for m in self.markers
+                           if current is None or m > current), None)
+            empty = "后面没有标记了"
+        else:
+            target = next((m for m in reversed(self.markers)
+                           if current is not None and m < current), None)
+            empty = "前面没有标记了"
+        if target is None:
+            self.side.set_export_text(empty)
+            return
+        self._goto_marker_frame(target)
+
+    def _goto_marker_frame(self, frame: int):
+        self._stop_playback_if_playing()
+        self._set_cursor(int(frame), sync_wall=True)
+        self.side.set_export_text(
+            f"标记：第 {int(frame)} 帧 · {fmt_tc(int(frame) / self._fps())}")
 
     def set_in_point(self, frame: int | None = None):
         self._stop_playback_if_playing()
@@ -2126,6 +2241,10 @@ class TrackPage(QWidget):
         menu = QMenu(self)
         act_in = menu.addAction("设入点（I）")
         act_out = menu.addAction("设出点（O）")
+        marker = self.view.marker_at(pos)
+        act_unmark = None
+        if marker is not None:
+            act_unmark = menu.addAction(f"删除标记（第 {marker} 帧）")
         menu.addSeparator()
         act_tc = menu.addAction("复制时间码")
         act_img = menu.addAction("复制画面")
@@ -2140,6 +2259,8 @@ class TrackPage(QWidget):
             self.set_in_point()
         elif chosen is act_out:
             self.set_out_point()
+        elif act_unmark is not None and chosen is act_unmark:
+            self.remove_marker(marker)
         elif chosen is act_tc:
             self._copy_tc()
         elif chosen is act_img:

@@ -32,6 +32,8 @@ class WallView(QListView):
     zoomRequested = Signal(int)          # Ctrl+滚轮：+1 放大 / -1 缩小
     rangeMoved = Signal(str, int)        # 拖动入/出点："in"/"out", 帧号
     rangeEdited = Signal(str)            # 拖动结束
+    rangeDragged = Signal(int, int)      # 随意框选进行中：(按下点, 当前点)
+    rangeSelected = Signal(int, int)     # 随意框选松手：按下点 → 松手点
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -43,6 +45,11 @@ class WallView(QListView):
         self._drag_bucket: list[int] | None = None
         self._drag_rects: list = []
         self._hover: str | None = None
+        # 随意框选：按「鼠标按下点 / 当前点」换算帧，而不是格子的左右边界
+        self._press_pos: QPoint | None = None
+        self._press_frame: int | None = None
+        self._last_frame: int | None = None
+        self._boxing = False
 
     # ---------------- 外部设置 ----------------
     def set_timeline(self, timeline: Timeline):
@@ -209,6 +216,36 @@ class WallView(QListView):
         hi = self.timeline.span(bucket[-1])[1]
         return int(max(lo, min(hi, frame)))
 
+    def _row_at_pos(self, pos: QPoint):
+        """任意鼠标位置 → 所在行（不在行内就取纵向最近的一行）。"""
+        best = None
+        for _top, bucket in self._visible_rows():
+            rects = [self._row_rect(i) for i in bucket]
+            rects = [r for r in rects if r is not None]
+            if not rects:
+                continue
+            top = min(r.top() for r in rects)
+            bottom = max(r.bottom() for r in rects)
+            if top <= pos.y() <= bottom:
+                return bucket, rects
+            dist = min(abs(pos.y() - top), abs(pos.y() - bottom))
+            if best is None or dist < best[0]:
+                best = (dist, bucket, rects)
+        if best is None:
+            return None
+        return best[1], best[2]
+
+    def _frame_at_pos(self, pos: QPoint) -> int | None:
+        """鼠标位置 → 精确帧号（框选两端都用它）。"""
+        hit = self._row_at_pos(pos)
+        if hit is None:
+            return None
+        return self._frame_in_row(hit[0], hit[1], pos.x())
+
+    def box_selecting(self) -> bool:
+        """正在随意框选？（TrackPage 用它忽略原生多选信号，免得覆盖精确帧）"""
+        return self._boxing
+
     def _handle_at(self, pos: QPoint):
         """命中入/出点手柄就返回 "in"/"out"。"""
         if self.in_frame is None and self.out_frame is None:
@@ -231,6 +268,10 @@ class WallView(QListView):
 
     # ---------------- 鼠标 ----------------
     def mousePressEvent(self, event):
+        self._press_pos = None
+        self._press_frame = None
+        self._last_frame = None
+        self._boxing = False
         if event.button() == Qt.LeftButton:
             kind = self._handle_at(event.position().toPoint())
             if kind:
@@ -243,6 +284,10 @@ class WallView(QListView):
                     self.viewport().update()
                     event.accept()
                     return
+            # 不拖小旗 = 可能开始随意框选：先记住按下点的精确帧
+            pos = event.position().toPoint()
+            self._press_pos = pos
+            self._press_frame = self._frame_at_pos(pos)
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
@@ -260,11 +305,21 @@ class WallView(QListView):
             self.viewport().setCursor(Qt.ClosedHandCursor)
             event.accept()
             return
+        if self._press_pos is not None and self._press_frame is not None:
+            if (not self._boxing
+                    and (pos - self._press_pos).manhattanLength() >= 4):
+                self._boxing = True
+            if self._boxing:
+                frame = self._frame_at_pos(pos)
+                if frame is not None:
+                    self._last_frame = frame
+                    self.rangeDragged.emit(self._press_frame, frame)
         kind = self._handle_at(pos)
         if kind != self._hover:
             self._hover = kind
             self.viewport().setCursor(Qt.SizeHorCursor if kind else Qt.ArrowCursor)
             self.viewport().update()
+        # 继续交给 QListView：保留原生框选高亮和边缘自动滚动
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
@@ -278,7 +333,18 @@ class WallView(QListView):
             self.rangeEdited.emit(kind)
             event.accept()
             return
+        had, start, end = self._boxing, self._press_frame, self._last_frame
+        # 先让 QListView 收尾（此时 _boxing 仍为 True，TrackPage 会忽略它的多选信号）
         super().mouseReleaseEvent(event)
+        self._boxing = False
+        self._press_pos = None
+        self._press_frame = None
+        self._last_frame = None
+        if had and start is not None and end is not None:
+            # 最后再发一次精确区间：按下点 → 松手点，覆盖原生「整格」多选
+            self.rangeSelected.emit(start, end)
+            event.accept()
+            return
 
     def leaveEvent(self, event):
         if not self._drag and self._hover is not None:

@@ -34,6 +34,7 @@ from ..util import fmt_tc, fmt_tc_compact, human_size, safe_filename
 from .dialogs import ask_batch_export, ask_export, show_log
 from .filmstrip import PLAY_FPS, FilmStrip, PlayClip
 from .images import jpeg_ready
+from .overview_bar import OverviewBar
 from .sidebar import SIDEBAR_MAX, SIDEBAR_MIN, EditSidebar
 from .wall_view import WallView
 from .widgets import LANE_H, FrameDelegate, FrameModel, FrameRef, PreviewDialog
@@ -167,6 +168,8 @@ class TrackPage(QWidget):
         self.view.zoomRequested.connect(self._on_wheel_zoom)
         self.view.rangeMoved.connect(self._on_range_drag)
         self.view.rangeEdited.connect(self._end_range_drag)
+        self.view.rangeDragged.connect(self._on_wall_range_drag)
+        self.view.rangeSelected.connect(self._on_wall_range_selected)
 
         self.side = EditSidebar()
         self.side.stopRequested.connect(self.stop_extract)
@@ -197,6 +200,20 @@ class TrackPage(QWidget):
         self.split.setStretchFactor(1, 0)
         self.split.setSizes([900, 372])
         root.addWidget(self.split, 1)
+
+        # 底部总进度条：整段视频一条，和墙上的时间轴共用同一份入点/出点/光标/片段
+        self.overview = OverviewBar()
+        self.overview.set_media(self.info.frames or 0, self.info.fps or 25.0)
+        root.addWidget(self.overview)
+        self.overview.seekRequested.connect(self._seek_overview)
+        self.overview.inMoved.connect(lambda f: self._on_range_drag("in", f))
+        self.overview.outMoved.connect(lambda f: self._on_range_drag("out", f))
+        self.overview.editFinished.connect(self._end_range_drag)
+        self.overview.setInRequested.connect(self.set_in_point)
+        self.overview.setOutRequested.connect(self.set_out_point)
+        self.overview.clearRangeRequested.connect(self.clear_range)
+        self.overview.addSegmentRequested.connect(self.add_segment)
+        self.overview.segmentActivated.connect(self.select_segment)
 
         # 兼容别名：导出/批处理等既有逻辑继续用原来的控件名
         self.lbl_meta = self.side.lbl_info
@@ -265,6 +282,7 @@ class TrackPage(QWidget):
                       if self.model.item(i) is not None]
             self.timeline = SceneTimeline(frames, max(0, int(self.info.frames or 0)))
         self.view.set_timeline(self.timeline)
+        self._sync_overview()
 
     def start(self):
         i = self.info
@@ -873,10 +891,14 @@ class TrackPage(QWidget):
             if not refs:
                 self._timer.stop()
         self.view.set_markers(self.in_frame, self.out_frame, self.cursor_frame)
+        self._sync_overview()
 
     # ------------------------------------------------------- 光标 / 预览卡
     def _on_current(self, cur, _prev):
         if self._syncing or not (cur and cur.isValid()):
+            return
+        if self.view.box_selecting():
+            # 随意框选过程中，原生多选会把 current 挪来挪去；以按下点/当前点为准
             return
         ref = self.model.item(cur.row())
         if ref is None:
@@ -890,6 +912,7 @@ class TrackPage(QWidget):
         if sync_wall:
             self._sync_wall_selection(frame)
         self.view.set_markers(self.in_frame, self.out_frame, frame)
+        self._sync_overview()
         if self._playing or self._player_open:
             # 回放/暂停时只刷新播放窗口，不重定位浮窗，否则会一直抖
             self._update_player()
@@ -1155,7 +1178,7 @@ class TrackPage(QWidget):
 
     # ------------------------------------------------------- 入点 / 出点
     def _on_selection_changed(self, *_args):
-        if self._syncing:
+        if self._syncing or self.view.box_selecting():
             return
         rows = self.selected_rows()
         if len(rows) >= 2:
@@ -1171,6 +1194,56 @@ class TrackPage(QWidget):
                 self._refresh_range()
                 self._update_card()
                 self._save_range_state()
+
+    def _seek_overview(self, frame: int):
+        """底部总进度条：点/拖只移动光标，不碰入点出点。"""
+        self._stop_playback_if_playing()
+        self._set_cursor(frame, sync_wall=True)
+
+    def _on_wall_range_drag(self, start_frame: int, end_frame: int):
+        """随意框选进行中：严格按「按下点 → 当前点」的精确帧，不用格子边界。"""
+        if self._syncing:
+            return
+        self._stop_playback_if_playing()
+        lo, hi = sorted((int(start_frame), int(end_frame)))
+        self.in_frame, self.out_frame = lo, hi
+        self.cursor_frame = lo
+        self._drag_frame = lo
+        self.view.set_markers(self.in_frame, self.out_frame, self.cursor_frame)
+        self._refresh_range()
+        if not self._drag_tick.isActive():
+            self._on_drag_preview()
+            self._drag_tick.start()
+        self._drag_settle.start()
+
+    def _on_wall_range_selected(self, start_frame: int, end_frame: int):
+        """随意框选松手：用两端精确帧定稿，覆盖原生「整格多选」的结果。"""
+        self._drag_tick.stop()
+        self._drag_settle.stop()
+        self._drag_frame = None
+        lo, hi = sorted((int(start_frame), int(end_frame)))
+        self.in_frame, self.out_frame = lo, hi
+        self._set_cursor(lo, sync_wall=True)
+        self._refresh_range()
+        count = hi - lo + 1
+        self.side.set_export_text(
+            f"框选区间：{count} 帧（{count / max(self._fps(), 1e-6):.2f} 秒）")
+        self._save_range_state()
+
+    def _sync_overview(self):
+        """把光标/入点/出点/片段推给底部总进度条（唯一的同步出口）。"""
+        bar = getattr(self, "overview", None)
+        if bar is None:
+            return
+        try:
+            bar.set_media(int(self.info.frames or 0),
+                          float(self.info.fps or 25.0))
+            bar.set_state(self.cursor_frame, self.in_frame, self.out_frame)
+            bar.set_segments([(float(s["t_in"]), float(s["t_end"]),
+                               str(s.get("name") or ""))
+                              for s in self.segments])
+        except (RuntimeError, KeyError, TypeError, ValueError):
+            pass
 
     def set_in_point(self, frame: int | None = None):
         self._stop_playback_if_playing()
@@ -1266,6 +1339,7 @@ class TrackPage(QWidget):
             (s["t_in"], s["t_end"], self._thumb_for_time(s["t_in"]),
              str(s.get("name") or ""))
             for s in self.segments])
+        self._sync_overview()
 
     def _thumb_for_time(self, t: float) -> str | None:
         """片段缩略图 = 已抽好的关键帧里最接近的一张（不额外解码）。"""
@@ -1387,6 +1461,7 @@ class TrackPage(QWidget):
         self.btn_export.setEnabled(range_ok and not self.busy and not self.exporting
                                    and self._batch is None)
         self.btn_play.setEnabled(range_ok and self._batch is None)
+        self._sync_overview()
 
     def selected_rows(self) -> list[int]:
         model = self.view.selectionModel()

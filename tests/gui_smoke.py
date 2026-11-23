@@ -472,6 +472,50 @@ def main() -> int:
               f"{page.in_frame},{page.out_frame}")
         check("wall markers kept", page.view.in_frame == 25 and page.view.out_frame == 30)
 
+        # ---- B1.5: 底部总进度条（和墙上时间轴共用同一份状态） ----
+        bar = page.overview
+        total = max(1, int(page.info.frames or 0))
+        check("overview bar exists", bar is not None and not bar.isHidden()
+              and bar.height() == 46, f"h={bar.height() if bar else '?'}")
+        check("overview mirrors in/out", bar.in_frame == 25 and bar.out_frame == 30,
+              f"{bar.in_frame},{bar.out_frame}")
+        check("overview roundtrips frame", all(
+            abs(bar.frame_at(bar._x_for_frame(f)) - f) <= 1
+            for f in (0, total // 2, total - 1)),
+            f"total={total}")
+        page.clear_range()
+        midpoint = total // 2
+        QTest.mouseClick(bar, Qt.LeftButton,
+                         pos=QPoint(int(bar._x_for_frame(midpoint)), 24))
+        app.processEvents()
+        check("overview click seeks", abs((page.cursor_frame or -1) - midpoint) <= 1,
+              f"cursor={page.cursor_frame} want={midpoint}")
+        page.set_out_point(min(total - 1, midpoint + 80))
+        page.set_in_point(midpoint)
+        app.processEvents()
+        x_in = int(bar._x_for_frame(page.in_frame))
+        want_in = max(1, page.in_frame - 20)
+        x_target = int(bar._x_for_frame(want_in))
+        QTest.mousePress(bar, Qt.LeftButton, pos=QPoint(x_in, 14))
+        QTest.mouseMove(bar, QPoint(x_target, 14))
+        QTest.mouseRelease(bar, Qt.LeftButton, pos=QPoint(x_target, 14))
+        app.processEvents()
+        check("overview drag moves in point",
+              abs(page.in_frame - want_in) <= 1,
+              f"in={page.in_frame} want={want_in}")
+        check("overview mirrors cursor", bar.cursor_frame == page.cursor_frame,
+              f"{bar.cursor_frame} vs {page.cursor_frame}")
+        page.clear_range()
+        page.set_in_point(midpoint)
+        page.set_out_point(midpoint + 10)
+        page.add_segment()
+        app.processEvents()
+        check("overview mirrors segments", len(bar._segments) == 1,
+              str(bar._segments))
+        page.clear_segments()
+        page.clear_range()
+        app.processEvents()
+
         # ---- B2: 时间轴手柄「垂直拖动」+ 预览跟随被拖的帧 ----
         total = max(1, int(page.info.frames or 0))
         page.set_display_side(320)          # 放大缩略图 → 墙折成多行，才能测纵向拖动
@@ -591,6 +635,50 @@ def main() -> int:
             check("horizontal drag still works", False)
         page.set_display_side(160)
         win.resize(1200, 760)
+        app.processEvents()
+
+        # ---- B3.5: 随意框选 = 按下点 → 松手点（不是格子的左右边界） ----
+        page.clear_range()
+        page.set_display_side(200)
+        win.resize(1200, 760)
+        app.processEvents()
+        rows = view._visible_rows()
+        three = next((r for r in rows if len(r[1]) >= 3), None)
+        if three is not None:
+            rects = [view._row_rect(i) for i in three[1]]
+            rects = [r for r in rects if r is not None]
+            p0 = QPoint(rects[0].left() + int(rects[0].width() * 0.72),
+                        rects[0].center().y())
+            p1 = QPoint(rects[2].left() + int(rects[2].width() * 0.28),
+                        rects[2].center().y())
+            want_in = view._frame_at_pos(p0)
+            want_out = view._frame_at_pos(p1)
+            cell_in = three[1][0] * page.step
+            cell_out = three[1][2] * page.step
+            QTest.mousePress(view.viewport(), Qt.LeftButton, pos=p0)
+            QTest.mouseMove(view.viewport(), p1)
+            app.processEvents()
+            QTest.mouseRelease(view.viewport(), Qt.LeftButton, pos=p1)
+            app.processEvents()
+            check("box select starts at press point",
+                  page.in_frame == want_in,
+                  f"in={page.in_frame} want={want_in} cell={cell_in}")
+            check("box select ends at release point",
+                  page.out_frame == want_out,
+                  f"out={page.out_frame} want={want_out} cell={cell_out}")
+            check("box select is not cell left edges",
+                  page.in_frame != cell_in and page.out_frame != cell_out,
+                  f"{page.in_frame}..{page.out_frame} vs {cell_in}..{cell_out}")
+            check("overview follows box select",
+                  bar.in_frame == page.in_frame and bar.out_frame == page.out_frame,
+                  f"{bar.in_frame}..{bar.out_frame}")
+        else:
+            for name in ("box select starts at press point",
+                         "box select ends at release point",
+                         "box select is not cell left edges",
+                         "overview follows box select"):
+                check(name, False, "没有找到 3 格以上的行")
+        page.set_display_side(160)
         app.processEvents()
 
         # ---- B4: 按镜头（坐标不规则）时，时间轴仍要精确到帧 ----

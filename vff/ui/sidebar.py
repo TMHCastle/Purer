@@ -16,9 +16,11 @@ from __future__ import annotations
 
 from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtGui import QPixmap
-from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QProgressBar, QPushButton,
+from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QListWidget,
+                               QListWidgetItem, QProgressBar, QPushButton,
                                QScrollArea, QSizePolicy, QVBoxLayout, QWidget)
 
+from ..util import human_size
 from .images import thumb_pixmap
 from .style import icon_photo, icon_timecode
 
@@ -154,12 +156,13 @@ class EditSidebar(QWidget):
     copyFrameRequested = Signal()
     playRequested = Signal()
     exportRequested = Signal()
-    revealRequested = Signal()
     addSegmentRequested = Signal()
     clearSegmentsRequested = Signal()
     removeSegmentRequested = Signal(int)
     selectSegmentRequested = Signal(int)
     exportAllSegmentsRequested = Signal()
+    openExportRequested = Signal(str)      # 打开某个已导出的片段
+    folderExportRequested = Signal(str)    # 打开它所在的文件夹
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -171,11 +174,12 @@ class EditSidebar(QWidget):
         self._aspect = 16 / 9
         self._rows: list[SegmentRow] = []
         self._segments: list[tuple[float, float, str | None]] = []
+        self._exports: list[dict] = []
         self._active = -1
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(8, 8, 8, 8)
-        root.setSpacing(6)
+        root.setContentsMargins(6, 5, 6, 5)
+        root.setSpacing(3)
 
         self.p_info = self._build_info()
         self.p_preview = self._build_preview()
@@ -384,8 +388,8 @@ class EditSidebar(QWidget):
         box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         box.setMinimumHeight(150)
         lay = QVBoxLayout(box)
-        lay.setContentsMargins(8, 6, 8, 7)
-        lay.setSpacing(5)
+        lay.setContentsMargins(8, 4, 8, 4)
+        lay.setSpacing(3)
 
         head = QHBoxLayout()
         head.setSpacing(4)
@@ -427,6 +431,51 @@ class EditSidebar(QWidget):
         self.btn_export_all.clicked.connect(self.exportAllSegmentsRequested)
         lay.addWidget(self.btn_export_all)
 
+        # ---- 已导出的片段文件（可展开：打开 / 打开文件夹） ----
+        self.btn_exports = QPushButton("▸ 已导出的片段（0）")
+        self.btn_exports.setObjectName("mini")
+        self.btn_exports.setCheckable(True)
+        self.btn_exports.setCursor(Qt.PointingHandCursor)
+        self.btn_exports.setToolTip("展开后能看到导出过的片段文件，双击打开")
+        self.btn_exports.toggled.connect(self._toggle_exports)
+        self.btn_open_export = QPushButton("打开")
+        self.btn_open_export.setObjectName("mini")
+        self.btn_open_export.setToolTip("用系统默认播放器打开选中的片段")
+        self.btn_open_export.clicked.connect(self._open_selected_export)
+        self.btn_folder_export = QPushButton("文件夹")
+        self.btn_folder_export.setObjectName("mini")
+        self.btn_folder_export.setToolTip("打开选中片段所在的文件夹")
+        self.btn_folder_export.clicked.connect(self._folder_selected_export)
+        head_row = QHBoxLayout()
+        head_row.setSpacing(4)
+        head_row.addWidget(self.btn_exports, 1)
+        head_row.addWidget(self.btn_open_export)
+        head_row.addWidget(self.btn_folder_export)
+        lay.addLayout(head_row)
+
+        self.export_box = QWidget()
+        export_lay = QVBoxLayout(self.export_box)
+        export_lay.setContentsMargins(0, 0, 0, 0)
+        export_lay.setSpacing(2)
+        self.exp_list = QListWidget()
+        self.exp_list.setObjectName("exportList")
+        self.exp_list.setMaximumHeight(56)
+        self.exp_list.setMinimumHeight(34)
+        self.exp_list.setAlternatingRowColors(False)
+        self.exp_list.setSelectionMode(QListWidget.SingleSelection)
+        self.exp_list.setTextElideMode(Qt.ElideMiddle)
+        self.exp_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.exp_list.setUniformItemSizes(True)
+        self.exp_list.itemDoubleClicked.connect(self._open_export_item)
+        self.exp_list.itemSelectionChanged.connect(self._sync_export_buttons)
+        export_lay.addWidget(self.exp_list)
+        self.lbl_exp_hint = QLabel("还没有导出过片段")
+        self.lbl_exp_hint.setObjectName("cfgNote")
+        export_lay.addWidget(self.lbl_exp_hint)
+        self.export_box.setVisible(False)
+        lay.addWidget(self.export_box)
+        self._sync_export_buttons()
+
         self.lbl_status = QLabel("")
         self.lbl_status.setObjectName("exportLabel")
         self.lbl_status.setWordWrap(True)
@@ -442,12 +491,6 @@ class EditSidebar(QWidget):
         self.exp_bar.setTextVisible(False)
         self.exp_bar.setVisible(False)
         lay.addWidget(self.exp_bar)
-
-        self.btn_reveal = QPushButton("📂 打开所在文件夹")
-        self.btn_reveal.setObjectName("mini")
-        self.btn_reveal.setVisible(False)
-        self.btn_reveal.clicked.connect(self.revealRequested)
-        lay.addWidget(self.btn_reveal)
         return box
 
     # ------------------------------------------------------------ 数据接口
@@ -524,9 +567,6 @@ class EditSidebar(QWidget):
         self.exp_bar.setVisible(True)
         self.exp_bar.setValue(value)
 
-    def set_reveal_visible(self, visible: bool):
-        self.btn_reveal.setVisible(visible)
-
     # ------------------------------------------------------------ 片段
     def set_segments(self, segments: list):
         """segments: [(t_in, t_end, 缩略图路径或 None[, 素材名]), ...]"""
@@ -568,6 +608,63 @@ class EditSidebar(QWidget):
         self._active = index
         for i, row in enumerate(self._rows):
             row.set_active(i == index)
+
+    # ------------------------------------------------------------ 已导出的片段
+    def set_exports(self, exports: list[dict]):
+        """已导出的片段文件列表（最新的在最上面）。"""
+        self._exports = [dict(e) for e in (exports or [])][::-1]
+        self.exp_list.clear()
+        for entry in self._exports:
+            path = str(entry.get("path") or "")
+            name = path.replace("\\", "/").rsplit("/", 1)[-1] or path
+            size = int(entry.get("size") or 0)
+            kind = str(entry.get("kind") or "")
+            item = QListWidgetItem(f"{name}　{human_size(size)}"
+                                   + (f"　{kind}" if kind else ""))
+            item.setData(Qt.UserRole, path)
+            item.setToolTip(f"{path}\n{human_size(size)}" + (f" · {kind}" if kind else ""))
+            item.setSizeHint(QSize(0, 18))
+            self.exp_list.addItem(item)
+        count = len(self._exports)
+        expanded = self.btn_exports.isChecked()
+        self.btn_exports.setText(f"{'▾ 收起' if expanded else '▸'}"
+                                 f"已导出的片段（{count}）")
+        self.lbl_exp_hint.setVisible(not count)
+        self.lbl_exp_hint.setText("还没有导出过片段")
+        if count and self.exp_list.currentRow() < 0:
+            self.exp_list.setCurrentRow(0)
+        self._sync_export_buttons()
+
+    def _toggle_exports(self, checked: bool):
+        self.export_box.setVisible(bool(checked))
+        count = len(self._exports)
+        self.btn_exports.setText(f"{'▾ 收起' if checked else '▸'}"
+                                 f"已导出的片段（{count}）")
+        self._apply_preview_height()
+
+    def current_export_path(self) -> str:
+        item = self.exp_list.currentItem()
+        return str(item.data(Qt.UserRole)) if item is not None else ""
+
+    def _sync_export_buttons(self):
+        has = bool(self.current_export_path())
+        self.btn_open_export.setEnabled(has)
+        self.btn_folder_export.setEnabled(has)
+
+    def _open_export_item(self, item):
+        path = str(item.data(Qt.UserRole) or "")
+        if path:
+            self.openExportRequested.emit(path)
+
+    def _open_selected_export(self):
+        path = self.current_export_path()
+        if path:
+            self.openExportRequested.emit(path)
+
+    def _folder_selected_export(self):
+        path = self.current_export_path()
+        if path:
+            self.folderExportRequested.emit(path)
 
     def _update_summary(self):
         count = len(self._segments)
@@ -618,6 +715,10 @@ class EditSidebar(QWidget):
             used += margins.top() + margins.bottom()
             used += lay.spacing() * (lay.count() - 1)
             room = total - used                      # 预留给 preview + 片段列表
+            # 「已导出的片段」展开时把它的高度也从预览里让出来
+            if getattr(self, "export_box", None) is not None \
+                    and self.export_box.isVisible():
+                room -= self.export_box.sizeHint().height() + 30
             avail_w = max(120, self.p_preview.width() - 14)
             natural = int(round(avail_w / self._aspect)) if self._aspect > 0 else 180
             # 先保证列表有 300px；只有当预览会被压到 100 以下时才退回 220

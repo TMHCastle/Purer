@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -37,7 +38,7 @@ from vff import ffmpeg  # noqa: E402
 from vff.config import APP_VERSION  # noqa: E402
 from vff.ffmpeg import Tools  # noqa: E402
 from vff.ui.main_window import MainWindow  # noqa: E402
-from vff.ui.style import OK, WARN  # noqa: E402
+from vff.ui.style import OK, TAB_GUIDE, WARN, apply_theme  # noqa: E402
 from vff.ui.widgets import LANE_H  # noqa: E402
 from vff.update import CheckResult  # noqa: E402
 
@@ -78,6 +79,7 @@ def main() -> int:
         print("ffmpeg not found")
         return 2
     app = QApplication([])
+    apply_theme(app)          # 真实运行一定会套主题：冒烟也要用同一套样式
     tmp = Path(tempfile.mkdtemp(prefix="purer_gui_"))
     try:
         clips = [tmp / f"c{i}.mp4" for i in range(3)]
@@ -95,6 +97,23 @@ def main() -> int:
                 win.combo_mode.setCurrentIndex(i)
                 break
         check("extract mode is step", win._extract_mode == "step", win._extract_mode)
+
+        # ---- 间隔默认「跟随视频帧率（1 秒 1 帧）」 ----
+        class _FakeInfo:
+            fps = 60.0
+
+        preset_values = [win.combo_step.itemData(i)
+                         for i in range(win.combo_step.count())]
+        check("step presets include common frame rates",
+              all(v in preset_values for v in (24, 25, 30, 50, 60, 120)),
+              str(preset_values))
+        check("auto step follows source fps",
+              win._step_auto and abs(win._step_for(_FakeInfo()) - 60.0) < 1e-6,
+              f"auto={win._step_auto} step={win._step_for(_FakeInfo())}")
+        # 后面的帧号 / 导出断言都按「每 24 帧」写，这里固定成 24
+        win.combo_step.set_value(24)
+        app.processEvents()
+        check("fixed step turns auto off", win._step_auto is False)
 
         # ---- A: 自绘标题栏 + 顶部卡片正中的「检查更新」药丸 ----
         check("window is frameless", bool(win.windowFlags() & Qt.FramelessWindowHint))
@@ -228,6 +247,42 @@ def main() -> int:
               and saved_cfg["skip_close_prompt"] is True, str(saved_cfg))
         settings_dlg.deleteLater()
         app.processEvents()
+
+        # ---- 设置改动即时落盘（用 Esc / 叉关掉也不丢） ----
+        auto_dlg = SettingsDialog(win, settings=win.app_settings,
+                                  store=win.cache_store)
+        auto_dlg.setAttribute(Qt.WA_DontShowOnScreen, True)
+        auto_dlg.show()
+        app.processEvents()
+        auto_dlg.radio_count.setChecked(True)
+        auto_dlg.spin_videos.setValue(5)
+        wait(app, lambda: win.app_settings.cache()["mode"] == "count"
+             and win.app_settings.cache()["max_videos"] == 5, 3.0)
+        check("settings autosave on change",
+              win.app_settings.cache()["mode"] == "count"
+              and win.app_settings.cache()["max_videos"] == 5,
+              str(win.app_settings.cache()))
+        disk_cfg = json.loads(
+            win.app_settings.path.read_text(encoding="utf-8"))["cache"]
+        check("settings autosave writes file",
+              disk_cfg["mode"] == "count" and disk_cfg["max_videos"] == 5,
+              str(disk_cfg))
+        auto_dlg.reject()                   # 用 Esc / 标题栏的叉关掉
+        app.processEvents()
+        after_cfg = json.loads(
+            win.app_settings.path.read_text(encoding="utf-8"))["cache"]
+        check("settings survive esc / close",
+              after_cfg["mode"] == "count" and after_cfg["max_videos"] == 5
+              and win.app_settings.cache()["mode"] == "count",
+              str(after_cfg))
+        auto_dlg.deleteLater()
+        app.processEvents()
+        # 还原成后面用例需要的策略
+        win.app_settings.update_cache(mode="usage", usage_minutes=7,
+                                      skip_close_prompt=True)
+        win.app_settings.save()
+        app.processEvents()
+
         check("cache store follows settings dir",
               win.cache_store.root == win.app_settings.effective_cache_dir(),
               f"{win.cache_store.root} vs "
@@ -236,14 +291,36 @@ def main() -> int:
         # ---- 1. 一次拖 3 个：必须串行 ----
         win.add_videos(clips)
         check("tabs==3", win.tabs.count() == 3, str(win.tabs.count()))
-        check("badge loading while extracting",
-              win.cache_badge.state_name() == "loading",
-              win.cache_badge.state_name())
         bar = win.tabs.tabBar()
         check("custom close button on every tab",
               bar.count() == 3 and all(
                   bar.tabButton(i, QTabBar.RightSide) is not None
                   for i in range(bar.count())))
+
+        # ---- 标签栏横条：上下浅灰引导线（状态色画在标签卡片上） ----
+        win._refresh_tab_states()
+        check("tab shows loading while extracting",
+              win.page_cache_state(win.tabs.widget(0)) == "loading"
+              and bar.state_of(0) == "loading",
+              f"{win.page_cache_state(win.tabs.widget(0))} / {bar.state_of(0)}")
+        app.processEvents()
+        shot = win.grab().toImage()
+
+        def _hex(x: int, y: int) -> str:
+            c = shot.pixelColor(x, y)
+            return "#%02X%02X%02X" % (c.red(), c.green(), c.blue())
+
+        tbar_top = bar.mapTo(win, bar.rect().topLeft()).y()
+        mid_x = bar.mapTo(win, bar.rect().center()).x()    # 标签栏中段（避开滚动按钮）
+        left_x = bar.mapTo(win, bar.rect().topLeft()).x() + 2
+        top_row = [_hex(left_x, tbar_top + 1), _hex(mid_x, tbar_top + 1)]
+        bottom_row = [_hex(left_x, tbar_top + bar.height() - 1),
+                      _hex(mid_x, tbar_top + bar.height() - 1)]
+        check("tab strip top guide line (full width)",
+              top_row == [TAB_GUIDE, TAB_GUIDE], str(top_row))
+        check("tab strip bottom guide line (full width)",
+              bottom_row == [TAB_GUIDE, TAB_GUIDE], str(bottom_row))
+
         last_dir = str(win.setting.value("paths/last_file_dir", ""))
         check("remembers last opened directory",
               Path(last_dir).resolve() == clips[0].parent.resolve(), last_dir)
@@ -260,37 +337,89 @@ def main() -> int:
         check("queue never exceeded 1", peak <= 1, f"peak={peak}")
         rows = [win.tabs.widget(i).model.rowCount() for i in range(win.tabs.count())]
         check("all pages extracted", rows == [5, 5, 5], str(rows))
+
+        def tab_fill(index: int):
+            """标签卡片里面（避开文字）的底色，用来判断「有没有按状态染色」。"""
+            rect = bar.tabRect(index)
+            img = bar.grab().toImage()
+            return img.pixelColor(rect.left() + 5, rect.bottom() - 7)
+
         win.tabs.setCurrentIndex(2)
         app.processEvents()
-        win._refresh_cache_badge()
-        check("badge ready (blue) after load",
-              win.cache_badge.state_name() == "ready",
-              win.cache_badge.state_name())
-        QTest.mouseClick(win.cache_badge, Qt.LeftButton)
+        win._refresh_tab_states()
+        page2 = win.tabs.widget(2)
+        check("tab state is ready (blue) after load",
+              win.page_cache_state(page2) == "ready" and bar.state_of(2) == "ready",
+              f"{win.page_cache_state(page2)} / {bar.state_of(2)}")
+        blue = tab_fill(2)
+        check("uncached tab is tinted blue",
+              blue.blue() - blue.red() >= 12,
+              f"rgb={blue.red(),blue.green(),blue.blue()}")
+        win._save_page_manually(page2)
         app.processEvents()
-        badge_page = win.tabs.widget(2)
-        check("badge click saves cache",
-              win.cache_badge.state_name() == "saved"
-              and win.cache_store.has(badge_page.cache_digest()),
-              win.cache_badge.state_name())
-        QTest.mouseClick(win.cache_badge, Qt.LeftButton)   # 绿色时点击不应重复
-        app.processEvents()
-        check("green badge click does nothing",
-              win.cache_badge.state_name() == "saved")
-        win.tabs.setCurrentIndex(0)
-        app.processEvents()
-        win._refresh_cache_badge()
-        check("badge switches with tab",
-              win.cache_badge.state_name() == "ready",
-              win.cache_badge.state_name())
+        win._refresh_tab_states()
+        check("manual save marks tab green",
+              win.page_cache_state(page2) == "saved"
+              and win.cache_store.has(page2.cache_digest()),
+              win.page_cache_state(page2))
+        green = tab_fill(2)
+        check("cached tab is tinted green",
+              green.green() - green.red() >= 10
+              and green.green() > blue.green(),
+              f"rgb={green.red(),green.green(),green.blue()} "
+              f"blue={blue.red(),blue.green(),blue.blue()}")
+        check("other tabs keep their own state",
+              win.page_cache_state(win.tabs.widget(0)) == "ready")
 
-        # 记忆上次设置：间隔（测完恢复 24，别影响后面新增的视频）
+        # 右键标签菜单：手动保存 / 关闭的入口还在（不真的弹出来）
+        menu_items = [a.text() for a in
+                      win._build_tab_menu(win.tabs.widget(0), 0).actions()]
+        check("tab context menu offers save/close",
+              "保存这一页的缓存" in menu_items and "关闭全部" in menu_items,
+              str(menu_items))
+
+        # 自动缓存策略下：渲染完就该自己变成「已缓存」（不用手动点）
+        win.app_settings.update_cache(mode="count", max_videos=20,
+                                      skip_close_prompt=True)
+        win.app_settings.save()
+        for _ in range(6):                 # 每次只存一页，多跑几拍
+            if not win._auto_save_pass():
+                break
+            app.processEvents()
+        win._refresh_tab_states()
+        check("auto cache marks tabs as cached",
+              all(win.page_cache_state(win.tabs.widget(i)) == "saved"
+                  for i in range(win.tabs.count())),
+              str([win.page_cache_state(win.tabs.widget(i))
+                   for i in range(win.tabs.count())]))
+        # 还原：后面「保存缓存 / 关闭前提示」用例需要「还没保存」的页面
+        win.cache_store.clear()
+        win.app_settings.update_cache(mode="never", skip_close_prompt=False)
+        win.app_settings.save()
+        app.processEvents()
+        win._refresh_tab_states()
+        check("clearing cache returns tabs to uncached",
+              all(win.page_cache_state(win.tabs.widget(i)) == "ready"
+                  for i in range(win.tabs.count())),
+              str([win.page_cache_state(win.tabs.widget(i))
+                   for i in range(win.tabs.count())]))
+
+        # 记忆上次设置：间隔（测完恢复「跟随视频帧率」）
         win.combo_step.set_value(12)
         app.processEvents()
         check("remembers extract step",
               abs(float(win.setting.value("ui/step", 0)) - 12.0) < 1e-6,
               str(win.setting.value("ui/step", 0)))
-        win.combo_step.set_value(24)
+        check("manual step turns auto off",
+              win._step_auto is False
+              and str(win.setting.value("ui/step_auto")).lower() == "false",
+              f"auto={win._step_auto} "
+              f"{win.setting.value('ui/step_auto')}")
+        win.combo_step.set_auto(True, notify=True)
+        app.processEvents()
+        check("auto step can be turned back on", win._step_auto is True)
+        win.combo_step.set_auto(True, notify=False)
+        win._step_auto = True              # 保持一致：之后新开的视频按它自己的帧率
         app.processEvents()
 
         # ---- 2. 区间导出（行 1..3） ----
@@ -549,6 +678,13 @@ def main() -> int:
             check("exact mode", "帧精确" in page.lbl_export.text(),
                   page.lbl_export.text()[:40])
             check("label ok", page.lbl_export.text().startswith("✅"), page.lbl_export.text()[:40])
+            check("export recorded in list",
+                  any(str(e.get("path")) == str(out) for e in page.exports),
+                  str(page.exports[:2]))
+            check("sidebar lists the exported file",
+                  page.side.exp_list.count() >= 1
+                  and str(page.side.exp_list.item(0).data(Qt.UserRole)) == str(out),
+                  f"{page.side.exp_list.count()} 条")
 
         # ---- D: 多片段列表 + 一次导出 ----
         page.set_in_point(24)
@@ -626,6 +762,55 @@ def main() -> int:
         restored = sorted((tmp / "restored").glob("f_*.jpg"))
         check("restored frame count", len(restored) == page.model.rowCount(),
               f"{len(restored)} vs {page.model.rowCount()}")
+
+        # ---- 2b2. 片段状态（片段 / 入点出点 / 导出记录）跟着缓存放，重开能恢复 ----
+        digest = page.cache_digest()
+        page.save_state()
+        state = win.cache_store.read_state(digest)
+        check("cache stores segment state",
+              len(state.get("segments") or []) == 3
+              and (state.get("range") or {}).get("in") is not None
+              and len(state.get("exports") or []) >= 4,
+              f"segments={len(state.get('segments') or [])} "
+              f"range={state.get('range')} "
+              f"exports={len(state.get('exports') or [])}")
+        counters = {"segments": len(page.segments),
+                    "in": page.in_frame, "exports": len(page.exports)}
+
+        import vff.ui.track_page as tp
+
+        reopened = []
+        original_init = tp.TrackPage.__init__
+
+        def _capture(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            reopened.append(self)
+
+        tp.TrackPage.__init__ = _capture
+        try:
+            win.close_tab(win.tabs.indexOf(page))
+            entry = win.cache_store.entry(digest)
+            ok_open = bool(entry) and win.open_cached_entry(entry)
+        finally:
+            tp.TrackPage.__init__ = original_init
+        new_page = reopened[0] if reopened else None
+        loaded = wait(app, lambda: new_page is not None
+                      and new_page.cache_ready(), 90)
+        check("reopened from cache", ok_open and loaded and new_page is not None,
+              f"ok={ok_open} loaded={loaded}")
+        if new_page is not None:
+            check("segments restored from cache",
+                  len(new_page.segments) == counters["segments"],
+                  f"{len(new_page.segments)} vs {counters['segments']}")
+            check("in point restored from cache",
+                  new_page.in_frame == counters["in"],
+                  f"{new_page.in_frame} vs {counters['in']}")
+            check("export list restored from cache",
+                  len(new_page.exports) >= counters["exports"],
+                  f"{len(new_page.exports)} vs {counters['exports']}")
+            check("sidebar export rows restored",
+                  new_page.side.exp_list.count() >= counters["exports"],
+                  str(new_page.side.exp_list.count()))
 
         # ---- 2c. 从缓存导入 / 设置里的条目列表 ----
         from vff.ui.cache_list import CacheEntryTable, CacheImportDialog
@@ -782,7 +967,7 @@ def main() -> int:
         subprocess.run([str(Tools.ffmpeg), "-hide_banner", "-loglevel", "error",
                         "-y", "-i", str(clips[0]), "-c", "copy", "-f", "mpegts",
                         str(ts_clip)], check=True)
-        win.add_videos([ts_clip])
+        win.add_video(ts_clip, step=24)     # 固定 24 帧：让起点落在关键帧之间（测「帧精确」）
         tpage = win.tabs.widget(win.tabs.count() - 1)
         tpage.quiet = True
         ok_extract = wait(app, lambda: tpage is not None and not tpage.busy

@@ -101,6 +101,9 @@ def run(app) -> int:
             if win.combo_mode.itemData(i) == "step":
                 win.combo_mode.setCurrentIndex(i)
                 break
+        # 间隔也固定成 24 帧：默认的「跟随视频帧率」会让张数随素材帧率变（30fps → 4 张），
+        # 这里的数字断言要可复现
+        win.combo_step.set_value(24)
         win.setAttribute(Qt.WA_DontShowOnScreen, True)
         win.resize(1280, 800)
         win.show()

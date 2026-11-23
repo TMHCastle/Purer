@@ -12,7 +12,7 @@ from pathlib import Path
 APP_NAME = "Purer"
 APP_TAGLINE = "视频抽帧浏览 / 帧精确切片"
 APP_ID = "Purer"
-APP_VERSION = "1.1.9"
+APP_VERSION = "1.1.10"
 # 「检查更新」查的是这里（公开仓库，只读 API，不需要 token）
 GITHUB_REPO = "TMHCastle/Purer"
 
@@ -52,10 +52,29 @@ def preset_label(value: float) -> str:
 
 
 # 抽帧间隔预设：常用整数 + 常见帧率下「约 1 秒」的帧数（含不便输入的小数）
-STEP_PRESETS = [1, 2, 4, 6, 8, 12, 24, 30, 48, 96]
+STEP_PRESETS = [1, 2, 3, 4, 6, 8, 12, 24, 25, 30, 50, 60, 120]
 STEP_PRESETS_FRACTIONAL = [23.98, 29.97, 59.94]
 STEP_MIN = 1.0
 STEP_MAX = 3000.0
+
+
+def snap_step(fps: float | None) -> float:
+    """「一秒一帧」的间隔 = 源视频帧率（能对上常见帧率就用常见值）。
+
+    23.976 → 23.98（预设里的写法）、24/25/30/50/60/120 原样、
+    其他帧率取整（例如 14.99 → 15）；拿不到帧率就退回 DEFAULT_STEP。
+    """
+    try:
+        value = float(fps or 0.0)
+    except (TypeError, ValueError):
+        return float(DEFAULT_STEP)
+    if value <= 0:
+        return float(DEFAULT_STEP)
+    for preset in STEP_PRESETS_FRACTIONAL:
+        if abs(value - float(preset)) < 0.01:
+            return float(preset)
+    return float(max(STEP_MIN, min(STEP_MAX, round(value))))
+
 
 # 抽取尺寸 = 磁盘上缩略图的长边；一旦定下就不随显示尺寸变化（换皮肤不重抽）
 EXTRACT_LONG_SIDE = 480

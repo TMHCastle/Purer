@@ -142,6 +142,26 @@ class TestSettings(_TempEnv):
 
 
 # --------------------------------------------------------------------------- #
+class TestStepPresets(unittest.TestCase):
+    def test_common_frame_rate_presets(self):
+        from vff.config import STEP_PRESETS, STEP_PRESETS_FRACTIONAL
+        for rate in (24, 25, 30, 50, 60, 120):
+            self.assertIn(rate, STEP_PRESETS)
+        self.assertIn(23.98, STEP_PRESETS_FRACTIONAL)
+
+    def test_snap_step_follows_source_fps(self):
+        from vff.config import DEFAULT_STEP, snap_step
+        self.assertAlmostEqual(snap_step(24.0), 24.0)
+        self.assertAlmostEqual(snap_step(25.0), 25.0)
+        self.assertAlmostEqual(snap_step(60.0), 60.0)
+        self.assertAlmostEqual(snap_step(23.976), 23.98)
+        self.assertAlmostEqual(snap_step(29.97), 29.97)
+        self.assertAlmostEqual(snap_step(59.94), 59.94)
+        self.assertAlmostEqual(snap_step(14.99), 15.0)
+        self.assertAlmostEqual(snap_step(0), float(DEFAULT_STEP))
+        self.assertAlmostEqual(snap_step(None), float(DEFAULT_STEP))
+
+
 class TestExportNames(unittest.TestCase):
     def test_series_label(self):
         self.assertEqual(series_label(0), "Cut - 1")
@@ -204,6 +224,37 @@ class TestCacheStore(_TempEnv):
         settings = Settings(self.tmp / "settings.json")
         settings.update_cache(mode=CACHE_MODE_NEVER)
         return CacheStore(self.tmp / "cache", settings)
+
+    def test_segment_state_roundtrip(self):
+        """片段 / 入点出点 / 导出记录跟着缓存条目走。"""
+        store = self.store()
+        src = self.make_cache()
+        digest = "fedcba9876543210"
+        payload = {"version": 1,
+                   "segments": [{"t_in": 1.0, "t_end": 2.5, "name": "开场"}],
+                   "range": {"in": 30, "out": 75},
+                   "exports": [{"path": "D:/out/a.mp4", "at": 1.0,
+                                "size": 123, "kind": "帧精确"}]}
+        (src / "segments.json").write_text(
+            json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        ok, why = store.save_dir(digest, src, self.meta())
+        self.assertTrue(ok, why)
+        self.assertIn("segments.json",
+                      [p.name for p in store.dir_for(digest).iterdir()])
+        state = store.read_state(digest)
+        self.assertEqual(state["segments"][0]["name"], "开场")
+        self.assertEqual(state["range"], {"in": 30, "out": 75})
+        self.assertEqual(len(state["exports"]), 1)
+        # 再写一次（用户改了片段列表）
+        store.write_state(digest, {"segments": [], "range": {}, "exports": []})
+        self.assertEqual(store.read_state(digest)["segments"], [])
+        self.assertEqual(store.entry(digest)["segments"], 0)
+        # 恢复出来的目录里也带着状态文件
+        dest = self.tmp / "restored_state"
+        self.assertTrue(store.materialize(digest, dest))
+        self.assertTrue((dest / "segments.json").is_file())
+        # 条目不存在时不许瞎写
+        self.assertFalse(store.write_state("0000000000000000", payload))
 
     def test_save_and_materialize(self):
         store = self.store()

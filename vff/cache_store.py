@@ -35,6 +35,7 @@ from .settings import CACHE_MODE_COUNT, Settings
 
 INDEX_NAME = "_index.json"
 INDEX_VERSION = 1
+STATE_NAME = "segments.json"     # 片段列表 / 入点出点 / 导出记录（跟着缓存一起存）
 _TMP_PREFIX = "."
 _DIGEST = re.compile(r"^[0-9a-f]{16}$")
 
@@ -244,7 +245,7 @@ class CacheStore:
             for item in frames:
                 _share_or_copy(item, tmp / item.name)
                 total += item.stat().st_size
-            for extra in ("scene.json", ".done"):
+            for extra in ("scene.json", STATE_NAME, ".done"):
                 item = src / extra
                 if item.is_file():
                     _share_or_copy(item, tmp / extra)
@@ -280,7 +281,10 @@ class CacheStore:
             "last_used_at": now,
             "hits": int((old or {}).get("hits") or 0),
             "first_saved_at": (old or {}).get("first_saved_at") or now,
+            "segments": int((old or {}).get("segments") or 0),
         }
+        if (old or {}).get("state_at"):
+            entry["state_at"] = old["state_at"]
         self._data["entries"][digest] = entry
         self._save_index()
         self.prune()
@@ -299,14 +303,16 @@ class CacheStore:
             for stale in dest.glob("f_*.jpg"):
                 stale.unlink(missing_ok=True)
             (dest / "scene.json").unlink(missing_ok=True)
+            (dest / STATE_NAME).unlink(missing_ok=True)
             frames = sorted(p for p in src.glob("f_*.jpg") if p.is_file())
             if not frames:
                 return False
             for item in frames:
                 _share_or_copy(item, dest / item.name)
-            scene = src / "scene.json"
-            if scene.is_file():
-                _share_or_copy(scene, dest / "scene.json")
+            for extra in ("scene.json", STATE_NAME):
+                item = src / extra
+                if item.is_file():
+                    _share_or_copy(item, dest / extra)
             _share_or_copy(src / ".done", dest / ".done")
         except OSError:
             return False
@@ -314,6 +320,50 @@ class CacheStore:
         if isinstance(entry, dict):
             entry["last_used_at"] = time.time()
             entry["hits"] = int(entry.get("hits") or 0) + 1
+            self._save_index()
+        return True
+
+    # ------------------------------------------------------------ 片段状态
+    def read_state(self, digest: str) -> dict:
+        """读某个缓存条目里的「片段列表 / 入点出点 / 导出记录」。"""
+        if not _DIGEST.match(str(digest or "")):
+            return {}
+        path = self.root / str(digest) / STATE_NAME
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def write_state(self, digest: str, payload: dict) -> bool:
+        """把片段状态写进已有条目的目录（原子写；条目不在就返回 False）。"""
+        digest = str(digest or "")
+        if not _DIGEST.match(digest):
+            return False
+        folder = self.root / digest
+        if not (folder / ".done").is_file():
+            return False
+        payload = dict(payload or {})
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(prefix=".state-", suffix=".json",
+                                       dir=str(folder))
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(payload, handle, ensure_ascii=False, indent=1)
+                os.replace(tmp, folder / STATE_NAME)
+            except OSError:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+        except OSError:
+            return False
+        entry = self._data["entries"].get(digest)
+        if isinstance(entry, dict):
+            entry["state_at"] = time.time()
+            entry["segments"] = len(payload.get("segments") or [])
             self._save_index()
         return True
 

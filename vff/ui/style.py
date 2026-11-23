@@ -25,6 +25,11 @@ WARN = "#E5B65C"
 DANGER = "#E56B72"
 BORDER = "#343A46"
 WALL_BG = "#12151A"     # 关键帧区底色（比主背景更深，突出缩略图）
+TAB_GUIDE = "#3E4553"   # 标签栏横条上下的浅灰引导线（也用来盖掉系统画的白线）
+TAB_RADIUS = 9          # 标签卡片圆角
+TAB_MARGIN_TOP = 3      # 标签卡片与标签栏上沿的距离（下面两条同理）
+TAB_MARGIN_BOTTOM = 3
+TAB_MARGIN_RIGHT = 6
 
 MONO = '"Cascadia Mono","JetBrains Mono","Consolas","Courier New",monospace'
 UI_FONT = '"Microsoft YaHei UI","Segoe UI",sans-serif'
@@ -353,23 +358,25 @@ QComboBox QAbstractItemView {{
 
 /* ------------------------------------------------------------ 标签栏 */
 QTabWidget::pane {{ border:none; background:transparent; }}
-QTabBar {{ background:transparent; }}
+/* 横条有上下两条浅灰引导线（由 TabStrip.paintEvent 画满整条；
+   上界那条顺带盖掉 Fusion 默认画的白色基准线：
+   main_window 把标签栏自己的 QPalette.Light 换成了 TAB_GUIDE） */
+QTabBar {{
+    background:transparent;
+}}
+/* 标签卡片（底色 / 边框）由 StateTabBar 自绘 —— 这样每个标签才能按
+   「缓存状态」上色；这里只保留几何（内边距 / 圆角 / 间距）和文字颜色。 */
 QTabBar::tab {{
-    background:#1B1F27; color:{DIM};
-    border:1px solid #252A33;
-    border-radius:9px;
+    background:transparent;
+    border:none;
+    color:{DIM};
     padding:6px 12px;
-    margin:3px 6px 3px 0;
+    margin:{TAB_MARGIN_TOP}px {TAB_MARGIN_RIGHT}px {TAB_MARGIN_BOTTOM}px 0;
     min-height:22px;
 }}
-QTabBar::tab:hover:!selected {{
-    background:#252A33; color:#D5DAE3; border-color:#343A46;
-}}
-QTabBar::tab:selected {{
-    background:#2D3442; color:#FFFFFF; border-color:#4A5570;
-}}
-QTabBar::tab:selected:hover {{ background:#333B4C; }}
-QTabBar::tab:disabled {{ color:#5B6270; border-color:#222730; }}
+QTabBar::tab:hover:!selected {{ color:#D5DAE3; }}
+QTabBar::tab:selected {{ color:#FFFFFF; }}
+QTabBar::tab:disabled {{ color:#5B6270; }}
 QTabBar QToolButton {{
     background:#1B1F27; border:1px solid #252A33; border-radius:7px;
     margin:3px 2px; min-width:22px; max-width:22px;
@@ -405,6 +412,14 @@ QHeaderView::section {{
     border-bottom:1px solid #2C3240; padding:5px 8px; font-size:8.6pt;
 }}
 QTableCornerButton::section {{ background:#1B1F27; border:none; }}
+
+/* ------------------------------------------------------------ 已导出的片段 */
+QListWidget#exportList {{
+    background:#14171C; border:1px solid #262B35; border-radius:6px;
+    outline:none; padding:2px;
+}}
+QListWidget#exportList::item {{ padding:3px 6px; border-radius:4px; }}
+QListWidget#exportList::item:selected {{ background:#2C3448; color:#FFFFFF; }}
 
 /* ------------------------------------------------------------ 片段列表 */
 QScrollArea#segScroll {{ background:transparent; border:none; }}

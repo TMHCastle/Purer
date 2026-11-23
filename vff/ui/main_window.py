@@ -7,13 +7,14 @@ import os
 import shutil
 from pathlib import Path
 
-from PySide6.QtCore import (QByteArray, QEvent, QProcess, QSettings, QSize, Qt,
-                            QTimer, QUrl)
-from PySide6.QtGui import QDesktopServices, QKeySequence, QShortcut
+from PySide6.QtCore import (QByteArray, QEvent, QProcess, QSettings, QSize,
+                            Qt, QTimer, QUrl)
+from PySide6.QtGui import (QColor, QDesktopServices, QKeySequence, QPainter,
+                           QPalette, QPen, QShortcut)
 from PySide6.QtWidgets import (QApplication, QDialog, QFileDialog, QFrame, QHBoxLayout,
-                               QLabel, QMessageBox, QProgressDialog, QPushButton,
-                               QSizePolicy, QStackedWidget, QTabBar, QTabWidget,
-                               QVBoxLayout, QWidget)
+                               QLabel, QMenu, QMessageBox, QProgressDialog,
+                               QPushButton, QSizePolicy, QStackedWidget, QTabBar,
+                               QTabWidget, QVBoxLayout, QWidget)
 
 from ..cache import cache_root
 from ..cache_store import CacheStore
@@ -22,7 +23,7 @@ from ..config import (APP_NAME, APP_VERSION, DEFAULT_DISPLAY_SIDE, DEFAULT_STEP,
                       EXTRACT_LONG_SIDE, JOBS_MAX_CONCURRENT, MAX_THUMBS_WARN,
                       STEP_MAX, STEP_MIN, STEP_PRESETS, STEP_PRESETS_FRACTIONAL,
                       VIDEO_EXTS, data_dir, extract_mode_items,
-                      parse_extract_mode, preset_label)
+                      parse_extract_mode, preset_label, snap_step)
 from ..download import UpdateDownloader
 from ..ffmpeg import probe
 from ..jobs import JobQueue
@@ -35,11 +36,11 @@ from ..update import RELEASES_PAGE, ReleaseChecker
 from ..util import fmt_tc
 from ..version import normalize
 from ..log import debug, debug_enabled
-from .cache_badge import CacheBadge
 from .cache_list import CacheImportDialog, sorted_entries
 from .frameless import FramelessWindow
 from .settings_dialog import CloseCacheDialog, SettingsDialog
-from .style import icon_win_close, make_icon
+from .style import BG, TAB_GUIDE, icon_win_close, make_icon
+from .tabs import StateTabBar
 from .titlebar import TitleBar
 from .track_page import TrackPage
 from .update_badge import UpdateBadge
@@ -105,6 +106,58 @@ class TabCloseButton(QPushButton):
         super().leaveEvent(event)
 
 
+class StripGuides(QWidget):
+    """浮在标签栏上的一层薄片：只画上下两条浅灰引导线。
+
+    为什么不用 QTabWidget.paintEvent：QTabBar 是子控件，会在父控件之后绘制，
+    它自己那块底色+基准线会把父控件画的线盖掉（左边红绿灯那块又盖不到，
+    于是变成「左边有线、标签上没线」）。放在最上层、且对鼠标透明，才稳定。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.setFocusPolicy(Qt.NoFocus)
+
+    def paintEvent(self, _event):             # noqa: N802
+        p = QPainter(self)
+        p.setPen(QPen(QColor(TAB_GUIDE), 1))
+        p.drawLine(0, 1, self.width() - 1, 1)                 # 上界
+        p.drawLine(0, self.height() - 1, self.width() - 1, self.height() - 1)
+        p.end()
+
+
+class TabStrip(QTabWidget):
+    """标签栏横条：上下浅灰引导线 + 每个标签按缓存状态上色。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setTabBar(StateTabBar(self))       # 必须在添加标签之前装
+        self.guides = StripGuides(self)
+        self.guides.raise_()
+        self.tabBar().installEventFilter(self)
+        self._sync_guides()
+
+    def _sync_guides(self):
+        bar = self.tabBar()
+        if bar is None:
+            return
+        self.guides.setGeometry(0, bar.geometry().top(),
+                                self.width(), max(1, bar.height()))
+        self.guides.raise_()
+
+    def resizeEvent(self, event):             # noqa: N802
+        super().resizeEvent(event)
+        self._sync_guides()
+
+    def eventFilter(self, obj, event):        # noqa: N802
+        if obj is self.tabBar() and event.type() in (QEvent.Resize, QEvent.Show,
+                                                    QEvent.Move):
+            self._sync_guides()
+        return super().eventFilter(obj, event)
+
+
 class MainWindow(FramelessWindow):
     def __init__(self):
         super().__init__()
@@ -161,19 +214,27 @@ class MainWindow(FramelessWindow):
 
         self.stack = QStackedWidget()
         self.empty = EmptyState()
-        self.tabs = QTabWidget()
+        self.tabs = TabStrip()
         self.tabs.setTabsClosable(False)   # 关自己画的按钮，见 _install_tab_close
         self.tabs.setMovable(True)
         self.tabs.setDocumentMode(True)
         self.tabs.setElideMode(Qt.ElideRight)
         self.tabs.setUsesScrollButtons(True)
-        self.tabs.tabBar().setExpanding(False)
+        tab_bar = self.tabs.tabBar()
+        tab_bar.setExpanding(False)
+        tab_bar.set_state_provider(self._tab_cache_state)
+        tab_bar.setContextMenuPolicy(Qt.CustomContextMenu)
+        tab_bar.customContextMenuRequested.connect(self._tab_menu)
         self.tabs.tabCloseRequested.connect(self.close_tab)
         self.tabs.currentChanged.connect(self._on_tab_changed)
-        # 标签页左侧的缓存红绿灯（加载中 / 未缓存 / 已缓存）
-        self.cache_badge = CacheBadge(self.tabs)
-        self.cache_badge.clicked.connect(self._on_cache_badge_clicked)
-        self.tabs.setCornerWidget(self.cache_badge, Qt.TopLeftCorner)
+        # 标签栏横条：上下两条浅灰引导线由 StripGuides 画。Fusion 还会在
+        # 「第一个标签上沿」自己画一条基准线，用的是 QPalette.Light（深色调色板
+        # 没设过 → 默认纯白，就是原来那条刺眼的白线）—— 换成背景色让它消失。
+        bar_palette = tab_bar.palette()
+        bar_palette.setColor(QPalette.Light, QColor(BG))
+        bar_palette.setColor(QPalette.Midlight, QColor(BG))
+        tab_bar.setPalette(bar_palette)
+        self._tab_states: list[str] = []
         self.stack.addWidget(self.empty)
         self.stack.addWidget(self.tabs)
         lay.addWidget(self.stack, 1)
@@ -181,7 +242,7 @@ class MainWindow(FramelessWindow):
         self._refresh_stack()
         self._setup_updater()
         self._setup_usage_timer()
-        self._setup_badge_timer()
+        self._setup_state_timer()
         self._refresh_titles()
         self.titlebar.sync_max_button()
         QShortcut(QKeySequence("Ctrl+O"), self, activated=self.open_files)
@@ -228,12 +289,18 @@ class MainWindow(FramelessWindow):
             saved_step = DEFAULT_STEP
         self.combo_step.set_value(max(STEP_MIN, min(STEP_MAX, saved_step)),
                                   notify=False)
+        saved_auto = self.setting.value("ui/step_auto", True)
+        self._step_auto = str(saved_auto).lower() not in ("false", "0", "no")
+        if self._step_auto:
+            self.combo_step.set_auto(True, notify=False)
         self.combo_step.setFixedWidth(104)
         self.combo_step.setToolTip(
             "每隔多少帧取一张（可直接输入，支持 23.98 这种小数）\n"
-            "23.98 / 29.97 / 59.94 = 常见帧率下「约 1 秒」的帧数\n"
-            "选「按镜头」时这一项会变灰（改用场景检测）")
+            "· 默认「跟随视频帧率」= 每 1 秒取 1 张（24fps 取 24、60fps 取 60）\n"
+            "· 23.98 / 29.97 / 59.94 = 常见帧率下「约 1 秒」的帧数\n"
+            "· 选「按镜头」时这一项会变灰（改用场景检测）")
         self.combo_step.valueChanged.connect(self._on_step_changed)
+        self.combo_step.autoPicked.connect(self._on_step_auto_picked)
         bar.addWidget(self.combo_step)
 
         bar.addSpacing(4)
@@ -484,50 +551,125 @@ class MainWindow(FramelessWindow):
             self.titlebar.sync_max_button()
         super().changeEvent(event)
 
-    # ------------------------------------------------------------ 缓存红绿灯
-    def _setup_badge_timer(self):
-        self._badge_timer = QTimer(self)
-        self._badge_timer.setInterval(700)
-        self._badge_timer.timeout.connect(self._refresh_cache_badge)
-        self._badge_timer.start()
+    # ------------------------------------------------------------ 标签缓存状态
+    def _setup_state_timer(self):
+        """每 0.9s 刷新一次各标签的缓存状态色（并每 4 拍做一次自动保存）。"""
+        self._state_timer = QTimer(self)
+        self._state_timer.setInterval(900)
+        self._state_timer.timeout.connect(self._on_state_tick)
+        self._state_timer.start()
+        self._state_ticks = 0
 
-    def _refresh_cache_badge(self):
-        badge = getattr(self, "cache_badge", None)
-        if badge is None:
-            return
-        page = self.tabs.currentWidget()
+    def _on_state_tick(self):
+        self._refresh_tab_states()
+        self._state_ticks += 1
+        if self._state_ticks % 4 == 0:        # ≈ 3.6 秒一次，够快也不一直写盘
+            self._auto_save_pass()
+
+    def page_cache_state(self, page) -> str:
+        """一个页面现在的缓存状态：loading / ready / saved / none。"""
         if not isinstance(page, TrackPage):
-            badge.set_state("none")
-            return
+            return "none"
         if page.busy or not page._finished:
-            badge.set_state("loading", "正在抽帧 / 加载缓存…\n完成后如果还没保存，图标会变成蓝色")
-            return
-        if page.cache_ready():
-            if self.cache_store.has(page.cache_digest()):
-                badge.set_state("saved")
-            else:
-                badge.set_state(
-                    "ready",
-                    "图墙已加载，但还没保存缓存\n点这里保存到：\n"
-                    f"{self.cache_store.root}")
-        else:
-            badge.set_state("none", "没有可保存的缓存（抽帧失败或已取消）")
+            return "loading"
+        if not page.cache_ready():
+            return "none"
+        try:
+            return ("saved" if self.cache_store.has(page.cache_digest())
+                    else "ready")
+        except Exception:                      # noqa: BLE001
+            return "ready"
 
-    def _on_cache_badge_clicked(self):
-        page = self.tabs.currentWidget()
-        if not isinstance(page, TrackPage):
-            return
-        if self.cache_badge.state_name() != "ready":
-            return
+    def _tab_cache_state(self, index: int) -> str:
+        return self.page_cache_state(self.tabs.widget(index))
+
+    def _refresh_tab_states(self):
+        count = self.tabs.count()
+        states = [self._tab_cache_state(i) for i in range(count)]
+        if states != self._tab_states:
+            self._tab_states = states
+            bar = self.tabs.tabBar()
+            for i, state in enumerate(states):
+                page = self.tabs.widget(i)
+                tip = {"loading": "正在抽帧 / 加载缓存…",
+                       "ready": "图墙已加载，还没保存进缓存（右键标签可以保存）",
+                       "saved": "已缓存（下次打开直接加载）",
+                       "none": "没有可保存的缓存"}.get(state, "")
+                path = getattr(page, "path", "")
+                self.tabs.setTabToolTip(i, f"{path}\n{tip}" if tip else str(path))
+            bar.refresh_states()
+
+    def _auto_save_pass(self) -> int:
+        """按自动保存策略把「已完成但还没进库」的页面悄悄存掉（标签会转绿）。"""
+        cfg = self.app_settings.cache()
+        mode = cfg.get("mode")
+        if mode == CACHE_MODE_NEVER:
+            return 0
+        if self.jobs.running_count:
+            return 0                       # 还在抽帧/导出，别抢磁盘，下一拍再说
+        for page in list(self._pages):
+            if not isinstance(page, TrackPage) or not page.cache_ready():
+                continue
+            try:
+                if self.cache_store.has(page.cache_digest()):
+                    continue
+            except Exception:                  # noqa: BLE001
+                continue
+            if mode == CACHE_MODE_USAGE:
+                usage = self.cache_store.usage(page.path)
+                usage["used_seconds"] = (float(usage.get("used_seconds") or 0)
+                                         + page.used_seconds)
+                usage["exports"] = (int(usage.get("exports") or 0)
+                                    + page.export_count)
+                if not usage_meets(cfg, usage):
+                    continue
+            # 一次只存一页：大缓存（几千张图）复制/链接要时间，别让界面卡住
+            return 1 if self._save_page_cache(page) else 0
+        return 0
+
+    def _save_page_manually(self, page) -> None:
         self._flush_usage(page)
-        if self._save_page_cache(page):
-            self.lbl_status.setText("✅ 已保存这一页的缓存")
-        else:
+        if not self._save_page_cache(page):
             QMessageBox.warning(
                 self, "保存缓存",
                 "缓存没能保存（目录不可写 / 磁盘空间不足？）。\n"
                 f"目录：{self.cache_store.root}")
-        self._refresh_cache_badge()
+        self._refresh_tab_states()
+
+    def _tab_menu(self, pos):
+        bar = self.tabs.tabBar()
+        index = bar.tabAt(pos)
+        if index < 0:
+            return
+        page = self.tabs.widget(index)
+        if not isinstance(page, TrackPage):
+            return
+        menu = self._build_tab_menu(page, index)
+        menu.exec(bar.mapToGlobal(pos))
+
+    def _build_tab_menu(self, page, index: int) -> QMenu:
+        """标签右键菜单（单独建好再 exec，方便测试直接看条目）。"""
+        menu = QMenu(self)
+        state = self.page_cache_state(page)
+        act_save = menu.addAction("保存这一页的缓存")
+        act_save.setEnabled(state == "ready")
+        act_save.triggered.connect(lambda: self._save_page_manually(page))
+        act_reload = menu.addAction("重新抽帧 / 重新加载")
+        act_reload.triggered.connect(lambda: self._on_reload(page))
+        menu.addSeparator()
+        act_close = menu.addAction("关闭这一页")
+        act_close.triggered.connect(lambda: self._close_page(page))
+        act_others = menu.addAction("关闭其他")
+        act_others.triggered.connect(lambda: self._close_others(index))
+        menu.addSeparator()
+        act_all = menu.addAction("关闭全部")
+        act_all.triggered.connect(self.clear_all)
+        return menu
+
+    def _close_others(self, keep_index: int):
+        for index in range(self.tabs.count() - 1, -1, -1):
+            if index != keep_index:
+                self.close_tab(index)
 
     # ------------------------------------------------------------ 设置 / 缓存
     def open_settings(self):
@@ -539,7 +681,7 @@ class MainWindow(FramelessWindow):
         dialog.exec()
         self.cache_store.reload()
         self.cache_store.prune()
-        self._refresh_cache_badge()
+        self._refresh_tab_states()
 
     def _setup_usage_timer(self):
         """给「自动保存用得多 / 导出过」的策略攒数据：只记当前页签。"""
@@ -658,6 +800,12 @@ class MainWindow(FramelessWindow):
     def _step(self) -> float:
         return float(self.combo_step.value())
 
+    def _step_for(self, info) -> float:
+        """新页面用多大的间隔：默认 = 源视频帧率（1 秒 1 帧）。"""
+        if getattr(self, "_step_auto", True):
+            return snap_step(getattr(info, "fps", 0.0))
+        return self._step()
+
     def _thumb_size_for(self, info):
         """抽取尺寸：磁盘上的缩略图长边（固定，不随显示尺寸变化）。"""
         return thumb_size_for(info.width, info.height, EXTRACT_LONG_SIDE)
@@ -679,10 +827,22 @@ class MainWindow(FramelessWindow):
             self.titlebar.set_subtitle(self._subtitle(self._step()))
 
     def _on_step_changed(self, v):
+        """手动选了数字 → 固定间隔，不再跟随视频帧率。"""
+        self._step_auto = False
         try:
+            self.setting.setValue("ui/step_auto", False)
             self.setting.setValue("ui/step", float(v))
         except (TypeError, ValueError):
             pass
+        self._refresh_titles()
+
+    def _on_step_auto_picked(self):
+        """选了「跟随视频帧率」→ 之后新开的视频都按它自己的帧率抽。"""
+        self._step_auto = True
+        self.setting.setValue("ui/step_auto", True)
+        page = self.tabs.currentWidget()
+        if isinstance(page, TrackPage):
+            self.combo_step.set_value(page.step, notify=False)
         self._refresh_titles()
 
     # ------------------------------------------------------------ 抽帧方式
@@ -774,7 +934,7 @@ class MainWindow(FramelessWindow):
         self.setting.setValue("ui/sidebar_width", width)
 
     def _refresh_status(self, *_args):
-        self._refresh_cache_badge()
+        self._refresh_tab_states()
         running = self.jobs.running_count
         pending = self.jobs.pending_count
         if not running and not pending:
@@ -927,7 +1087,7 @@ class MainWindow(FramelessWindow):
                          store=self.cache_store)
         if not self._insert_page(page):
             return False
-        self._refresh_cache_badge()
+        self._refresh_tab_states()
         return True
 
     def add_videos(self, paths):
@@ -968,13 +1128,18 @@ class MainWindow(FramelessWindow):
             msg += f"，跳过 {skipped} 个（已在标签页中）"
         self.lbl_status.setText(msg)
 
-    def add_video(self, path: Path, index: int | None = None) -> bool:
+    def add_video(self, path: Path, index: int | None = None,
+                  step: float | None = None) -> bool:
         try:
             info = probe(path)
         except Exception as e:  # noqa: BLE001
             self.lbl_status.setText(f"⚠ {path.name}：{e}")
             return False
-        step = self._step()
+        if step is None:
+            step = self._step_for(info)
+            if self._step_auto:
+                # 顶部的间隔跟着这个视频的帧率走（用户能直接看到「25 帧」）
+                self.combo_step.set_value(step, notify=False)
         tw, th = self._thumb_size_for(info)
         threshold = self._scene_threshold_or_none()
         if threshold is None:
@@ -1014,7 +1179,7 @@ class MainWindow(FramelessWindow):
         page.start()
         self._refresh_stack()
         self._refresh_status()
-        self._refresh_cache_badge()
+        self._refresh_tab_states()
         return True
 
     def _install_tab_close(self, index: int, page: TrackPage):
@@ -1047,8 +1212,9 @@ class MainWindow(FramelessWindow):
         if idx < 0:
             return
         path = page.path
+        step = page.step
         self.close_tab(idx)
-        self.add_video(path, index=idx)
+        self.add_video(path, index=idx, step=step)
         self.tabs.setCurrentIndex(min(idx, self.tabs.count() - 1))
 
     def close_tab(self, index, keep_count=False):
@@ -1085,7 +1251,9 @@ class MainWindow(FramelessWindow):
                     pass
         if isinstance(cur, TrackPage):
             self._sync_size_combo(cur.display_side)
-        self._refresh_cache_badge()
+            if self._step_auto:
+                self.combo_step.set_value(cur.step, notify=False)
+        self._refresh_tab_states()
 
     def _refresh_stack(self):
         self.stack.setCurrentWidget(self.tabs if self.tabs.count() else self.empty)

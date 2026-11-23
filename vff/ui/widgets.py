@@ -54,22 +54,32 @@ class ArrowCombo(QComboBox):
 class StepCombo(ArrowCombo):
     """抽帧间隔下拉框：常用预设 + 手输（支持 23.98 这种小数）。
 
+    第一项是 **跟随视频帧率（1 秒 1 帧）** —— 默认就是它：每打开一个视频，
+    间隔自动取该视频的帧率（23.976 的片子就是 23.98，60fps 就是 60），
+    真正「一秒一提取」；手动选了某个数字才固定成那个值。
+
     小数间隔不是「每 N 帧」的整数取模，抽取时改走 `fps=源fps/step`（按时间均匀取），
     所以 23.98 帧 = 23.98fps 视频的「1 秒一张」。
     """
 
+    AUTO = "auto"
     valueChanged = Signal(float)
+    autoPicked = Signal()
 
     def __init__(self, presets, fractional=(), value=24.0, parent=None):
         super().__init__(parent)
         self.setEditable(True)
         self.setInsertPolicy(QComboBox.NoInsert)
         self.setLocale(QLocale.c())
-        self.setMaxVisibleItems(15)
+        self.setMaxVisibleItems(16)
         self._value = float(value)
+        self._auto = True
         line = self.lineEdit()
         line.setValidator(QDoubleValidator(1.0, 3000.0, 3, self))
         line.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.addItem("跟随视频帧率（1 秒 1 帧）", self.AUTO)
+        self.setItemData(0, "每打开一个视频，间隔 = 它的帧率（1 秒取 1 张）\n"
+                            "手动选下面的数字就固定成那个值", Qt.ToolTipRole)
         for v in presets:
             self.addItem(self._text(v), float(v))
         if fractional:
@@ -79,7 +89,7 @@ class StepCombo(ArrowCombo):
                 self.setItemData(self.count() - 1,
                                  f"{float(v):g} 帧 · 常见帧率下约 1 秒",
                                  Qt.ToolTipRole)
-        self.set_value(value, notify=False)
+        self.set_auto(True, notify=False)
         self.activated.connect(self._on_activated)
         line.editingFinished.connect(self._on_edited)
 
@@ -87,23 +97,40 @@ class StepCombo(ArrowCombo):
     def value(self) -> float:
         return self._value
 
+    def is_auto(self) -> bool:
+        return self._auto
+
+    def set_auto(self, auto: bool, notify: bool = False):
+        """切到/切回「跟随视频帧率」。切回去时用上一次的数字占个位显示。"""
+        auto = bool(auto)
+        changed = auto != self._auto
+        self._auto = auto
+        if auto:
+            self.setCurrentIndex(0)
+            if notify and changed:
+                self.autoPicked.emit()
+        elif not auto and self.currentIndex() <= 0:
+            self.set_value(self._value, notify=notify)
+
     def set_value(self, v, notify: bool = True):
         v = max(1.0, min(3000.0, float(v)))
         changed = abs(v - self._value) > 1e-9
+        was_auto = self._auto
         self._value = v
+        self._auto = False
         index = self._index_of(v)
         if index >= 0:
             self.setCurrentIndex(index)
         else:
             self.setCurrentIndex(-1)
             self.lineEdit().setText(self._text(v))
-        if changed and notify:
+        if notify and (changed or was_auto):
             self.valueChanged.emit(v)
 
     def _index_of(self, v) -> int:
         for i in range(self.count()):
             data = self.itemData(i)
-            if data is not None and abs(float(data) - v) < 1e-6:
+            if isinstance(data, (int, float)) and abs(float(data) - v) < 1e-6:
                 return i
         return -1
 
@@ -114,7 +141,9 @@ class StepCombo(ArrowCombo):
     # ---------------- 交互 ----------------
     def _on_activated(self, index: int):
         data = self.itemData(index)
-        if data is not None:
+        if data == self.AUTO:
+            self.set_auto(True, notify=True)
+        elif isinstance(data, (int, float)):
             self.set_value(float(data))
 
     def _on_edited(self):
@@ -123,6 +152,7 @@ class StepCombo(ArrowCombo):
             value = float(text)
         except ValueError:
             value = self._value
+            self.set_auto(self._auto)
         self.set_value(value)
         self.lineEdit().setText(self._text(self._value))
 

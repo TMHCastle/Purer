@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import time
 from pathlib import Path
 
 from PySide6.QtCore import (QElapsedTimer, QItemSelectionModel, QPoint, QSize, Qt,
@@ -21,6 +22,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QFileDialog, QMe
 
 from .. import ffmpeg, scenedetect, smartcut
 from ..cache import cache_dir_for, cache_digest
+from ..cache_store import STATE_NAME
 from ..config import (DEFAULT_DISPLAY_SIDE, DISPLAY_MAX, DISPLAY_MIN, DISPLAY_STEP,
                       cache_root, preset_label)
 from ..export_names import existing_names, plan_filenames
@@ -80,6 +82,7 @@ class TrackPage(QWidget):
         self.in_frame: int | None = None
         self.out_frame: int | None = None
         self.segments: list[dict] = []
+        self.exports: list[dict] = []      # 已导出的片段文件（打开 / 打开文件夹用）
         self._batch: dict | None = None
         self.batch_job: Job | None = None
 
@@ -174,12 +177,13 @@ class TrackPage(QWidget):
         self.side.copyFrameRequested.connect(self._copy_img)
         self.side.playRequested.connect(self.toggle_playback)
         self.side.exportRequested.connect(self.export_segment)
-        self.side.revealRequested.connect(self._reveal_output)
         self.side.addSegmentRequested.connect(self.add_segment)
         self.side.clearSegmentsRequested.connect(self.clear_segments)
         self.side.removeSegmentRequested.connect(self.remove_segment)
         self.side.selectSegmentRequested.connect(self.select_segment)
         self.side.exportAllSegmentsRequested.connect(self.export_all_segments)
+        self.side.openExportRequested.connect(self.open_export)
+        self.side.folderExportRequested.connect(self.reveal_export)
 
         # 图墙 | 右侧面板 之间可拖拽（宽度由 MainWindow 记住）
         self.split = QSplitter(Qt.Horizontal)
@@ -203,7 +207,6 @@ class TrackPage(QWidget):
         self.lbl_export = self.side.lbl_status
         self.btn_export = self.side.btn_export
         self.btn_play = self.side.btn_play
-        self.btn_reveal = self.side.btn_reveal
         self.lbl_range = self.side.lbl_range
         self.seg_bar = self.side
 
@@ -493,6 +496,127 @@ class TrackPage(QWidget):
             "frames": int(self.info.frames or 0),
         }
 
+    # ------------------------------------------------- 片段状态（跟着缓存放）
+    def state_payload(self) -> dict:
+        """这一页的「片段列表 / 入点出点 / 导出记录」，会写进缓存目录。"""
+        return {
+            "version": 1,
+            "segments": [
+                {"t_in": round(float(s["t_in"]), 4),
+                 "t_end": round(float(s["t_end"]), 4),
+                 "name": str(s.get("name") or "")}
+                for s in self.segments],
+            "range": {"in": self.in_frame, "out": self.out_frame},
+            "exports": [dict(item) for item in self.exports[-200:]],
+            "updated_at": time.time(),
+        }
+
+    def save_state(self) -> bool:
+        """把片段状态写进临时缓存目录；持久库里有同一条缓存就一起更新。"""
+        if not self.out_dir:
+            return False
+        payload = self.state_payload()
+        try:
+            self.out_dir.mkdir(parents=True, exist_ok=True)
+            (self.out_dir / STATE_NAME).write_text(
+                json.dumps(payload, ensure_ascii=False, indent=1),
+                encoding="utf-8")
+        except OSError:
+            return False
+        if self.store is not None:
+            try:
+                self.store.write_state(self.cache_digest(), payload)
+            except Exception:      # noqa: BLE001  状态写失败不能影响导出
+                pass
+        return True
+
+    def _read_state(self, folder: Path | None = None) -> dict:
+        path = (folder or self.out_dir)
+        if path is None:
+            return {}
+        try:
+            data = json.loads((path / STATE_NAME).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def apply_state(self, payload: dict) -> bool:
+        """把读到的片段状态套回界面（片段列表 + 入点出点 + 导出记录）。"""
+        if not isinstance(payload, dict):
+            return False
+        fps = self._fps()
+        segments = []
+        for item in payload.get("segments") or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                t_in = float(item.get("t_in"))
+                t_end = float(item.get("t_end"))
+            except (TypeError, ValueError):
+                continue
+            if t_end <= t_in:
+                continue
+            segments.append({"t_in": t_in, "t_end": t_end,
+                             "name": str(item.get("name") or "")})
+        self.segments = segments
+        rng = payload.get("range") or {}
+        try:
+            in_frame = rng.get("in")
+            out_frame = rng.get("out")
+            limit = max(0, int(self.info.frames or 0) - 1)
+            if in_frame is not None:
+                self.in_frame = max(0, min(limit, int(in_frame)))
+            if out_frame is not None:
+                self.out_frame = max(0, min(limit, int(out_frame)))
+        except (TypeError, ValueError):
+            pass
+        exports = []
+        for item in payload.get("exports") or []:
+            if not isinstance(item, dict):
+                continue
+            target = str(item.get("path") or "")
+            if not target:
+                continue
+            exports.append({"path": target,
+                            "at": float(item.get("at") or 0),
+                            "size": int(item.get("size") or 0),
+                            "kind": str(item.get("kind") or "")})
+        self.exports = exports
+        self._refresh_segments()
+        self.side.set_exports(self.exports)
+        self._refresh_range()
+        return bool(segments or exports or rng)
+
+    def _record_export(self, out: Path, kind: str = ""):
+        """记一条「已导出的片段文件」，顺手把片段状态存进缓存。"""
+        try:
+            size = out.stat().st_size
+        except OSError:
+            size = 0
+        entry = {"path": str(out), "at": time.time(), "size": size,
+                 "kind": kind}
+        self.exports = [e for e in self.exports
+                        if str(e.get("path")) != str(out)] + [entry]
+        self.side.set_exports(self.exports)
+        self.save_state()
+
+    def open_export(self, path: str):
+        """用系统默认播放器打开一个已导出的片段。"""
+        target = Path(str(path or ""))
+        if not target.is_file():
+            self.side.set_export_text(f"⚠ 文件不在了：{target.name}")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
+
+    def reveal_export(self, path: str):
+        """打开已导出片段所在的文件夹（没给路径就用最近一条）。"""
+        target = Path(str(path or ""))
+        folder = target.parent if target.suffix else target
+        if not folder.is_dir():
+            self.side.set_export_text("⚠ 文件夹不在了")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+
     def _load_persistent_cache(self) -> bool:
         """临时目录没有、但持久库里有 -> 恢复一份进来（硬链接，几乎瞬间）。"""
         if self.store is None or self.out_dir is None:
@@ -561,6 +685,7 @@ class TrackPage(QWidget):
         self.lbl_count.setToolTip("来自缓存（同一视频同设置，秒开）")
         if self.model.rowCount():
             self.view.setCurrentIndex(self.model.index(0))
+        self.apply_state(self._read_state())     # 片段 / 入点出点 / 导出记录
         return True
 
     def _save_scene_meta(self):
@@ -936,6 +1061,7 @@ class TrackPage(QWidget):
                 self.view.set_markers(self.in_frame, self.out_frame, self.cursor_frame)
                 self._refresh_range()
                 self._update_card()
+                self._save_range_state()
 
     def set_in_point(self, frame: int | None = None):
         self._stop_playback_if_playing()
@@ -949,6 +1075,7 @@ class TrackPage(QWidget):
         self._clear_drag_hint()
         self._refresh_range()
         self._update_card()
+        self._save_range_state()
 
     def set_out_point(self, frame: int | None = None):
         self._stop_playback_if_playing()
@@ -962,6 +1089,12 @@ class TrackPage(QWidget):
         self._clear_drag_hint()
         self._refresh_range()
         self._update_card()
+        self._save_range_state()
+
+    def _save_range_state(self):
+        """入点/出点也属于「片段状态」，跟着缓存一起存。"""
+        if self._finished:
+            self.save_state()
 
     def _clear_drag_hint(self):
         if self.lbl_export.text().startswith("区间已调整"):
@@ -971,6 +1104,7 @@ class TrackPage(QWidget):
         self.in_frame = None
         self.out_frame = None
         self._refresh_range()
+        self._save_range_state()
 
     # ------------------------------------------------- 拖动入点/出点手柄
     def _on_range_drag(self, kind: str, frame: int):
@@ -1012,6 +1146,7 @@ class TrackPage(QWidget):
             count = self.out_frame - self.in_frame + 1
             self.side.set_export_text(f"区间已调整：{count} 帧"
                                       f"（{count / max(self._fps(), 1e-6):.2f} 秒）")
+        self._save_range_state()
 
     # ------------------------------------------------------- 片段列表
     def _fps(self) -> float:
@@ -1038,6 +1173,7 @@ class TrackPage(QWidget):
         self.segments.clear()
         self._refresh_segments()
         self.side.set_export_text("已清空片段列表")
+        self.save_state()
 
     # ------------------------------------------------------- 显示尺寸（不重抽）
     def set_display_side(self, side: int, notify: bool = True):
@@ -1092,12 +1228,14 @@ class TrackPage(QWidget):
         self.side.set_active_segment(len(self.segments) - 1)
         self.side.set_export_text(f"已加入片段 #{len(self.segments)}"
                                 f"（共 {len(self.segments)} 段）")
+        self.save_state()
 
     def remove_segment(self, index: int):
         if 0 <= index < len(self.segments):
             self.segments.pop(index)
             self._refresh_segments()
             self.side.set_export_text(f"已删除片段，剩 {len(self.segments)} 段")
+            self.save_state()
 
     def select_segment(self, index: int):
         if not (0 <= index < len(self.segments)):
@@ -1109,6 +1247,7 @@ class TrackPage(QWidget):
         self.side.set_active_segment(index)
         self._set_cursor(self.in_frame)
         self._refresh_range()
+        self._save_range_state()
 
     def _refresh_range(self):
         fps = self.info.fps or 25.0
@@ -1300,7 +1439,6 @@ class TrackPage(QWidget):
         self._prepare_ctx = {"out": out, "start": start_rel, "end": end_rel,
                              "exact": exact, "dir": temp_dir, "norm": norm}
         self.btn_export.setEnabled(False)
-        self.btn_reveal.setVisible(False)
         self.exp_bar.setVisible(True)
         self.exp_bar.setValue(0)
         self._export_text = f"源时间戳不规范，先无损转封装…（{self.path.suffix}）"
@@ -1374,7 +1512,6 @@ class TrackPage(QWidget):
             "reason": "",
         }
         self.btn_export.setEnabled(False)
-        self.btn_reveal.setVisible(False)
         self.exp_bar.setVisible(True)
         self.exp_bar.setRange(0, 100)
         self.exp_bar.setValue(0)
@@ -1462,14 +1599,9 @@ class TrackPage(QWidget):
         self.side.set_export_text(
             f"✅ 已导出 {out.name}（{kind}）"
             + (f" · {info_text}" if info_text else ""))
-        self.btn_reveal.setVisible(True)
         self._export_text = self.lbl_export.text()
         self.export_count += 1
-
-    def _reveal_output(self):
-        if self.exp_out is None:
-            return
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.exp_out.parent)))
+        self._record_export(out, kind)
 
     # ------------------------------------------------------- 批量导出
     def export_all_segments(self):
@@ -1535,7 +1667,6 @@ class TrackPage(QWidget):
         self.seg_bar.set_busy(True)
         self.btn_export.setEnabled(False)
         self.btn_play.setEnabled(False)
-        self.btn_reveal.setVisible(False)
         self.exp_bar.setVisible(True)
         self.exp_bar.setRange(0, 100)
         self.exp_bar.setValue(0)
@@ -1707,7 +1838,10 @@ class TrackPage(QWidget):
         self._refresh_range()
         if ok_items:
             self.exp_out = batch["dir"]
-            self.btn_reveal.setVisible(True)
+            for item in ok_items:
+                kind = ("无损" if (item["fallback"] or item["cut"] is None
+                                  or item["cut"].mode != "smart") else "帧精确")
+                self._record_export(item["out"], kind)
 
     def _batch_abort(self, reason: str = ""):
         batch = self._batch

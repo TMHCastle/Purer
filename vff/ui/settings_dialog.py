@@ -129,6 +129,12 @@ class SettingsDialog(QDialog):
         self._save_now = save_now
         self._check_update = check_update
         self._load_cache = load_cache
+        # 改动即时落盘：控件回调里只是「排个队」，250ms 内合并成一次写盘
+        self._autosave_armed = False
+        self._persist_timer = QTimer(self)
+        self._persist_timer.setSingleShot(True)
+        self._persist_timer.setInterval(220)
+        self._persist_timer.timeout.connect(self._persist)
 
         head = QHBoxLayout()
         head.setSpacing(10)
@@ -157,9 +163,12 @@ class SettingsDialog(QDialog):
         self.tabs.addTab(self.about_page, "关于")
         self.tabs.setCurrentIndex(0)
 
-        btn_close = _button("关闭", self.accept)
+        self.lbl_saved = QLabel("改动会立即保存")
+        self.lbl_saved.setObjectName("cfgNote")
+        btn_close = _button("完成", self.accept)
         btn_close.setDefault(True)
         bar = QHBoxLayout()
+        bar.addWidget(self.lbl_saved)     # 左：保存状态（✓ 已保存 / ⚠ 写不进去）
         bar.addStretch(1)
         bar.addWidget(btn_close)
 
@@ -411,6 +420,14 @@ class SettingsDialog(QDialog):
         self.lbl_limit_hint.setText(
             f"默认 = {_disk_hint(cache_dir)} ≈ {human_size(default_bytes)}")
         lay.addWidget(box2)
+        # 控件都建好了：从现在开始任何改动都即时落盘（见 _schedule_persist）
+        self._autosave_armed = True
+        for widget in (self.radio_never, self.radio_count, self.radio_usage):
+            widget.toggled.connect(self._schedule_persist)
+        for spin in (self.spin_videos, self.spin_minutes, self.spin_exports,
+                     self.spin_limit):
+            spin.valueChanged.connect(self._schedule_persist)
+        self.check_skip.toggled.connect(self._schedule_persist)
 
         # ---- 现状 ----
         box3, box3_lay = _card("当前缓存")
@@ -586,7 +603,7 @@ class SettingsDialog(QDialog):
             is_default = target == default
         if self.settings is not None:
             self.settings.update_cache(dir=None if is_default else str(target))
-            self.settings.save()
+            self._persist()          # 顺带把「✓ 已保存」状态刷对
             self.store.prune()
 
         self.lbl_dir.setText(elide_path(target))
@@ -710,18 +727,56 @@ class SettingsDialog(QDialog):
         }
 
     def accept(self):
-        if self.settings is not None:
-            values = self.values()
-            self.settings.update_cache(**values)
-            if not self.settings.save():
-                QMessageBox.warning(
-                    self, "设置",
-                    "设置没能写入磁盘（目录不可写？）。\n"
-                    f"文件：{self.settings.path}\n"
-                    "本次运行会照常生效，但下次启动可能恢复默认值。")
+        self._persist_timer.stop()
+        ok = self._persist(warn=True)
         if self.store is not None:
             self.store.prune()
         super().accept()
+
+    def reject(self):
+        # 用 Esc / 点标题栏的叉关掉也要把改动作数保存下来 ——
+        # 「关掉就丢」正是之前「设置-缓存 不能正确保存」的根因。
+        self._persist_timer.stop()
+        self._persist()
+        if self.store is not None:
+            self.store.prune()
+        super().reject()
+
+    def closeEvent(self, event):               # noqa: N802
+        self._persist_timer.stop()
+        self._persist()
+        super().closeEvent(event)
+
+    # ------------------------------------------------------------ 即时保存
+    def _schedule_persist(self, *_args):
+        if not self._autosave_armed or self.settings is None:
+            return
+        self._persist_timer.start()
+
+    def _persist(self, warn: bool = False) -> bool:
+        """把当前界面上的选项写入 settings.json（任何关闭方式都会走这里）。"""
+        if self.settings is None:
+            return True
+        try:
+            values = self.values()
+        except Exception:                      # noqa: BLE001  界面还没搭完
+            return False
+        self.settings.update_cache(**values)
+        ok = self.settings.save()
+        if hasattr(self, "lbl_saved"):
+            if ok:
+                self.lbl_saved.setText("✓ 已自动保存")
+                self.lbl_saved.setToolTip(f"已写入 {self.settings.path}")
+            else:
+                self.lbl_saved.setText("⚠ 没能写入磁盘")
+                self.lbl_saved.setToolTip(str(self.settings.path))
+        if not ok and warn:
+            QMessageBox.warning(
+                self, "设置",
+                "设置没能写入磁盘（目录不可写？）。\n"
+                f"文件：{self.settings.path}\n"
+                "本次运行会照常生效，但下次启动可能恢复默认值。")
+        return ok
 
 
 # --------------------------------------------------------------------------- #

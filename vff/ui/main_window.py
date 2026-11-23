@@ -33,7 +33,8 @@ from ..selfupdate import (app_exe, apply_update, auto_install_enabled,
                           can_self_update, download_path, verify_file)
 from .. import session as session_state
 from ..settings import (CACHE_MODE_NEVER, CACHE_MODE_USAGE, Settings,
-                        close_prompt_needed, usage_meets)
+                        close_prompt_needed, update_apply_choice,
+                        update_should_prompt, usage_meets)
 from ..update import RELEASES_PAGE, ReleaseChecker
 from ..util import fmt_tc
 from ..version import normalize
@@ -46,6 +47,7 @@ from .tabs import StateTabBar
 from .titlebar import TitleBar
 from .track_page import TrackPage
 from .update_badge import UpdateBadge
+from .update_dialog import UpdatePromptDialog
 from .widgets import ArrowCombo, EmptyState, StepCombo
 
 CUSTOM_INDEX = len(DISPLAY_PRESETS)
@@ -392,8 +394,15 @@ class MainWindow(FramelessWindow):
         self.downloader.finished.connect(self._on_download_finished)
         self._update_result = None          # 最近一次「有新版本」的结果
         self._pending_exe = ""              # 已下载并校验通过的新 exe
+        self._update_prompt = None          # 正在显示的「发现新版本」弹窗
+        self._update_manual = False         # 这次检查是不是用户手动点的
+        self._update_retries = 0            # 队列没空时等了几轮
+        self._update_retry = QTimer(self)
+        self._update_retry.setSingleShot(True)
+        self._update_retry.setInterval(10000)
+        self._update_retry.timeout.connect(self._retry_update_prompt)
         self.badge.clicked.connect(self._on_update_clicked)
-        self.badge.recheckRequested.connect(self.check_updates)
+        self.badge.recheckRequested.connect(lambda: self.check_updates(manual=True))
         self.titlebar.set_subtitle(self._subtitle(self._step()))
         debug("MainWindow._setup_updater 完成")
         if debug_enabled():
@@ -402,16 +411,22 @@ class MainWindow(FramelessWindow):
             self._hb.setInterval(1000)
             self._hb.timeout.connect(lambda: debug("heartbeat"))
             self._hb.start()
-        if update_checks_enabled():
+        prefs = self.app_settings.update_prefs()
+        if update_checks_enabled() and prefs.get("auto_check", True):
             # 等界面彻底安静下来再查（刚启动时 spawn 子进程太早容易和首帧绘制撞车）
             QTimer.singleShot(6000, self.check_updates)
-        else:
+        elif not update_checks_enabled():
             self.badge.set_state("idle", tip="已用 PURER_NO_UPDATE=1 关闭联网检查")
+        else:
+            self.badge.set_state("idle",
+                                 tip="设置-更新 里关掉了自动检查\n"
+                                     "右键点这里可以手动检查")
 
-    def check_updates(self):
-        debug("check_updates: 进入")
+    def check_updates(self, manual: bool = False):
+        debug(f"check_updates: 进入（manual={manual}）")
         if self.downloader.busy():
             return
+        self._update_manual = bool(manual)
         if self.badge.state_name() != "checking":
             self.badge.set_state("checking",
                                  tip="正在向 GitHub 查询最新发布版本…")
@@ -439,6 +454,85 @@ class MainWindow(FramelessWindow):
             self.badge.set_state(
                 "error",
                 tip=f"没查到最新版本：{result.error or '网络不可用'}\n点击重试")
+        if state == "stale":
+            self._maybe_prompt_update(result)
+
+    # -------------------------------------------------- 「发现新版本」弹窗
+    def _maybe_prompt_update(self, result) -> None:
+        """该不该弹窗：策略 + 队列空闲（正在抽帧/导出就先等等）。"""
+        if not update_checks_enabled() or self._update_prompt is not None:
+            return
+        prefs = self.app_settings.update_prefs()
+        if not prefs.get("auto_check", True) and not self._update_manual:
+            return
+        show, why = update_should_prompt(
+            prefs, result.tag, manual=self._update_manual)
+        if not show:
+            debug(f"不弹更新窗：{why}")
+            self.lbl_status.setText(f"有新版本 {normalize(result.tag) or ''}（{why}）")
+            return
+        if self.jobs.busy:
+            if self._update_retries >= 6:      # 等了两分钟还没空，这次启动先不弹
+                self._update_retries = 0
+                debug("队列一直忙，这次启动不弹更新窗")
+                return
+            self._update_retries += 1
+            self._update_retry.start()
+            return
+        self._update_retries = 0
+        self._prompt_update(result)
+
+    def _retry_update_prompt(self):
+        result = self._update_result
+        if result is None or self._update_prompt is not None:
+            return
+        if self.jobs.busy:
+            if self._update_retries < 6:
+                self._update_retries += 1
+                self._update_retry.start()
+            return
+        self._update_retries = 0
+        prefs = self.app_settings.update_prefs()
+        show, why = update_should_prompt(prefs, result.tag,
+                                         manual=self._update_manual)
+        if show:
+            self._prompt_update(result)
+        else:
+            debug(f"等队列期间策略变了，不弹：{why}")
+
+    def _prompt_update(self, result) -> None:
+        """弹小窗，按用户的选择落策略（不做任何自动决定）。"""
+        tag = normalize(result.tag) or result.tag
+        dialog = UpdatePromptDialog(
+            self, tag=tag, current=APP_VERSION,
+            size=int(result.asset_size or 0),
+            url=result.url or RELEASES_PAGE)
+        self._update_prompt = dialog
+        manual = self._update_manual
+        try:
+            dialog.exec()
+        finally:
+            self._update_prompt = None
+            self._update_manual = False
+        choice = dialog.choice
+        prefs = update_apply_choice(self.app_settings.update_prefs(),
+                                    tag, choice)
+        self.app_settings.set_update_prefs(**prefs)
+        self.app_settings.save()
+        debug(f"更新弹窗选择：{choice}（tag={tag} manual={manual}）")
+        if choice == "now":
+            self._start_download(result)
+        elif choice == "week":
+            self.lbl_status.setText(
+                f"好，一周后再提醒 {tag}（期间出现更高版本会立刻提醒）")
+        elif choice == "skip":
+            self.lbl_status.setText(f"已忽略 {tag}（更高版本仍会提醒）")
+        elif choice == "mute":
+            self.badge.set_state("idle",
+                                 tip="更新提醒已关闭（设置-更新 里可以恢复）")
+            self.lbl_status.setText("已关闭更新提醒（右键顶部药丸仍可手动检查）")
+        else:
+            self.lbl_status.setText(f"稍后再说（24 小时内不再提示 {tag}）")
 
     def _on_update_clicked(self):
         state = self.badge.state_name()
@@ -449,7 +543,7 @@ class MainWindow(FramelessWindow):
         elif state == "ready":
             self._ask_install()
         elif state != "checking":
-            self.check_updates()
+            self.check_updates(manual=True)
 
     # -------------------------------------------------- 下载 → 校验 → 替换重启
     def _ask_download(self):
@@ -469,8 +563,9 @@ class MainWindow(FramelessWindow):
         answer = QMessageBox.question(
             self, "下载并安装更新",
             f"最新版本 {tag}（{size}）\n\n"
-            "现在下载吗？下载完会先校验 sha256，然后关闭本程序、"
-            "替换 exe 并自动重启。\n\n（下载期间可以继续剪片子）",
+            "现在下载吗？下载完会先校验 sha256，然后保存当前标签页、"
+            "替换程序并自动重启（重启后接着现在的进度）。\n\n"
+            "（下载期间可以继续剪片子）",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
         if answer == QMessageBox.Yes:
             self._start_download(result)
@@ -503,19 +598,19 @@ class MainWindow(FramelessWindow):
         answer = QMessageBox.question(
             self, "更新已就绪",
             f"新版本 {tag} 已下载完成，sha256 校验通过。\n\n"
-            "现在重启安装吗？（会关闭本程序再启动新版本）",
+            "现在重启安装吗？（会保存当前标签页，重启后自动接上）",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
         if answer == QMessageBox.Yes:
             self._install_update()
 
     def _ask_install(self):
         if not self._pending_exe:
-            self.check_updates()
+            self.check_updates(manual=True)
             return
         tag = self.badge.tag() or "新版本"
         answer = QMessageBox.question(
             self, "安装更新",
-            f"现在安装 {tag} 并重启吗？",
+            f"现在安装 {tag} 并重启吗？（会保存当前标签页）",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
         if answer == QMessageBox.Yes:
             self._install_update()
@@ -716,12 +811,18 @@ class MainWindow(FramelessWindow):
         dialog = SettingsDialog(
             self, settings=self.app_settings, store=self.cache_store,
             save_now=self._save_rendered_now,
-            check_update=(self.check_updates if update_checks_enabled() else None),
+            check_update=(lambda: self.check_updates(manual=True))
+            if update_checks_enabled() else None,
             load_cache=self.open_cached_entry)
         dialog.exec()
         self.cache_store.reload()
         self.cache_store.prune()
         self._refresh_tab_states()
+        # 设置里刚打开自动检查 / 清掉了忽略 → 立刻查一次（药丸还是灰的才查）
+        prefs = self.app_settings.update_prefs()
+        if (update_checks_enabled() and prefs.get("auto_check", True)
+                and self.badge.state_name() == "idle"):
+            self.check_updates(manual=True)
 
     def _setup_usage_timer(self):
         """给「自动保存用得多 / 导出过」的策略攒数据：只记当前页签。"""

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import platform
 import sys
+import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, QUrl
@@ -25,7 +26,8 @@ from ..cache_store import INDEX_NAME, CacheStore
 from ..config import GITHUB_REPO, app_dir, persistent_cache_root
 from ..ffmpeg import Tools, tool_version
 from ..settings import (CACHE_MODE_COUNT, CACHE_MODE_LABELS, CACHE_MODE_NEVER,
-                        CACHE_MODE_USAGE, default_cache_limit_bytes)
+                        CACHE_MODE_USAGE, DEFAULT_UPDATE,
+                        default_cache_limit_bytes, update_clear_skip)
 from ..update import RELEASES_PAGE
 from ..util import human_size
 from .cache_list import CacheEntryTable, sorted_entries
@@ -157,9 +159,11 @@ class SettingsDialog(QDialog):
         self.tabs = QTabWidget()
         self.tabs.setObjectName("settingsTabs")
         self.about_page = self._build_about()
+        self.update_page = self._build_update()
         self.cache_page = self._build_cache()
         # 缓存页在左边，并且默认打开它（最常用的设置）
         self.tabs.addTab(self.cache_page, "缓存")
+        self.tabs.addTab(self.update_page, "更新")
         self.tabs.addTab(self.about_page, "关于")
         self.tabs.setCurrentIndex(0)
 
@@ -707,6 +711,119 @@ class SettingsDialog(QDialog):
             self.entry_table.refresh()
         self._refresh_summary()
 
+    # ------------------------------------------------------------ 更新
+    def _build_update(self) -> QWidget:
+        prefs = (self.settings.update_prefs() if self.settings
+                 else dict(DEFAULT_UPDATE))
+        scroll = QScrollArea()
+        scroll.setObjectName("cfgScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        body = QWidget()
+        body.setObjectName("cfgBody")
+        lay = QVBoxLayout(body)
+        lay.setContentsMargins(2, 2, 2, 2)
+        lay.setSpacing(10)
+
+        box, box_lay = _card(
+            "更新提醒",
+            "发现新版本时会弹一个小窗问一次：立即更新 / 一周后提醒 / 忽略此版本 / "
+            "不再提醒。更新会先保存当前标签页，换好程序后自动接上。")
+        self.check_auto_update = QCheckBox("启动后自动检查更新")
+        self.check_auto_update.setToolTip(
+            "关掉后不再自动联网检查；右键点击顶部「检查更新」仍可手动查")
+        self.check_auto_update.setChecked(bool(prefs.get("auto_check", True)))
+        self.check_auto_update.toggled.connect(self._schedule_persist)
+        box_lay.addWidget(self.check_auto_update)
+
+        self.check_mute_update = QCheckBox("不再弹出更新提醒（忽略所有更新通知）")
+        self.check_mute_update.setToolTip(
+            "弹窗全关掉，顶部药丸也不再自动变橙；手动检查不受影响")
+        self.check_mute_update.setChecked(bool(prefs.get("muted", False)))
+        self.check_mute_update.toggled.connect(self._schedule_persist)
+        box_lay.addWidget(self.check_mute_update)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.lbl_update_state = QLabel("")
+        self.lbl_update_state.setObjectName("cfgNote")
+        self.lbl_update_state.setWordWrap(True)
+        row.addWidget(self.lbl_update_state, 1)
+        self.btn_reset_update = _button("恢复更新提醒", self._reset_update_prefs,
+                                        ghost=True)
+        self.btn_reset_update.setToolTip("清掉「忽略的版本 / 不再提醒 / 一周后 remind」")
+        row.addWidget(self.btn_reset_update)
+        box_lay.addLayout(row)
+        lay.addWidget(box)
+
+        box2, box2_lay = _card(
+            "版本",
+            "更新包从 GitHub Releases 下载，下载完先校验 sha256 再替换。")
+        self.lbl_update_ver = QLabel(f"当前版本 v{APP_VERSION}")
+        self.lbl_update_ver.setObjectName("cfgVal")
+        box2_lay.addWidget(self.lbl_update_ver)
+        check_row = QHBoxLayout()
+        check_row.setSpacing(8)
+        self.btn_check_now = _button("立即检查", self._check_now, ghost=True)
+        self.btn_check_now.setEnabled(self._check_update is not None)
+        check_row.addWidget(self.btn_check_now)
+        self.lbl_update_check = QLabel("")
+        self.lbl_update_check.setObjectName("cfgNote")
+        check_row.addWidget(self.lbl_update_check, 1)
+        box2_lay.addLayout(check_row)
+        lay.addWidget(box2)
+
+        lay.addStretch(1)
+        scroll.setWidget(body)
+        self._refresh_update_labels()
+        return scroll
+
+    def _refresh_update_labels(self):
+        if not hasattr(self, "lbl_update_state"):
+            return
+        prefs = (self.settings.update_prefs() if self.settings
+                 else dict(DEFAULT_UPDATE))
+        parts = []
+        if prefs.get("muted"):
+            parts.append("已关闭所有更新提醒")
+        if prefs.get("skip_version"):
+            parts.append(f"已忽略 {prefs['skip_version']}")
+        try:
+            snooze = float(prefs.get("snooze_until") or 0)
+        except (TypeError, ValueError):
+            snooze = 0.0
+        if snooze > time.time():
+            parts.append("推迟到 "
+                         + time.strftime("%m-%d %H:%M", time.localtime(snooze)))
+        self.lbl_update_state.setText(" · ".join(parts) if parts
+                                      else "目前没有忽略任何版本")
+
+    def _reset_update_prefs(self):
+        if self.settings is None:
+            return
+        self.settings.set_update_prefs(
+            **update_clear_skip(self.settings.update_prefs(), now=time.time()))
+        self.settings.save()
+        self.check_mute_update.setChecked(False)
+        self._refresh_update_labels()
+
+    def _check_now(self):
+        if self._check_update is None:
+            return
+        try:
+            self._check_update()
+        except Exception:                  # noqa: BLE001
+            pass
+        self.lbl_update_check.setText(
+            "已开始检查…关掉设置后看顶部的「检查更新」药丸")
+
+    def _update_values(self) -> dict:
+        prefs = (self.settings.update_prefs() if self.settings
+                 else dict(DEFAULT_UPDATE))
+        prefs["auto_check"] = bool(self.check_auto_update.isChecked())
+        prefs["muted"] = bool(self.check_mute_update.isChecked())
+        return prefs
+
     # ------------------------------------------------------------ 取值 / 保存
     def values(self) -> dict:
         mode = (CACHE_MODE_NEVER if self.radio_never.isChecked() else
@@ -762,6 +879,11 @@ class SettingsDialog(QDialog):
         except Exception:                      # noqa: BLE001  界面还没搭完
             return False
         self.settings.update_cache(**values)
+        try:
+            if hasattr(self, "check_auto_update"):
+                self.settings.set_update_prefs(**self._update_values())
+        except Exception:                      # noqa: BLE001  更新页还没搭好
+            pass
         ok = self.settings.save()
         if hasattr(self, "lbl_saved"):
             if ok:
@@ -776,6 +898,7 @@ class SettingsDialog(QDialog):
                 "设置没能写入磁盘（目录不可写？）。\n"
                 f"文件：{self.settings.path}\n"
                 "本次运行会照常生效，但下次启动可能恢复默认值。")
+        self._refresh_update_labels()
         return ok
 
 

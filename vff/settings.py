@@ -40,6 +40,19 @@ DEFAULT_CACHE = {
     "skip_close_prompt": False,
 }
 
+# ---------------------------------------------------------------- 更新提醒
+# 「发现新版本」弹窗记住了什么：自动检查 / 静音 / 忽略的版本 / 推迟到什么时候。
+UPDATE_PROMPT_COOLDOWN = 24 * 3600      # 同一版本 24 小时内只问一次
+UPDATE_SNOOZE_DAYS = 7                  # 「一周后提醒我」
+DEFAULT_UPDATE = {
+    "auto_check": True,          # 启动后自动检查（PURER_NO_UPDATE=1 仍最高优先）
+    "muted": False,              # 忽略所有更新通知（手动检查不受影响）
+    "skip_version": "",          # 忽略这个版本（更高版本仍会提示）
+    "snooze_until": 0.0,         # 推迟到什么时候（时间戳）
+    "snooze_version": "",        # 推迟的是哪个版本
+    "last_prompt_at": {},        # {tag: 上次弹窗时间}
+}
+
 
 def _clamp_int(value, low: int, high: int, default: int) -> int:
     try:
@@ -115,6 +128,109 @@ def normalized_cache(raw: dict | None) -> dict:
     }
 
 
+def normalized_update(raw: dict | None) -> dict:
+    """更新提醒设置的收敛（只认已知字段，坏值退回默认）。"""
+    raw = raw if isinstance(raw, dict) else {}
+    prompts = {}
+    for tag, stamp in (raw.get("last_prompt_at") or {}).items():
+        text = str(tag or "").strip()[:32]
+        try:
+            value = float(stamp)
+        except (TypeError, ValueError):
+            continue
+        if text:
+            prompts[text] = value
+    if len(prompts) > 12:                      # 只留最近 12 个版本
+        prompts = dict(sorted(prompts.items(), key=lambda kv: kv[1])[-12:])
+    try:
+        snooze = float(raw.get("snooze_until") or 0.0)
+    except (TypeError, ValueError):
+        snooze = 0.0
+    if snooze < 0 or snooze > 10 ** 11:
+        snooze = 0.0
+    return {
+        "auto_check": bool(raw.get("auto_check", True)),
+        "muted": bool(raw.get("muted", False)),
+        "skip_version": str(raw.get("skip_version") or "").strip()[:32],
+        "snooze_until": snooze,
+        "snooze_version": str(raw.get("snooze_version") or "").strip()[:32],
+        "last_prompt_at": prompts,
+    }
+
+
+def update_should_prompt(prefs: dict | None, tag: str, now: float | None = None,
+                         manual: bool = False) -> tuple[bool, str]:
+    """要不要弹「发现新版本」？→ ``(弹不弹, 原因)``（原因用于调试和状态栏）。
+
+    优先级：没有版本号 → 手动检查直接弹 → 静音 → 忽略的版本 → 推迟期 →
+    同一版本 24 小时内问过。
+    """
+    from .version import is_newer, normalize
+
+    cfg = normalized_update(prefs)
+    text = str(tag or "").strip()
+    if not normalize(text):
+        return False, "没有可用的版本号"
+    if manual:
+        return True, "手动检查"
+    if cfg["muted"]:
+        return False, "已关闭更新提醒"
+    skip = cfg["skip_version"]
+    if skip and not is_newer(text, skip):
+        return False, f"已忽略 {skip}"
+    if cfg["snooze_until"] > (now if now is not None else _now()):
+        snoozed = cfg["snooze_version"]
+        if not snoozed or not is_newer(text, snoozed):
+            return False, "推迟中"
+    stamp = cfg["last_prompt_at"].get(normalize(text))
+    if stamp and (now if now is not None else _now()) - stamp < UPDATE_PROMPT_COOLDOWN:
+        return False, "今天已经问过"
+    return True, ""
+
+
+def update_apply_choice(prefs: dict | None, tag: str, choice: str,
+                        now: float | None = None,
+                        days: int = UPDATE_SNOOZE_DAYS) -> dict:
+    """把用户点的那一下记进设置（返回新的 prefs，交给调用方保存）。
+
+    ``now`` = 立即更新；``later`` = 这次先不装；``week`` = 一周后提醒；
+    ``skip`` = 忽略这个版本；``mute`` = 忽略所有更新通知。
+    """
+    from .version import normalize
+
+    cfg = normalized_update(prefs)
+    stamp = _now() if now is None else float(now)
+    key = normalize(tag) or str(tag or "").strip()
+
+    if choice == "week":
+        cfg["snooze_until"] = stamp + max(1, int(days)) * 86400
+        cfg["snooze_version"] = key
+    elif choice == "skip":
+        cfg["skip_version"] = key
+    elif choice == "mute":
+        cfg["muted"] = True
+    if key:
+        prompts = dict(cfg["last_prompt_at"])
+        prompts[key] = stamp
+        cfg["last_prompt_at"] = prompts
+    return normalized_update(cfg)
+
+
+def update_clear_skip(prefs: dict | None, now: float | None = None) -> dict:
+    """「恢复更新提醒」：清掉忽略的版本 / 静音 / 推迟。"""
+    cfg = normalized_update(prefs)
+    cfg.update({"muted": False, "skip_version": "", "snooze_until": 0.0,
+                "snooze_version": ""})
+    if now is not None:
+        cfg["last_prompt_at"] = {}
+    return normalized_update(cfg)
+
+
+def _now() -> float:
+    import time
+    return time.time()
+
+
 def _read_json(path: Path) -> dict:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -170,6 +286,7 @@ class Settings:
         if not isinstance(self._data.get("cache"), dict):
             self._data["cache"] = {}
         self._data["cache"] = normalized_cache(self._data["cache"])
+        self._data["update"] = normalized_update(self._data.get("update"))
 
     # ------------------------------------------------------------ 读写
     def cache(self) -> dict:
@@ -181,6 +298,16 @@ class Settings:
         merged.update(values)
         self._data["cache"] = normalized_cache(merged)
         return dict(self._data["cache"])
+
+    # ------------------------------------------------------------ 更新提醒
+    def update_prefs(self) -> dict:
+        return dict(self._data.get("update") or DEFAULT_UPDATE)
+
+    def set_update_prefs(self, **values) -> dict:
+        merged = dict(self._data.get("update") or {})
+        merged.update(values)
+        self._data["update"] = normalized_update(merged)
+        return dict(self._data["update"])
 
     def get(self, key: str, default=None):
         return self._data.get(key, default)

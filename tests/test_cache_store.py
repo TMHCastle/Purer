@@ -23,7 +23,9 @@ from vff.export_names import (clean_user_name, default_filename, plan_filenames,
                               series_label, strip_video_suffix)
 from vff.settings import (CACHE_MODE_COUNT, CACHE_MODE_NEVER, CACHE_MODE_USAGE,
                           Settings, close_prompt_needed, default_cache_limit_bytes,
-                          normalized_cache, usage_meets)
+                          normalized_cache, normalized_update,
+                          update_apply_choice, update_clear_skip,
+                          update_should_prompt, usage_meets)
 
 
 class _TempEnv(unittest.TestCase):
@@ -139,6 +141,104 @@ class TestSettings(_TempEnv):
         # 缺字段 / 脏数据都按 0 处理
         self.assertFalse(usage_meets({}, {"used_seconds": 0, "exports": 0}))
         self.assertFalse(usage_meets(cfg, None))
+
+
+class TestUpdatePrefs(_TempEnv):
+    """「发现新版本」弹窗的策略：什么时候弹、四个选择各记什么。"""
+
+    def prefs(self, **values):
+        return normalized_update(values)
+
+    def test_defaults(self):
+        cfg = normalized_update(None)
+        self.assertTrue(cfg["auto_check"])
+        self.assertFalse(cfg["muted"])
+        self.assertEqual(cfg["skip_version"], "")
+        self.assertEqual(cfg["snooze_until"], 0.0)
+        self.assertEqual(cfg["last_prompt_at"], {})
+
+    def test_dirty_values_are_cleaned(self):
+        cfg = normalized_update({
+            "auto_check": 0, "muted": "yes", "skip_version": 123,
+            "snooze_until": "abc", "last_prompt_at": {"": 1, "v1": "x",
+                                                      "v2": 5.0}})
+        self.assertFalse(cfg["auto_check"])
+        self.assertTrue(cfg["muted"])
+        self.assertEqual(cfg["skip_version"], "123")
+        self.assertEqual(cfg["snooze_until"], 0.0)
+        self.assertEqual(cfg["last_prompt_at"], {"v2": 5.0})
+
+    def test_prompt_matrix(self):
+        now = 1_000_000.0
+        self.assertTrue(update_should_prompt(self.prefs(), "v1.2.0", now=now)[0])
+        self.assertFalse(update_should_prompt(self.prefs(), "abc", now=now)[0])
+        self.assertFalse(update_should_prompt(
+            self.prefs(muted=True), "v1.2.0", now=now)[0])
+        self.assertTrue(update_should_prompt(
+            self.prefs(muted=True), "v1.2.0", now=now, manual=True)[0])
+        # 忽略的是「这个版本」，更高版本照样弹
+        skip = self.prefs(skip_version="v1.2.0")
+        self.assertFalse(update_should_prompt(skip, "v1.2.0", now=now)[0])
+        self.assertFalse(update_should_prompt(skip, "v1.1.9", now=now)[0])
+        self.assertTrue(update_should_prompt(skip, "v1.3.0", now=now)[0])
+
+    def test_snooze_respects_newer_version(self):
+        now = 1_000_000.0
+        cfg = update_apply_choice(self.prefs(), "v1.2.0", "week", now=now)
+        self.assertAlmostEqual(cfg["snooze_until"], now + 7 * 86400)
+        self.assertFalse(update_should_prompt(cfg, "v1.2.0", now=now + 60)[0])
+        self.assertTrue(update_should_prompt(cfg, "v1.3.0", now=now + 60)[0])
+        # 过了推迟期就恢复
+        self.assertTrue(update_should_prompt(
+            cfg, "v1.2.0", now=now + 8 * 86400)[0])
+
+    def test_cooldown_once_per_day(self):
+        now = 1_000_000.0
+        cfg = update_apply_choice(self.prefs(), "v1.2.0", "later", now=now)
+        self.assertFalse(update_should_prompt(cfg, "v1.2.0", now=now + 3600)[0])
+        self.assertTrue(update_should_prompt(
+            cfg, "v1.2.0", now=now + 25 * 3600)[0])
+
+    def test_apply_choice_writes_each_field(self):
+        now = 1_000_000.0
+        self.assertEqual(
+            update_apply_choice(self.prefs(), "v2.0", "skip", now=now)[
+                "skip_version"], "v2.0")
+        self.assertTrue(
+            update_apply_choice(self.prefs(), "v2.0", "mute", now=now)["muted"])
+        # "now" / "later" 不改策略，只记「今天问过」
+        for choice in ("now", "later"):
+            cfg = update_apply_choice(self.prefs(), "v2.0", choice, now=now)
+            self.assertEqual(cfg["skip_version"], "")
+            self.assertFalse(cfg["muted"])
+            self.assertIn("v2.0", cfg["last_prompt_at"])
+
+    def test_clear_skip_restores_everything(self):
+        now = 1_000_000.0
+        cfg = update_apply_choice(self.prefs(), "v2.0", "mute", now=now)
+        cfg = update_apply_choice(cfg, "v2.0", "skip", now=now)
+        cleared = update_clear_skip(cfg, now=now)
+        self.assertFalse(cleared["muted"])
+        self.assertEqual(cleared["skip_version"], "")
+        self.assertEqual(cleared["last_prompt_at"], {})
+        self.assertTrue(update_should_prompt(cleared, "v2.0", now=now)[0])
+
+    def test_settings_persist_update_prefs(self):
+        settings = Settings(self.tmp / "settings.json")
+        settings.set_update_prefs(muted=True, skip_version="v3.0",
+                                  auto_check=False)
+        self.assertTrue(settings.save())
+        again = Settings(self.tmp / "settings.json")
+        cfg = again.update_prefs()
+        self.assertTrue(cfg["muted"])
+        self.assertFalse(cfg["auto_check"])
+        self.assertEqual(cfg["skip_version"], "v3.0")
+
+    def test_prompt_history_is_capped(self):
+        stamps = {f"v1.{i}": float(i) for i in range(30)}
+        cfg = normalized_update({"last_prompt_at": stamps})
+        self.assertEqual(len(cfg["last_prompt_at"]), 12)
+        self.assertIn("v1.29", cfg["last_prompt_at"])
 
 
 # --------------------------------------------------------------------------- #

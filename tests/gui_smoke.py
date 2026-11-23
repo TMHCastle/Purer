@@ -188,7 +188,7 @@ def main() -> int:
         check("maximize / restore buttons", maximized and not win.isMaximized(),
               f"max={maximized} back={win.isMaximized()}")
 
-        # ---- 设置窗：关于 / 缓存（v1.1.9） ----
+        # ---- 设置窗：关于 / 缓存 / 更新 ----
         from vff.ui.settings_dialog import CloseCacheDialog, SettingsDialog
         from PySide6.QtWidgets import QLabel
         settings_dlg = SettingsDialog(win, settings=win.app_settings,
@@ -198,11 +198,19 @@ def main() -> int:
         app.processEvents()
         tabs = [settings_dlg.tabs.tabText(i)
                 for i in range(settings_dlg.tabs.count())]
-        check("settings tabs (cache left, about right)", tabs == ["缓存", "关于"],
-              str(tabs))
+        check("settings tabs (cache left, update, about right)",
+              tabs == ["缓存", "更新", "关于"], str(tabs))
         check("settings opens the leftmost tab",
               settings_dlg.tabs.currentIndex() == 0,
               str(settings_dlg.tabs.currentIndex()))
+        check("update page has both toggles",
+              settings_dlg.check_auto_update.isChecked()
+              and not settings_dlg.check_mute_update.isChecked(),
+              f"auto={settings_dlg.check_auto_update.isChecked()} "
+              f"mute={settings_dlg.check_mute_update.isChecked()}")
+        check("update page shows state",
+              "没有忽略" in settings_dlg.lbl_update_state.text(),
+              settings_dlg.lbl_update_state.text())
         about_text = " ".join(w.text() for w in settings_dlg.findChildren(QLabel))
         check("about shows version", f"v{APP_VERSION}" in about_text,
               about_text[:80])
@@ -1041,6 +1049,107 @@ def main() -> int:
         check("copy mirror link", QApplication.clipboard().text() == MIRROR_ZIP)
         guide.close()
         app.processEvents()
+
+        # ---- 3b. 更新提醒弹窗：四个选择 + 策略落盘 ----
+        from vff.ui import update_dialog as update_dialog_mod
+        from vff.ui.update_dialog import UpdatePromptDialog
+        import vff.ui.main_window as mw_mod
+        from vff.settings import update_should_prompt
+
+        fake = CheckResult(True, "v9.9.9", "https://example.invalid/releases",
+                           "", "冒烟", "https://example.invalid/a.exe",
+                           46000000, "")
+        prompt = UpdatePromptDialog(win, tag="v9.9.9", current=APP_VERSION,
+                                    size=46000000,
+                                    url="https://example.invalid")
+        prompt.setAttribute(Qt.WA_DontShowOnScreen, True)
+        prompt.show()
+        app.processEvents()
+        texts = [prompt.btn_now.text(), prompt.btn_week.text(),
+                 prompt.btn_skip.text(), prompt.btn_mute.text()]
+        prompt_text = " ".join(w.text() for w in prompt.findChildren(QLabel))
+        check("update prompt has four choices",
+              all(texts) and prompt.choice == "later", str(texts))
+        check("update prompt shows version + size",
+              "v9.9.9" in prompt_text and "MB" in prompt_text,
+              prompt_text[:60])
+        prompt._pick("week")
+        check("update prompt records choice",
+              prompt.choice == "week", prompt.choice)
+        prompt2 = UpdatePromptDialog(win, tag="v9.9.9")
+        prompt2.setAttribute(Qt.WA_DontShowOnScreen, True)
+        prompt2.show()
+        app.processEvents()
+        prompt2.reject()
+        check("closing update prompt means later", prompt2.choice == "later")
+        prompt2.deleteLater()
+
+        orig_exec = update_dialog_mod.UpdatePromptDialog.exec
+        orig_enabled = mw_mod.update_checks_enabled
+        mw_mod.update_checks_enabled = lambda: True
+        pending = {"choice": "skip"}
+
+        def _fake_exec(self):
+            self.choice = pending["choice"]
+            return 1
+
+        update_dialog_mod.UpdatePromptDialog.exec = _fake_exec
+        try:
+            win.app_settings.set_update_prefs(
+                muted=False, skip_version="", snooze_until=0.0,
+                snooze_version="", last_prompt_at={}, auto_check=True)
+            win._prompt_update(fake)
+            prefs = win.app_settings.update_prefs()
+            check("skip writes the ignored version",
+                  prefs["skip_version"] == "v9.9.9", str(prefs))
+            check("ignored version stops prompting",
+                  update_should_prompt(prefs, "v9.9.9")[0] is False)
+            check("newer version still prompts",
+                  update_should_prompt(prefs, "v9.10.0")[0] is True)
+
+            pending["choice"] = "week"
+            win._prompt_update(fake)
+            prefs = win.app_settings.update_prefs()
+            check("week snoozes seven days",
+                  prefs["snooze_until"] > time.time() + 6 * 86400
+                  and update_should_prompt(prefs, "v9.9.9")[0] is False,
+                  f"{prefs['snooze_until'] - time.time():.0f}s")
+
+            pending["choice"] = "mute"
+            win._prompt_update(fake)
+            prefs = win.app_settings.update_prefs()
+            check("mute silences the badge",
+                  prefs["muted"] and win.badge.state_name() == "idle",
+                  f"muted={prefs['muted']} badge={win.badge.state_name()}")
+            win._maybe_prompt_update(fake)
+            check("muted never prompts", win._update_prompt is None)
+            check("manual check still bypasses policy",
+                  update_should_prompt(prefs, "v9.9.9", manual=True)[0] is True)
+
+            # 队列忙：先不弹，隔 10 秒再看（最多 6 轮）
+            from unittest.mock import PropertyMock, patch as mock_patch
+            win.app_settings.set_update_prefs(
+                muted=False, skip_version="", snooze_until=0.0,
+                snooze_version="", last_prompt_at={}, auto_check=True)
+            win._update_retry.stop()
+            win._update_retries = 0
+            with mock_patch.object(type(win.jobs), "busy",
+                                   new_callable=PropertyMock) as busy_mock:
+                busy_mock.return_value = True
+                win._maybe_prompt_update(fake)
+            check("busy queue delays the prompt",
+                  win._update_prompt is None and win._update_retry.isActive(),
+                  f"retries={win._update_retries}")
+        finally:
+            update_dialog_mod.UpdatePromptDialog.exec = orig_exec
+            mw_mod.update_checks_enabled = orig_enabled
+            win._update_retry.stop()
+            win._update_retries = 0
+            win.app_settings.set_update_prefs(
+                muted=False, skip_version="", snooze_until=0.0,
+                snooze_version="", last_prompt_at={}, auto_check=True)
+            win.app_settings.save()
+            win.badge.set_state("idle")
 
         # ---- 4. 会话快照：保存 → 换个窗口恢复（更新重启 / 崩溃恢复都靠它） ----
         from vff import session as session_state

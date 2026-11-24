@@ -634,7 +634,8 @@ def main() -> int:
               abs(bar.frame_at(x_anchor) - frame_before) <= 2,
               f"{frame_before} -> {bar.frame_at(x_anchor)} zoom={bar.zoom:.2f}")
         start_before = bar._view_start
-        event = QWheelEvent(QPointF(100, 24), QPointF(100, 24),
+        event = QWheelEvent(QPointF(100, bar.track_y()),
+                            QPointF(100, bar.track_y()),
                             QPoint(0, 0), QPoint(0, 120), Qt.NoButton,
                             Qt.NoModifier, Qt.NoScrollPhase, False)
         bar.wheelEvent(event)
@@ -688,6 +689,31 @@ def main() -> int:
               and bar.band_scroll == 1, str(bar.band_scroll))
         bar.scroll_bands(-1)
         check("lanes scroll back", bar.band_scroll == 0, str(bar.band_scroll))
+
+        # 放大后：滚轮在「片段条区域」只翻层、进度条纹丝不动；
+        # 只有鼠标在「进度条区域」才水平平移
+        bar.set_zoom(4.0)
+        start_before = bar._view_start
+        stack_y = max(2, bar.stack_bottom() - bar.band_height() - 2)
+        event = QWheelEvent(QPointF(bar.width() * 0.5, stack_y),
+                            QPointF(bar.width() * 0.5, stack_y),
+                            QPoint(0, 0), QPoint(0, 120), Qt.NoButton,
+                            Qt.NoModifier, Qt.NoScrollPhase, False)
+        bar.wheelEvent(event)
+        app.processEvents()
+        check("wheel over segment area never pans the timeline",
+              bar._view_start == start_before,
+              f"{start_before:.1f} -> {bar._view_start:.1f}")
+        track_event = QWheelEvent(QPointF(bar.width() * 0.5, bar.track_y()),
+                                  QPointF(bar.width() * 0.5, bar.track_y()),
+                                  QPoint(0, 0), QPoint(0, 120), Qt.NoButton,
+                                  Qt.NoModifier, Qt.NoScrollPhase, False)
+        bar.wheelEvent(track_event)
+        app.processEvents()
+        check("wheel over the track pans when zoomed",
+              bar._view_start != start_before,
+              f"{start_before:.1f} -> {bar._view_start:.1f}")
+        bar.reset_zoom()
         page.clear_segments()
         page.clear_range()
         app.processEvents()

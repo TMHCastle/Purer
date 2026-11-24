@@ -310,6 +310,10 @@ class OverviewBar(QWidget):
             return False
         return self._lane_y(lane) - self.band_height() >= 0
 
+    def in_stack_area(self, y: int) -> bool:
+        """y 落在片段条那块区域（轨道上方）？普通滚轮在这里只做垂直滚动。"""
+        return int(y) < self.track_y() - 14
+
     def _lane_at(self, y: int) -> int | None:
         """y 落在哪一层带的矩形里（叠起来也能点中）。"""
         for lane in range(int(self.band_scroll),
@@ -557,12 +561,14 @@ class OverviewBar(QWidget):
             self.scale_bands(notches)
             event.accept()
             return
-        if self.zoom > 1.0:
-            # 放大后：滚轮左右平移（向上 = 往左）
-            self._pan_to(self._view_start - notches * self._visible() * 0.1)
+        if self.in_stack_area(event.position().y()):
+            # 鼠标在片段条区域：只上下翻片段层，进度条一动不动
+            self.scroll_bands(notches)
             event.accept()
             return
-        if self.lane_count() > self.visible_lanes() and self.scroll_bands(notches):
+        if self.zoom > 1.0:
+            # 鼠标在进度条区域：居中左右平移（向上 = 往左）
+            self._pan_to(self._view_start - notches * self._visible() * 0.1)
             event.accept()
             return
         super().wheelEvent(event)

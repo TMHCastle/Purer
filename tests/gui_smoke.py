@@ -35,7 +35,8 @@ if str(ROOT) not in sys.path:
 from PySide6.QtCore import QItemSelection, QItemSelectionModel, QPoint, QPointF, Qt  # noqa: E402
 from PySide6.QtGui import QWheelEvent  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
-from PySide6.QtWidgets import QApplication, QMessageBox, QTabBar  # noqa: E402
+from PySide6.QtWidgets import (QApplication, QMessageBox, QSplitter,  # noqa: E402
+                               QTabBar)
 
 from vff import ffmpeg  # noqa: E402
 from vff.config import APP_VERSION  # noqa: E402
@@ -489,7 +490,18 @@ def main() -> int:
         bar = page.overview
         total = max(1, int(page.info.frames or 0))
         check("overview bar exists", bar is not None and not bar.isHidden()
-              and bar.height() == 62, f"h={bar.height() if bar else '?'}")
+              and bar.height() >= 60, f"h={bar.height() if bar else '?'}")
+        check("overview bar has a draggable splitter",
+              isinstance(page.vsplit, QSplitter)
+              and page.vsplit.orientation() == Qt.Vertical,
+              type(page.vsplit).__name__)
+        before_h = bar.height()
+        page.set_overview_height(before_h + 40)
+        app.processEvents()
+        check("overview height can be dragged taller",
+              bar.height() > before_h + 20, f"{before_h} -> {bar.height()}")
+        page.set_overview_height(before_h)
+        app.processEvents()
         check("overview mirrors in/out", bar.in_frame == 25 and bar.out_frame == 30,
               f"{bar.in_frame},{bar.out_frame}")
         check("overview roundtrips frame", all(
@@ -499,7 +511,8 @@ def main() -> int:
         page.clear_range()
         midpoint = total // 2
         QTest.mouseClick(bar, Qt.LeftButton,
-                         pos=QPoint(int(bar._x_for_frame(midpoint)), 44))
+                         pos=QPoint(int(bar._x_for_frame(midpoint)),
+                                    bar.track_y()))
         app.processEvents()
         check("overview click seeks", abs((page.cursor_frame or -1) - midpoint) <= 1,
               f"cursor={page.cursor_frame} want={midpoint}")
@@ -509,9 +522,10 @@ def main() -> int:
         x_in = int(bar._x_for_frame(page.in_frame))
         want_in = max(1, page.in_frame - 20)
         x_target = int(bar._x_for_frame(want_in))
-        QTest.mousePress(bar, Qt.LeftButton, pos=QPoint(x_in, 14))
-        QTest.mouseMove(bar, QPoint(x_target, 14))
-        QTest.mouseRelease(bar, Qt.LeftButton, pos=QPoint(x_target, 14))
+        flag_y = bar.track_y() - 8
+        QTest.mousePress(bar, Qt.LeftButton, pos=QPoint(x_in, flag_y))
+        QTest.mouseMove(bar, QPoint(x_target, flag_y))
+        QTest.mouseRelease(bar, Qt.LeftButton, pos=QPoint(x_target, flag_y))
         app.processEvents()
         check("overview drag moves in point",
               abs(page.in_frame - want_in) <= 1,
@@ -549,7 +563,7 @@ def main() -> int:
               page.side.lbl_markers.text())
         page._set_cursor(90, sync_wall=True)
         QTest.mouseClick(bar, Qt.LeftButton,
-                         pos=QPoint(int(bar._x_for_frame(30)), 38))
+                         pos=QPoint(int(bar._x_for_frame(30)), bar.track_y() - 5))
         app.processEvents()
         check("click overview marker jumps", page.cursor_frame == 30,
               str(page.cursor_frame))
@@ -646,15 +660,27 @@ def main() -> int:
               f"lanes={bar.lane_count()} n={len(bar._segments)}")
         check("stack starts at bottom lane", bar.band_scroll == 0,
               str(bar.band_scroll))
+        check("bands have real height",
+              bar.band_height() >= 8 and bar.band_gap() >= 3,
+              f"band={bar.band_height()} gap={bar.band_gap()}")
+        step_before = bar.band_step
         event = QWheelEvent(QPointF(bar.width() * 0.5, 20),
                             QPointF(bar.width() * 0.5, 20),
                             QPoint(0, 0), QPoint(0, 120), Qt.NoButton,
                             Qt.AltModifier, Qt.NoScrollPhase, False)
         bar.wheelEvent(event)
         app.processEvents()
-        check("alt+wheel scrolls segment lanes", bar.band_scroll == 1,
-              f"scroll={bar.band_scroll} zoom={bar.zoom}")
+        check("alt+wheel scales the segment lanes", bar.band_step > step_before,
+              f"{step_before} -> {bar.band_step}")
+        check("alt+wheel grows height and gap together",
+              bar.band_height() > 8 and bar.band_gap() >= 4,
+              f"band={bar.band_height()} gap={bar.band_gap()}")
         check("alt+wheel does not zoom the bar", bar.zoom == 1.0, str(bar.zoom))
+        bar.scale_bands(-1)
+        check("lanes scale back", bar.band_step == step_before,
+              f"{step_before} -> {bar.band_step}")
+        check("plain wheel scrolls lanes", bar.scroll_bands(1)
+              and bar.band_scroll == 1, str(bar.band_scroll))
         bar.scroll_bands(-1)
         check("lanes scroll back", bar.band_scroll == 0, str(bar.band_scroll))
         page.clear_segments()

@@ -35,7 +35,7 @@ from ..util import (fmt_tc, fmt_tc_compact, human_size, next_play_index,
 from .dialogs import ask_batch_export, ask_export, show_log
 from .filmstrip import PLAY_FPS, FilmStrip, PlayClip
 from .images import jpeg_ready
-from .overview_bar import OverviewBar
+from .overview_bar import DEFAULT_BAR_H, MIN_BAR_H, OverviewBar
 from .range_palette import assign_lanes, color_for
 from .sidebar import SIDEBAR_MAX, SIDEBAR_MIN, EditSidebar
 from .wall_view import WallView
@@ -45,11 +45,13 @@ from .widgets import LANE_H, FrameDelegate, FrameModel, FrameRef, PreviewDialog
 class TrackPage(QWidget):
     reload_requested = Signal(object)
     display_side_changed = Signal(int)
+    overview_height_changed = Signal(int)
 
     def __init__(self, path: Path, step: int, tw: int, th: int, info: MediaInfo,
                  queue: JobQueue, parent=None, display_side: int | None = None,
                  scene_threshold: float | None = None, store=None,
-                 restore: dict | None = None):
+                 restore: dict | None = None,
+                 overview_height: int | None = None):
         super().__init__(parent)
         self.path = Path(path)
         self.step = float(step)
@@ -66,6 +68,8 @@ class TrackPage(QWidget):
         self.timeline = StepTimeline(self.step, max(0, int(info.frames or 0)))
         self.tw, self.th = int(tw), int(th)          # 抽取尺寸（磁盘上的 jpg）
         self.display_side = int(display_side or DEFAULT_DISPLAY_SIDE)
+        self._overview_height = max(
+            MIN_BAR_H, min(400, int(overview_height or DEFAULT_BAR_H)))
         self.disp_w, self.disp_h = thumb_size_for(info.width, info.height,
                                                   self.display_side)
         self.info = info
@@ -212,12 +216,24 @@ class TrackPage(QWidget):
         self.split.setStretchFactor(0, 1)
         self.split.setStretchFactor(1, 0)
         self.split.setSizes([900, 372])
-        root.addWidget(self.split, 1)
 
         # 底部总进度条：整段视频一条，和墙上的时间轴共用同一份入点/出点/光标/片段
         self.overview = OverviewBar()
         self.overview.set_media(self.info.frames or 0, self.info.fps or 25.0)
-        root.addWidget(self.overview)
+
+        # 图墙 / 侧栏 与 总进度条 之间也能拖：**拖上边框就能把这一整块拉高**
+        self.vsplit = QSplitter(Qt.Vertical)
+        self.vsplit.setChildrenCollapsible(False)
+        self.vsplit.setHandleWidth(6)
+        self.vsplit.addWidget(self.split)
+        self.vsplit.addWidget(self.overview)
+        self.vsplit.setStretchFactor(0, 1)
+        self.vsplit.setStretchFactor(1, 0)
+        self.split.setMinimumHeight(180)
+        self.vsplit.setSizes([max(240, 720), int(self._overview_height)])
+        root.addWidget(self.vsplit, 1)
+        self.vsplit.splitterMoved.connect(self._on_overview_resized)
+
         self.overview.seekRequested.connect(self._seek_overview)
         self.overview.inMoved.connect(lambda f: self._on_range_drag("in", f))
         self.overview.outMoved.connect(lambda f: self._on_range_drag("out", f))
@@ -1721,6 +1737,21 @@ class TrackPage(QWidget):
         width = max(320, self.split.width())
         px = max(SIDEBAR_MIN, min(SIDEBAR_MAX, int(px)))
         self.split.setSizes([max(240, width - px), px])
+
+    # ------------------------------------------------------- 总进度条高度
+    def overview_height(self) -> int:
+        return int(self.overview.height()) if self.overview else DEFAULT_BAR_H
+
+    def set_overview_height(self, px: int):
+        """设置底部总进度条那一块的高度（拖上边框等价于这个）。"""
+        px = max(MIN_BAR_H, min(400, int(px)))
+        sizes = self.vsplit.sizes()
+        total = max(1, sum(sizes))
+        self.vsplit.setSizes([max(180, total - px), px])
+
+    def _on_overview_resized(self, _pos: int, _index: int):
+        self.overview._clamp_band_scroll()
+        self.overview_height_changed.emit(self.overview_height())
 
     def _collect_ranges_to_segments(self):
         """把画好的每一段都收进片段列表（重复的跳过，不导出文件）。"""

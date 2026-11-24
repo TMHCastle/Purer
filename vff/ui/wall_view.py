@@ -56,6 +56,7 @@ class WallView(QListView):
         # 随意框选：按「鼠标按下点 / 当前点」换算帧，而不是格子的左右边界
         self._press_pos: QPoint | None = None
         self._press_frame: int | None = None
+        self._press_seek: int | None = None
         self._press_lane = False
         self._last_frame: int | None = None
         self._boxing = False
@@ -295,6 +296,25 @@ class WallView(QListView):
             return None
         return self._frame_in_row(hit[0], hit[1], pos.x())
 
+    def _frame_in_item(self, index, x: float) -> int | None:
+        """点在某张缩略图上：按它在格子里的横向比例换算帧号。
+
+        这比「取这一格的抽样帧」精确 —— 预览才能显示鼠标指的那一帧。
+        """
+        if index is None or not index.isValid():
+            return None
+        rect = self.visualRect(index)
+        if rect.width() <= 0:
+            return None
+        item = int(index.row())
+        lo = int(self.timeline.frame_at(item))
+        hi = int(self.timeline.span(item)[1])
+        if hi <= lo:
+            return lo
+        frac = (float(x) - rect.left()) / max(1.0, float(rect.width()))
+        frac = max(0.0, min(1.0, frac))
+        return int(round(lo + frac * (hi - lo)))
+
     def box_selecting(self) -> bool:
         """正在随意框选？（TrackPage 用它忽略原生多选信号，免得覆盖精确帧）"""
         return self._boxing
@@ -337,6 +357,7 @@ class WallView(QListView):
     def mousePressEvent(self, event):
         self._press_pos = None
         self._press_frame = None
+        self._press_seek = None
         self._last_frame = None
         self._boxing = False
         self._started = False
@@ -362,8 +383,13 @@ class WallView(QListView):
                 return
             self._press_pos = pos
             self._press_frame = self._frame_at_pos(pos)
-            # 按在「行内时间轴」这条窄带上：松手时只移动当前帧，不立刻设入出点
+            index = self.indexAt(pos)
+            self._press_seek = self._press_frame
             self._press_lane = self._row_at_y(pos.y()) is not None
+            if index.isValid() and not self._press_lane:
+                fine = self._frame_in_item(index, pos.x())
+                if fine is not None:
+                    self._press_seek = fine
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
@@ -413,12 +439,13 @@ class WallView(QListView):
             event.accept()
             return
         had, start, end = self._boxing, self._press_frame, self._last_frame
-        lane = self._press_lane
+        seek = self._press_seek
         # 先让 QListView 收尾（此时 _boxing 仍为 True，TrackPage 会忽略它的多选信号）
         super().mouseReleaseEvent(event)
         self._boxing = False
         self._press_pos = None
         self._press_frame = None
+        self._press_seek = None
         self._last_frame = None
         self._press_lane = False
         if had and start is not None and end is not None:
@@ -426,9 +453,10 @@ class WallView(QListView):
             self.rangeSelected.emit(start, end)
             event.accept()
             return
-        if lane and start is not None:
-            # 只点了一下行内时间轴：移动当前帧（精确到帧），不设入点/出点
-            self.seekRequested.emit(int(start))
+        if seek is not None and not (
+                event.modifiers() & (Qt.ControlModifier | Qt.ShiftModifier)):
+            # 单击（缩略图或时间轴）：把当前帧精确落到鼠标那一帧 → 预览显示这一帧
+            self.seekRequested.emit(int(seek))
             event.accept()
             return
 

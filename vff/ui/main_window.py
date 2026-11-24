@@ -53,6 +53,7 @@ from .style import BG, TAB_GUIDE, icon_win_close, make_icon
 from .tabs import StateTabBar
 from .titlebar import TitleBar
 from .track_page import TrackPage
+from .overview_bar import DEFAULT_BAR_H, MIN_BAR_H
 from .update_badge import UpdateBadge
 from .update_dialog import UpdatePromptDialog
 from .widgets import ArrowCombo, EmptyState, StepCombo
@@ -220,8 +221,11 @@ class MainWindow(FramelessWindow):
                 DISPLAY_MAX, int(self.setting.value("ui/display_side",
                                                     DEFAULT_DISPLAY_SIDE))))
             self._sidebar_width = int(self.setting.value("ui/sidebar_width", 372))
+            self._overview_height = max(MIN_BAR_H, min(400, int(
+                self.setting.value("ui/overview_height", DEFAULT_BAR_H))))
         except (TypeError, ValueError):
             self._display_side, self._sidebar_width = DEFAULT_DISPLAY_SIDE, 372
+            self._overview_height = DEFAULT_BAR_H
         self._sidebar_expanded = {}
         for key in ("edit", "segments"):
             value = str(self.setting.value(f"ui/sidebar_{key}_expanded", "true"))
@@ -1292,6 +1296,14 @@ class MainWindow(FramelessWindow):
         self.setting.setValue("ui/display_side", self._display_side)
         self._sync_size_combo(self._display_side)
 
+    def _on_overview_height(self, px: int):
+        """底部总进度条拖高了 / 压低了：记住这个高度，新标签页沿用。"""
+        try:
+            self._overview_height = max(MIN_BAR_H, min(400, int(px)))
+        except (TypeError, ValueError):
+            return
+        self.setting.setValue("ui/overview_height", self._overview_height)
+
     def _on_splitter_moved(self, *_args):
         page = self.tabs.currentWidget()
         if not isinstance(page, TrackPage):
@@ -1464,7 +1476,8 @@ class MainWindow(FramelessWindow):
         page = TrackPage(video, step, tw, th, info, self.jobs,
                          display_side=self._display_side,
                          scene_threshold=threshold,
-                         store=self.cache_store)
+                         store=self.cache_store,
+                         overview_height=self._overview_height)
         if not self._insert_page(page):
             return False
         self._refresh_tab_states()
@@ -1535,7 +1548,8 @@ class MainWindow(FramelessWindow):
         page = TrackPage(path, step, tw, th, info, self.jobs,
                          display_side=self._display_side,
                          scene_threshold=threshold,
-                         store=self.cache_store)
+                         store=self.cache_store,
+                         overview_height=self._overview_height)
         return self._insert_page(page, index=index)
 
     def _insert_page(self, page: TrackPage, index: int | None = None,
@@ -1543,6 +1557,7 @@ class MainWindow(FramelessWindow):
         """把已经建好的 TrackPage 接进标签栏并开始加载。"""
         page.reload_requested.connect(self._on_reload)
         page.display_side_changed.connect(self._on_page_display_side)
+        page.overview_height_changed.connect(self._on_overview_height)
         page.split.splitterMoved.connect(self._on_splitter_moved)
         page.set_sidebar_width(self._sidebar_width if sidebar_width is None
                                else sidebar_width)
@@ -1751,7 +1766,8 @@ class MainWindow(FramelessWindow):
                          display_side=side,
                          scene_threshold=threshold,
                          store=self.cache_store,
-                         restore=entry)
+                         restore=entry,
+                         overview_height=self._overview_height)
         return self._insert_page(page, sidebar_width=entry.get("sidebar_width"))
 
     def _select_restored(self, data: dict, entries: list) -> None:

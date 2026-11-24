@@ -221,7 +221,6 @@ class TrackPage(QWidget):
         self.overview.markerActivated.connect(self._goto_marker_frame)
         self.overview.addMarkerRequested.connect(self.add_marker)
         self.overview.removeMarkerRequested.connect(self.remove_marker)
-        self.overview.zoomRequested.connect(self._on_wheel_zoom)
         self._refresh_markers()
 
         # 兼容别名：导出/批处理等既有逻辑继续用原来的控件名
@@ -1482,19 +1481,49 @@ class TrackPage(QWidget):
         self.save_state()
 
     # ------------------------------------------------------- 显示尺寸（不重抽）
-    def set_display_side(self, side: int, notify: bool = True):
+    def set_display_side(self, side: int, notify: bool = True,
+                         anchor_frame: int | None = None,
+                         anchor_point=None,
+                         anchor_row: int | None = None):
+        """改缩略图尺寸。带锚点（Alt+滚轮）时把鼠标那一格放回原来的高度，
+        图墙不会跳走；``anchor_row`` 是缩放前 ``indexAt`` 命中的格子。"""
         side = max(DISPLAY_MIN, min(DISPLAY_MAX, int(side)))
         w, h = thumb_size_for(self.info.width, self.info.height, side)
         if (side, w, h) == (self.display_side, self.disp_w, self.disp_h):
             return
-        anchor = self._top_visible_index()
+        count = self.model.rowCount()
+        keep_row = None
+        keep_top = 0
+        if anchor_row is None and anchor_frame is not None and count:
+            try:
+                anchor_row = self.view._item_for_frame(int(anchor_frame))
+            except (AttributeError, RuntimeError):
+                anchor_row = None
+        if anchor_row is not None and 0 <= int(anchor_row) < count:
+            rect = self.view.visualRect(self.model.index(int(anchor_row), 0))
+            if rect.isValid() and not rect.isEmpty():
+                keep_row = int(anchor_row)
+                keep_top = rect.top()
+        anchor = None if keep_row is not None else self._top_visible_index()
         self.display_side = side
         self.disp_w, self.disp_h = w, h
         delegate = self.view.itemDelegate()
         delegate.tw, delegate.th = w, h
         self.view.setGridSize(QSize(w + 10, h + 10 + 22 + LANE_H))
         self.view.doItemsLayout()
-        if anchor is not None:
+        if keep_row is not None:
+            # 缩放后这一格可能已经滚出已布局范围（visualRect 变无效），
+            # 按「均匀网格」直接算内容坐标；滚动条上限此时可能还是旧的，
+            # 先按网格算好的内容高度把范围设对，再设滚动值，免得被夹住。
+            grid = self.view.gridSize()
+            gh = max(1, grid.height())
+            gw = max(1, grid.width())
+            per_row = max(1, self.view.viewport().width() // gw)
+            content_h = ((count + per_row - 1) // per_row) * gh
+            scroll = self.view.verticalScrollBar()
+            scroll.setRange(0, max(0, content_h - self.view.viewport().height()))
+            scroll.setValue(int(round((keep_row // per_row) * gh - keep_top)))
+        elif anchor is not None:
             self.view.scrollTo(anchor, QAbstractItemView.PositionAtTop)
         self.view.viewport().update()
         if notify:
@@ -1505,7 +1534,15 @@ class TrackPage(QWidget):
         return index if index.isValid() else None
 
     def _on_wheel_zoom(self, direction: int):
-        self.set_display_side(self.display_side + int(direction) * DISPLAY_STEP)
+        anchor = None
+        try:
+            anchor = self.view.take_zoom_anchor()
+        except AttributeError:
+            anchor = None
+        frame, point, row = anchor if anchor else (None, None, None)
+        self.set_display_side(self.display_side + int(direction) * DISPLAY_STEP,
+                              anchor_frame=frame, anchor_point=point,
+                              anchor_row=row)
 
     # ------------------------------------------------------- 面板宽度
     def sidebar_width(self) -> int:

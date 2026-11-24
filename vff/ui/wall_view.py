@@ -16,6 +16,7 @@ from PySide6.QtGui import QColor, QPainter, QPen, QPolygon
 from PySide6.QtWidgets import QListView
 
 from ..timeline import StepTimeline, Timeline
+from .wheel_util import wheel_direction
 from .widgets import LANE_H
 
 LINE_COLOR = QColor("#2E3442")
@@ -53,6 +54,8 @@ class WallView(QListView):
         self._press_frame: int | None = None
         self._last_frame: int | None = None
         self._boxing = False
+        # Alt+滚轮缩放时记住「鼠标下那一帧 + 屏幕位置」，缩放后把它钉在原地
+        self._zoom_anchor: tuple[int | None, QPoint] | None = None
 
     # ---------------- 外部设置 ----------------
     def set_timeline(self, timeline: Timeline):
@@ -82,12 +85,22 @@ class WallView(QListView):
     def wheelEvent(self, event):
         # Alt+滚轮只改显示尺寸；普通滚轮照常滚动（和 Premiere 的缩放改键一致）
         if event.modifiers() & Qt.AltModifier:
-            delta = event.angleDelta().y()
-            if delta:
-                self.zoomRequested.emit(1 if delta > 0 else -1)
+            direction = wheel_direction(event)
+            if direction:
+                pos = event.position().toPoint()
+                index = self.indexAt(pos)
+                row = index.row() if index.isValid() else None
+                self._zoom_anchor = (self._frame_at_pos(pos), pos, row)
+                self.zoomRequested.emit(direction)
                 event.accept()
                 return
         super().wheelEvent(event)
+
+    def take_zoom_anchor(self):
+        """取走 Alt+滚轮记下的「鼠标下那一帧 + 屏幕位置 + 那一格」（只生效一次）。"""
+        anchor = self._zoom_anchor
+        self._zoom_anchor = None
+        return anchor
 
     # ---------------- 可见范围 ----------------
     def _row_rect(self, row: int):
@@ -97,19 +110,28 @@ class WallView(QListView):
         return self.visualRect(index)
 
     def _first_visible(self) -> int:
+        """当前最上面那一行的第一格。
+
+        **不能用二分**：Batched 布局下远处的 item 还没排过版，``visualRect``
+        返回 ``(-1,-1,0,0)``，二分会被骗到列表末尾 —— 大图墙（几千格）上
+        框选 / 拖手柄 / Alt+滚轮找锚点全都会算到最后一帧去。
+        """
         count = self.model().rowCount() if self.model() else 0
         if count == 0:
             return 0
-        lo, hi, found = 0, count - 1, count
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            rect = self._row_rect(mid)
-            if rect is not None and rect.bottom() >= 0:
-                found = mid
-                hi = mid - 1
-            else:
-                lo = mid + 1
-        return min(found, count - 1)
+        width = max(1, self.viewport().width())
+        for y in (1, 4, 9, 16):
+            for x in (2, width // 2, max(2, width - 4)):
+                index = self.indexAt(QPoint(x, y))
+                if index.isValid():
+                    return max(0, min(count - 1, index.row()))
+        # 退化：网格是均匀的，按滚动位置直接估一行再往前退一格
+        grid = self.gridSize()
+        gh = max(1, grid.height())
+        gw = max(1, grid.width())
+        per_row = max(1, width // gw)
+        line = max(0, self.verticalScrollBar().value() // gh)
+        return max(0, min(count - 1, (line - 1) * per_row))
 
     def _visible_rows(self):
         """返回 [(top, [item_row, ...]), ...]（只覆盖当前可见区域）。"""
@@ -123,6 +145,12 @@ class WallView(QListView):
             rect = self._row_rect(row)
             if rect is None:
                 break
+            if rect.width() <= 0 or rect.height() <= 0:
+                # 还没排版到（Batched 布局）：可见区间之前跳过，之后直接停
+                if bucket:
+                    break
+                row += 1
+                continue
             if rect.top() > height + rect.height():
                 break
             if current_top is None or abs(rect.top() - current_top) > 2:

@@ -22,6 +22,7 @@ from PySide6.QtWidgets import QMenu, QWidget
 
 from ..util import fmt_tc
 from .style import ACCENT, DIM, PANEL2, WARN
+from .wheel_util import wheel_direction
 
 BAR_H = 46              # 控件总高（轨道 + 下面一行时间）
 MARGIN = 16             # 左右留白（贴边不好点）
@@ -57,7 +58,7 @@ class OverviewBar(QWidget):
     markerActivated = Signal(int)        # 点绿色标记：跳到该帧
     addMarkerRequested = Signal(int)     # 右键：在这一帧加标记
     removeMarkerRequested = Signal(int)  # 右键：删掉这个标记
-    zoomRequested = Signal(int)          # Alt+滚轮：+1 放大 / -1 缩小
+    # 时间轴伸缩是这条控件自己的事（Alt+滚轮 / 双击 / 右键），不再动缩略图尺寸
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -66,7 +67,8 @@ class OverviewBar(QWidget):
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.NoFocus)
         self.setCursor(Qt.ArrowCursor)
-        self.setToolTip("点/拖：移动光标 · 拖两端小旗：改入点/出点 · 右键：更多")
+        self.setToolTip("点/拖：移动光标 · 拖两端小旗：改入点/出点 · "
+                        "Alt+滚轮：伸缩时间轴 · 滚轮：左右平移 · 右键：更多")
 
         self.fps = 25.0
         self.total = 0
@@ -78,6 +80,11 @@ class OverviewBar(QWidget):
         self._drag: str | None = None
         self._scrubbing = False
         self._hover: str | None = None
+        # 时间轴伸缩：1.0 = 整段铺满（默认），越大窗口越窄
+        self.zoom = 1.0
+        self._view_start = 0.0          # 可见窗口左边缘（帧，浮点）
+        self._wheel_accum = 0           # 高精度滚轮 / 横向滚动累计
+        self._wheel_unit = 120          # 一个「格」的增量，按事件类型调整
 
     # ------------------------------------------------------------------ 数据
     def set_media(self, total_frames: int, fps: float = 25.0):
@@ -85,6 +92,7 @@ class OverviewBar(QWidget):
         fps = max(1e-6, float(fps or 25.0))
         if (total, fps) != (self.total, self.fps):
             self.total, self.fps = total, fps
+            self.zoom, self._view_start = 1.0, 0.0
             self.update()
 
     def set_state(self, cursor_frame=None, in_frame=None, out_frame=None):
@@ -92,7 +100,19 @@ class OverviewBar(QWidget):
         self.cursor_frame = None if cursor_frame is None else int(cursor_frame)
         self.in_frame = None if in_frame is None else int(in_frame)
         self.out_frame = None if out_frame is None else int(out_frame)
-        if before != (self.cursor_frame, self.in_frame, self.out_frame):
+        changed = before != (self.cursor_frame, self.in_frame, self.out_frame)
+        moved = (self.cursor_frame is not None
+                 and self.cursor_frame != before[0])
+        if self.zoom > 1.0 and moved:
+            # 放大后光标跑出窗口就跟着走（播放 / 跳帧时时间轴不会「停住」）；
+            # 只是在别处缩放时不动，免得把刚放大的位置拽回光标处。
+            visible = self._visible()
+            start, end = self._view_start, self._view_start + visible
+            if not (start <= self.cursor_frame <= end):
+                self._view_start = self.cursor_frame - visible / 2.0
+                self._clamp_view()
+                changed = True
+        if changed:
             self.update()
 
     def set_segments(self, segments):
@@ -123,22 +143,84 @@ class OverviewBar(QWidget):
     def _track_right(self) -> float:
         return float(max(MARGIN + 1, self.width() - MARGIN))
 
+    def _usable(self) -> float:
+        return max(1.0, self._track_right() - self._track_left())
+
+    def _span(self) -> float:
+        return float(max(1, self.total - 1))
+
+    def _visible(self) -> float:
+        """当前窗口覆盖多少帧（zoom=1 时就是整段）。"""
+        return max(1.0, self._span() / max(1.0, float(self.zoom)))
+
+    def _max_zoom(self) -> float:
+        # 最窄也留 4 帧，再窄就没意义了
+        return max(1.0, min(64.0, self._span() / 4.0))
+
+    def _clamp_view(self):
+        limit = max(0.0, self._span() - self._visible())
+        self._view_start = max(0.0, min(limit, float(self._view_start)))
+        if self.zoom <= 1.0:
+            self.zoom, self._view_start = 1.0, 0.0
+
     def _x_for_frame(self, frame: float) -> float:
-        span = max(1, self.total - 1)
-        usable = max(1.0, self._track_right() - self._track_left())
-        frame = max(0.0, min(float(span), float(frame)))
-        return self._track_left() + frame / span * usable
+        frac = (float(frame) - self._view_start) / self._visible()
+        return self._track_left() + frac * self._usable()
 
     def _frame_at_x(self, x: float) -> int:
-        span = max(1, self.total - 1)
-        usable = max(1.0, self._track_right() - self._track_left())
-        frac = (float(x) - self._track_left()) / usable
+        frac = (float(x) - self._track_left()) / self._usable()
         frac = max(0.0, min(1.0, frac))
-        return int(round(frac * span))
+        frame = self._view_start + frac * self._visible()
+        return int(round(max(0.0, min(self._span(), frame))))
 
     def frame_at(self, x: float) -> int:
         """公开给测试/外部用：屏幕 x → 帧号。"""
         return self._frame_at_x(x)
+
+    def visible_range(self) -> tuple[float, float]:
+        """当前窗口的 [起帧, 止帧]（浮点，给绘制/提示用）。"""
+        return self._view_start, self._view_start + self._visible()
+
+    # ------------------------------------------------------------------ 缩放
+    def set_zoom(self, zoom: float, anchor_frame: float | None = None):
+        """把时间轴伸缩到 ``zoom`` 倍；``anchor_frame`` 尽量留在原来的横位置。"""
+        if self._span() <= 1:
+            self.zoom, self._view_start = 1.0, 0.0
+            self.update()
+            return
+        old_visible = self._visible()
+        anchor = (self._span() / 2.0 if anchor_frame is None
+                  else float(anchor_frame))
+        frac = 0.5
+        if anchor_frame is not None:
+            frac = (anchor - self._view_start) / old_visible
+            frac = max(0.0, min(1.0, frac))
+        self.zoom = max(1.0, min(self._max_zoom(), float(zoom)))
+        self._view_start = anchor - frac * self._visible()
+        self._clamp_view()
+        self.update()
+
+    def reset_zoom(self):
+        self.zoom, self._view_start = 1.0, 0.0
+        self.update()
+
+    def _pan_to(self, start: float):
+        self._view_start = float(start)
+        self._clamp_view()
+        self.update()
+
+    def _zoom_notches(self, notches: int, x: float):
+        """Alt+滚轮：以鼠标所在帧为锚点伸缩（每格 ×1.25 / ÷1.25）。"""
+        if not notches:
+            return
+        frac = (float(x) - self._track_left()) / self._usable()
+        frac = max(0.0, min(1.0, frac))
+        anchor = self._view_start + frac * self._visible()
+        factor = 1.25 ** int(notches)
+        if self.zoom * factor <= 1.0001:
+            self.reset_zoom()
+            return
+        self.set_zoom(self.zoom * factor, anchor)
 
     def _handle_at(self, pos) -> str | None:
         """鼠标在入/出点小旗上就返回 ``"in"`` / ``"out"``。"""
@@ -190,22 +272,24 @@ class OverviewBar(QWidget):
         painter.drawRoundedRect(
             QRectF(left, y - TRACK_H / 2, right - left, TRACK_H), 3, 3)
 
-        # 已走的部分（光标左侧）
+        # 已走的部分（光标左侧，裁到可见窗口）
         if self.cursor_frame is not None and self.total > 0:
-            cx = self._x_for_frame(self.cursor_frame)
-            width = max(2.0, cx - left)
-            painter.setBrush(PROGRESS_COLOR)
-            painter.drawRoundedRect(
-                QRectF(left, y - TRACK_H / 2, width, TRACK_H), 3, 3)
+            cx = min(right, self._x_for_frame(self.cursor_frame))
+            if cx > left:
+                painter.setBrush(PROGRESS_COLOR)
+                painter.drawRoundedRect(
+                    QRectF(left, y - TRACK_H / 2, max(2.0, cx - left),
+                           TRACK_H), 3, 3)
 
-        # 入点/出点区间
+        # 入点/出点区间（只画可见那段）
         if self.in_frame is not None and self.out_frame is not None:
             lo, hi = sorted((self.in_frame, self.out_frame))
-            x1 = self._x_for_frame(lo)
-            x2 = self._x_for_frame(hi)
-            painter.setBrush(RANGE_FILL)
-            painter.drawRoundedRect(
-                QRectF(x1, y - TRACK_H / 2, max(2.0, x2 - x1), TRACK_H), 3, 3)
+            x1 = max(left, self._x_for_frame(lo))
+            x2 = min(right, self._x_for_frame(hi))
+            if x2 >= x1:
+                painter.setBrush(RANGE_FILL)
+                painter.drawRoundedRect(
+                    QRectF(x1, y - TRACK_H / 2, max(2.0, x2 - x1), TRACK_H), 3, 3)
 
         # 片段标记（轨道上方一条细带，两端各一个小刻度）
         for start, end, _name in self._segments:
@@ -213,6 +297,9 @@ class OverviewBar(QWidget):
             x2 = self._x_for_frame(end * self.fps)
             if x2 < x1:
                 x1, x2 = x2, x1
+            if x2 < left or x1 > right:
+                continue
+            x1, x2 = max(left, x1), min(right, x2)
             painter.setBrush(SEG_COLOR)
             painter.drawRoundedRect(
                 QRectF(x1, y - 11, max(3.0, x2 - x1), 3), 1.5, 1.5)
@@ -222,34 +309,57 @@ class OverviewBar(QWidget):
         # M 键标记：轨道上方绿色短竖线（单点，不和片段/入出点混）
         for frame in self.markers:
             x = self._x_for_frame(frame)
+            if not (left - 1 <= x <= right + 1):
+                continue
             painter.setPen(QPen(MARKER_COLOR, 2))
             painter.drawLine(QPointF(x, y - 7), QPointF(x, y - 3))
 
-        # 两端小旗
+        # 两端小旗（不在窗口里就不画，免得跑到留白上）
         if self.in_frame is not None:
-            self._paint_flag(painter, self._x_for_frame(self.in_frame),
-                             "in", self._hover == "in" or self._drag == "in")
+            x = self._x_for_frame(self.in_frame)
+            if left - 6 <= x <= right + 6:
+                self._paint_flag(painter, x, "in",
+                                 self._hover == "in" or self._drag == "in")
         if self.out_frame is not None:
-            self._paint_flag(painter, self._x_for_frame(self.out_frame),
-                             "out", self._hover == "out" or self._drag == "out")
+            x = self._x_for_frame(self.out_frame)
+            if left - 6 <= x <= right + 6:
+                self._paint_flag(painter, x, "out",
+                                 self._hover == "out" or self._drag == "out")
 
-        # 光标：竖线 + 小圆点
+        # 放大后：窗口两端的小箭头，提示「两边还有内容（滚轮平移）」
+        if self.zoom > 1.0:
+            painter.setPen(QPen(QColor(DIM), 1.5))
+            start, end = self.visible_range()
+            if start > 0.5:
+                painter.drawPolyline(QPolygonF([
+                    QPointF(left - 11, y - 4), QPointF(left - 7, y),
+                    QPointF(left - 11, y + 4)]))
+            if end < self._span() - 0.5:
+                painter.drawPolyline(QPolygonF([
+                    QPointF(right + 11, y - 4), QPointF(right + 7, y),
+                    QPointF(right + 11, y + 4)]))
+
+        # 光标：竖线 + 小圆点（只在窗口里才画）
         if self.cursor_frame is not None and self.total > 0:
             cx = self._x_for_frame(self.cursor_frame)
-            painter.setPen(QPen(CURSOR_COLOR, 1.5))
-            painter.drawLine(QPointF(cx, y - 12), QPointF(cx, y + 7))
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(CURSOR_COLOR)
-            painter.drawEllipse(QPointF(cx, y), 4.0, 4.0)
+            if left - 1 <= cx <= right + 1:
+                painter.setPen(QPen(CURSOR_COLOR, 1.5))
+                painter.drawLine(QPointF(cx, y - 12), QPointF(cx, y + 7))
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(CURSOR_COLOR)
+                painter.drawEllipse(QPointF(cx, y), 4.0, 4.0)
 
         # 底部时间：左「总进度」，右「当前 / 总长」
         font = painter.font()
         font.setPointSizeF(8.0)
         painter.setFont(font)
         painter.setPen(QPen(QColor(DIM), 1))
+        label = "总进度"
+        if self.zoom > 1.0:
+            label = f"总进度 ×{self.zoom:.1f}"
         if self.width() >= 520:
-            painter.drawText(QRectF(left, self.height() - 13, 80, 12),
-                             Qt.AlignLeft | Qt.AlignVCenter, "总进度")
+            painter.drawText(QRectF(left, self.height() - 13, 120, 12),
+                             Qt.AlignLeft | Qt.AlignVCenter, label)
         if self.total > 0:
             current = (self.cursor_frame or 0) / self.fps
             total_s = max(0, self.total - 1) / self.fps
@@ -277,15 +387,47 @@ class OverviewBar(QWidget):
         painter.drawPolygon(QPolygonF(points))
 
     # ------------------------------------------------------------------ 鼠标
+    @staticmethod
+    def _notches(event) -> int:
+        """滚轮增量 → 「几格」：普通鼠标 120/格，高精度滚轮 / 横向滚动 40/格。"""
+        angle = event.angleDelta()
+        amount = angle.y() or angle.x()
+        unit = 120
+        if not amount:
+            pixels = event.pixelDelta()
+            amount = pixels.y() or pixels.x()
+            unit = 40
+        if not amount:
+            return 0
+        count = int(round(abs(amount) / unit))
+        if count < 1:
+            return 0
+        return count if amount > 0 else -count
+
     def wheelEvent(self, event):              # noqa: N802
-        """Alt+滚轮缩略图缩放（和墙上时间轴同一套）。"""
+        """Alt+滚轮伸缩时间轴；放大后用普通滚轮左右平移。"""
+        if not self._notches(event):
+            super().wheelEvent(event)
+            return
+        notches = self._notches(event)
         if event.modifiers() & Qt.AltModifier:
-            delta = event.angleDelta().y()
-            if delta:
-                self.zoomRequested.emit(1 if delta > 0 else -1)
-                event.accept()
-                return
+            self._zoom_notches(notches, event.position().x())
+            event.accept()
+            return
+        if self.zoom > 1.0:
+            # 放大后：滚轮左右平移（向上 = 往左），不用去够滚动条
+            self._pan_to(self._view_start - notches * self._visible() * 0.1)
+            event.accept()
+            return
         super().wheelEvent(event)
+
+    def mouseDoubleClickEvent(self, event):   # noqa: N802
+        """双击总进度条 = 缩放到整段。"""
+        if event.button() == Qt.LeftButton and self.zoom > 1.0:
+            self.reset_zoom()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
 
     def mousePressEvent(self, event):         # noqa: N802
         if event.button() != Qt.LeftButton:
@@ -370,6 +512,11 @@ class OverviewBar(QWidget):
             return
         frame = self._frame_at_x(pos.x())
         lines = [f"第 {frame} 帧 · {fmt_tc(frame / self.fps)}"]
+        if self.zoom > 1.0:
+            start, end = self.visible_range()
+            lines.append(f"时间轴 ×{self.zoom:.1f}：{fmt_tc(start / self.fps)} → "
+                         f"{fmt_tc(end / self.fps)}")
+            lines.append("滚轮左右平移 · 双击回到整段")
         if self.in_frame is not None and self.out_frame is not None:
             lo, hi = sorted((self.in_frame, self.out_frame))
             if lo <= frame <= hi:
@@ -419,6 +566,11 @@ class OverviewBar(QWidget):
             act_jump = menu.addAction(f"选中片段 #{index + 1}")
         menu.addSeparator()
         act_seek = menu.addAction("光标跳到这里")
+        menu.addSeparator()
+        act_zin = menu.addAction("时间轴放大（也可以 Alt+滚轮向上）")
+        act_zout = menu.addAction("时间轴缩小（也可以 Alt+滚轮向下）")
+        act_zfit = menu.addAction("显示整段（双击时间轴）")
+        act_zfit.setEnabled(self.zoom > 1.0)
         chosen = menu.exec(event.globalPos())
         if chosen is act_in:
             self.setInRequested.emit(frame)
@@ -436,6 +588,12 @@ class OverviewBar(QWidget):
             self.segmentActivated.emit(index)
         elif chosen is act_seek:
             self.seekRequested.emit(frame)
+        elif chosen is act_zin:
+            self._zoom_notches(1, pos.x())
+        elif chosen is act_zout:
+            self._zoom_notches(-1, pos.x())
+        elif chosen is act_zfit:
+            self.reset_zoom()
 
     # ------------------------------------------------------------------ 其它
     def sizeHint(self) -> QSize:              # noqa: N802

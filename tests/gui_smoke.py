@@ -582,14 +582,69 @@ def main() -> int:
         check("ctrl+wheel no longer zooms", page.display_side == before_ctrl,
               f"{before_ctrl} -> {page.display_side}")
         page.set_display_side(before_side)
-        before_bar = page.display_side
+        check("bottom bar starts fit", bar.zoom == 1.0, str(bar.zoom))
+        side_now = page.display_side
         event = QWheelEvent(QPointF(20, 20), QPointF(20, 20),
                             QPoint(0, 0), QPoint(0, 120), Qt.NoButton,
                             Qt.AltModifier, Qt.NoScrollPhase, False)
         bar.wheelEvent(event)
         app.processEvents()
-        check("alt+wheel on bottom bar zooms", page.display_side > before_bar,
-              f"{before_bar} -> {page.display_side}")
+        check("alt+wheel on bottom bar stretches timeline", bar.zoom > 1.0,
+              f"zoom={bar.zoom}")
+        check("bottom bar zoom leaves thumbnails alone",
+              page.display_side == side_now,
+              f"{side_now} -> {page.display_side}")
+        check("zoomed bar roundtrips frames", all(
+            abs(bar.frame_at(bar._x_for_frame(f)) - f) <= 1
+            for f in (int(bar._view_start) + 1,
+                      bar._view_start + bar._visible() / 2)),
+            f"zoom={bar.zoom} start={bar._view_start:.1f}")
+        x_anchor = bar.width() * 0.25
+        frame_before = bar.frame_at(x_anchor)
+        for _ in range(2):
+            event = QWheelEvent(QPointF(x_anchor, 24), QPointF(x_anchor, 24),
+                                QPoint(0, 0), QPoint(0, 120), Qt.NoButton,
+                                Qt.AltModifier, Qt.NoScrollPhase, False)
+            bar.wheelEvent(event)
+            app.processEvents()
+        check("bar zoom keeps the frame under the cursor",
+              abs(bar.frame_at(x_anchor) - frame_before) <= 2,
+              f"{frame_before} -> {bar.frame_at(x_anchor)} zoom={bar.zoom:.2f}")
+        start_before = bar._view_start
+        event = QWheelEvent(QPointF(100, 24), QPointF(100, 24),
+                            QPoint(0, 0), QPoint(0, 120), Qt.NoButton,
+                            Qt.NoModifier, Qt.NoScrollPhase, False)
+        bar.wheelEvent(event)
+        app.processEvents()
+        check("plain wheel pans a zoomed bar", bar._view_start != start_before,
+              f"{start_before:.1f} -> {bar._view_start:.1f}")
+        bar.reset_zoom()
+        check("bar zoom resets to fit",
+              bar.zoom == 1.0 and bar._view_start == 0.0,
+              f"{bar.zoom} @ {bar._view_start}")
+        page.set_display_side(before_side)
+
+        # 可滚动的大图墙：Alt+滚轮不要把位置甩走（锚点钉在鼠标那一行）
+        page.set_display_side(320)
+        app.processEvents()
+        vbar = page.view.verticalScrollBar()
+        if vbar.maximum() > 0:
+            vbar.setValue(vbar.maximum() // 2)
+            app.processEvents()
+            top_before = page.view._first_visible()
+            spot = QPoint(page.view.viewport().width() // 2,
+                          page.view.viewport().height() // 2)
+            event = QWheelEvent(QPointF(spot), QPointF(spot),
+                                QPoint(0, 0), QPoint(0, -120), Qt.NoButton,
+                                Qt.AltModifier, Qt.NoScrollPhase, False)
+            page.view.wheelEvent(event)
+            app.processEvents()
+            top_after = page.view._first_visible()
+            check("alt+wheel keeps the wall in place",
+                  abs(top_after - top_before) <= 4,
+                  f"top {top_before} -> {top_after}")
+        else:
+            print("SKIP  alt+wheel keeps the wall in place  (内容不足一屏)")
         page.set_display_side(before_side)
         page.save_state()
         saved = page._read_state()

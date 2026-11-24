@@ -11,7 +11,9 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QPoint, Qt, Signal
+import math
+
+from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPen, QPolygon
 from PySide6.QtWidgets import QListView
 
@@ -25,6 +27,10 @@ MAJOR_COLOR = QColor("#5E6879")
 RANGE_COLOR = QColor("#668CFF")
 CURSOR_COLOR = QColor("#E5B65C")
 MARKER_COLOR = QColor("#45C995")
+LANE_BG = QColor("#141922")        # 工具带底色
+LANE_TOP = QColor("#3C4456")       # 上界标记（工具带上沿）
+FRAME_TICK = QColor("#39414F")     # 每帧一根细竖线
+FRAME_TICK_H = 4                   # 细竖线高度
 
 HANDLE_HALF_W = 8      # 手柄命中宽度（左右各 8px）
 HANDLE_TOL_Y = 9       # 垂直命中容差
@@ -59,6 +65,9 @@ class WallView(QListView):
         self._press_frame: int | None = None
         self._press_seek: int | None = None
         self._press_lane = False
+        self._lane_scrub = False        # 在窄时间轴上拖播放头
+        self._lane_bucket: list[int] | None = None
+        self._lane_rects: list = []
         self._last_frame: int | None = None
         self._boxing = False
         self._started = False
@@ -193,81 +202,116 @@ class WallView(QListView):
         return rows
 
     # ---------------- 几何：帧 <-> x ----------------
+    def _segment(self, bucket, rects, n):
+        """第 n 格的 ``(帧下界, 帧上界, 左边界, 右边界)``（上下界都是含的）。"""
+        timeline = self.timeline
+        index = bucket[n]
+        lo = float(timeline.frame_at(index))
+        hi = float(timeline.span(index)[1])
+        rect = rects[n]
+        return lo, hi, float(rect.left()), float(rect.right())
+
+    # ---------------- 帧 <-> x（整行一条线性映射，唯一口径） ----------------
+    def _row_span(self, bucket, rects):
+        """这一行覆盖的 ``(起帧, 止帧, 左边界 x, 右边界 x)``。"""
+        timeline = self.timeline
+        lo = float(timeline.frame_at(bucket[0]))
+        hi = float(timeline.span(bucket[-1])[1])
+        x0 = float(rects[0].left())
+        x1 = float(rects[-1].right())
+        return lo, hi, x0, x1
+
     def _x_for_frame(self, bucket, rects, frame: int) -> float | None:
-        """某一帧在这一行上的精确 x（可能落在两个格子中间）。"""
-        timeline = self.timeline
-        if not rects or timeline.count() <= 0:
+        """帧号 → 这一行上的精确 x（不在这一行的范围就返回 None）。"""
+        if not rects or self.timeline.count() <= 0:
             return None
-        centers = {item: r.center().x() for item, r in zip(bucket, rects)}
-        timeline = self.timeline
-        index, frac = timeline.index_of(frame)
-        cur = centers.get(index)
-        nxt = centers.get(index + 1)
-        if cur is None:
+        lo, hi, x0, x1 = self._row_span(bucket, rects)
+        if x1 <= x0:
+            return x0
+        tol = 0.5
+        if not (lo - tol <= float(frame) <= hi + tol):
             return None
-        if nxt is not None:
-            return cur + frac * (nxt - cur)
-        return float(cur)          # 这一行里没有下一格：钉在格心（避免画到行外）
+        t = (float(frame) - lo) / max(1e-9, hi - lo)
+        return x0 + max(0.0, min(1.0, t)) * (x1 - x0)
 
     def _frame_at_x(self, bucket, rects, x: float) -> int | None:
-        timeline = self.timeline
-        centers = [r.center().x() for r in rects]
-        if not centers or timeline.count() <= 0:
+        """这一行上的 x → 最近的帧号（点哪儿就是哪一帧）。"""
+        if not rects or self.timeline.count() <= 0:
             return None
-        if len(centers) == 1:
-            # 一行只有一格（按镜头只抽到 1 张，或最后一行只剩一张）：
-            # 按格内位置映射到这一格覆盖的帧范围，否则拖不动蓝旗
-            lo, hi = timeline.span(bucket[0])
-            rect = rects[0]
-            frac = (x - rect.left()) / max(1.0, float(rect.width()))
-            return int(round(lo + min(1.0, max(0.0, frac)) * max(0.0, hi - lo)))
-        if x <= centers[0]:
-            gap = max(1, centers[1] - centers[0])
-            f0, f1 = timeline.frame_at(bucket[0]), timeline.frame_at(bucket[1])
-            return int(round(f0 + (x - centers[0]) / gap * (f1 - f0)))
-        if x >= centers[-1]:
-            gap = max(1, centers[-1] - centers[-2])
-            f0, f1 = timeline.frame_at(bucket[-2]), timeline.frame_at(bucket[-1])
-            return int(round(f1 + (x - centers[-1]) / gap * (f1 - f0)))
-        for i in range(len(centers) - 1):
-            if centers[i] <= x <= centers[i + 1]:
-                gap = max(1, centers[i + 1] - centers[i])
-                f0, f1 = timeline.frame_at(bucket[i]), timeline.frame_at(bucket[i + 1])
-                return int(round(f0 + (x - centers[i]) / gap * (f1 - f0)))
-        return None
+        lo, hi, x0, x1 = self._row_span(bucket, rects)
+        if x1 <= x0:
+            return int(round(lo))
+        t = max(0.0, min(1.0, (x - x0) / (x1 - x0)))
+        return int(round(lo + t * (hi - lo)))
+
+
+    def _lane_band(self, rects):
+        """返回 ``(带顶, 带底, 基线 y)``；带高固定 ``LANE_H``。"""
+        bottom = max(r.bottom() for r in rects)
+        top = bottom - LANE_H
+        return top, bottom, top + LANE_H - 5
+
+    def _frame_lines(self, bucket, rects, left, right):
+        """每帧一根细竖线要画的 x 坐标（和点击/小旗同一口径，等距不漏帧）。"""
+        if not rects or self.timeline.count() <= 0:
+            return []
+        lo, hi, x0, x1 = self._row_span(bucket, rects)
+        span = hi - lo
+        width = x1 - x0
+        if span <= 0 or width <= 0:
+            return []
+        per_px = width / span
+        stride = 1
+        if per_px < 1.5:
+            stride = int(math.ceil(1.5 / max(per_px, 1e-6)))
+        out = []
+        frame = int(math.ceil(lo))
+        if stride > 1:
+            frame = int(math.ceil(frame / stride) * stride)
+        while frame <= hi:
+            t = (frame - lo) / span
+            x = x0 + t * width
+            if left - 1 <= x <= right + 1:
+                out.append(x)
+            frame += stride
+        return out
+
+
+    def pending_seek(self):
+        """按下还没松开时返回待定帧（用来压住 currentChanged 的重复 seek）。"""
+        return self._press_seek
 
     def _row_at_y(self, y: int):
-        """鼠标 y 落在哪一行的「时间轴窄带」上。"""
+        """y 落在哪一行的工具带里（整条带都算，不再是 ±几像素的细线）。"""
         for _top, bucket in self._visible_rows():
             rects = [self._row_rect(i) for i in bucket]
             rects = [r for r in rects if r is not None]
             if not rects:
                 continue
-            line_y = max(r.bottom() for r in rects) - LANE_H // 2
-            if abs(y - line_y) <= HANDLE_TOL_Y:
+            top, bottom, _base = self._lane_band(rects)
+            if top - 1 <= y <= bottom + 2:
                 return bucket, rects
         return None
 
     def _nearest_row(self, y: int):
-        """拖动用：离鼠标纵向最近的那一行（自动吸附，不要求对准窄带）。
-
-        `_row_at_y` 是「命中判定」（要精确落在窄带 ±9px 内）；
-        拖动时如果还要求精确，鼠标一旦离开窄带就再也拖不动了 ——
-        而纵向拖动本来就该一路跨行，所以这里取最近的一行。
-        """
+        """拖动用：离 y 最近的那一行（拖出工具带也不会断）。"""
         best = None
         for _top, bucket in self._visible_rows():
             rects = [self._row_rect(i) for i in bucket]
             rects = [r for r in rects if r is not None]
             if not rects:
                 continue
-            line_y = max(r.bottom() for r in rects) - LANE_H // 2
-            dist = abs(y - line_y)
+            top, bottom, _base = self._lane_band(rects)
+            if top <= y <= bottom:
+                dist = 0
+            else:
+                dist = min(abs(y - top), abs(y - bottom))
             if best is None or dist < best[0]:
                 best = (dist, bucket, rects)
         if best is None:
             return None
         return best[1], best[2]
+
 
     def _frame_in_row(self, bucket, rects, x: float) -> int | None:
         """把 x 换算成帧号，并限制在**这一行**的帧范围内。
@@ -308,22 +352,24 @@ class WallView(QListView):
         return self._frame_in_row(hit[0], hit[1], pos.x())
 
     def _frame_in_item(self, index, x: float) -> int | None:
-        """点在某张缩略图上：按它在格子里的横向比例换算帧号。
-
-        这比「取这一格的抽样帧」精确 —— 预览才能显示鼠标指的那一帧。
-        """
+        """点在某张缩略图上：按**整行线性映射**算最近帧（和工具带完全一致）。"""
         if index is None or not index.isValid():
             return None
+        row = int(index.row())
+        for _top, bucket in self._visible_rows():
+            if row not in bucket:
+                continue
+            rects = [self._row_rect(i) for i in bucket]
+            rects = [r for r in rects if r is not None]
+            if len(rects) == len(bucket) and rects:
+                return self._frame_at_x(bucket, rects, x)
+            break
         rect = self.visualRect(index)
         if rect.width() <= 0:
             return None
-        item = int(index.row())
-        lo = int(self.timeline.frame_at(item))
-        hi = int(self.timeline.span(item)[1])
-        if hi <= lo:
-            return lo
-        frac = (float(x) - rect.left()) / max(1.0, float(rect.width()))
-        frac = max(0.0, min(1.0, frac))
+        lo = float(self.timeline.frame_at(row))
+        hi = float(self.timeline.span(row)[1])
+        frac = max(0.0, min(1.0, (float(x) - rect.left()) / max(1.0, float(rect.width()))))
         return int(round(lo + frac * (hi - lo)))
 
     def box_selecting(self) -> bool:
@@ -373,10 +419,14 @@ class WallView(QListView):
         self._boxing = False
         self._started = False
         self._press_lane = False
+        self._lane_scrub = False
+        self._lane_bucket = None
+        self._lane_rects = []
         if event.button() == Qt.LeftButton:
-            kind = self._handle_at(event.position().toPoint())
+            pos = event.position().toPoint()
+            kind = self._handle_at(pos)
             if kind:
-                hit = self._row_at_y(event.position().toPoint().y())
+                hit = self._row_at_y(pos.y())
                 if hit is not None:
                     self._drag = kind
                     self._drag_bucket, self._drag_rects = hit
@@ -385,8 +435,6 @@ class WallView(QListView):
                     self.viewport().update()
                     event.accept()
                     return
-            # 不拖小旗 = 可能开始随意框选：先记住按下点的精确帧
-            pos = event.position().toPoint()
             marker = self.marker_at(pos)
             if marker is not None:
                 self.markerActivated.emit(marker)
@@ -394,9 +442,13 @@ class WallView(QListView):
                 return
             self._press_pos = pos
             self._press_frame = self._frame_at_pos(pos)
-            index = self.indexAt(pos)
             self._press_seek = self._press_frame
-            self._press_lane = self._row_at_y(pos.y()) is not None
+            lane = self._row_at_y(pos.y())
+            self._press_lane = lane is not None
+            if lane is not None:
+                # 压在工具带上：可以按住拖播放头
+                self._lane_bucket, self._lane_rects = lane
+            index = self.indexAt(pos)
             if index.isValid() and not self._press_lane:
                 fine = self._frame_in_item(index, pos.x())
                 if fine is not None:
@@ -406,7 +458,7 @@ class WallView(QListView):
     def mouseMoveEvent(self, event):
         pos = event.position().toPoint()
         if self._drag:
-            # 横竖都能拖：纵向自动吸附到最近的那一行，横向决定这一行里的帧号
+            # 拖入点/出点：跨行也不会断（取最近的一行）
             hit = self._nearest_row(pos.y())
             if hit is None:
                 event.accept()
@@ -416,6 +468,24 @@ class WallView(QListView):
             if frame is not None:
                 self.rangeMoved.emit(self._drag, frame)
             self.viewport().setCursor(Qt.ClosedHandCursor)
+            event.accept()
+            return
+        if self._press_pos is not None and self._press_lane:
+            # 工具带上拖动 = 直接拖当前帧（不再画框选区间）
+            if not self._lane_scrub:
+                if (pos - self._press_pos).manhattanLength() < 2:
+                    return
+                self._lane_scrub = True
+                self.viewport().setCursor(Qt.ClosedHandCursor)
+            hit = self._nearest_row(pos.y())
+            if hit is not None:
+                self._lane_bucket, self._lane_rects = hit
+            if self._lane_bucket:
+                frame = self._frame_in_row(self._lane_bucket,
+                                           self._lane_rects, pos.x())
+                if frame is not None:
+                    self._last_frame = frame
+                    self.seekRequested.emit(int(frame))
             event.accept()
             return
         if self._press_pos is not None and self._press_frame is not None:
@@ -435,7 +505,6 @@ class WallView(QListView):
             self._hover = kind
             self.viewport().setCursor(Qt.SizeHorCursor if kind else Qt.ArrowCursor)
             self.viewport().update()
-        # 继续交给 QListView：保留原生框选高亮和边缘自动滚动
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
@@ -449,9 +518,23 @@ class WallView(QListView):
             self.rangeEdited.emit(kind)
             event.accept()
             return
+        if self._lane_scrub:
+            self._lane_scrub = False
+            super().mouseReleaseEvent(event)      # 让 QListView 正常收尾
+            self._press_pos = None
+            self._press_frame = None
+            self._press_seek = None
+            self._last_frame = None
+            self._press_lane = False
+            self._lane_bucket = None
+            self._lane_rects = []
+            self.viewport().setCursor(Qt.ArrowCursor)
+            self.viewport().update()
+            event.accept()
+            return
         had, start, end = self._boxing, self._press_frame, self._last_frame
         seek = self._press_seek
-        # 先让 QListView 收尾（此时 _boxing 仍为 True，TrackPage 会忽略它的多选信号）
+        # 交给 QListView 收尾（_press_seek 还没清，能压住重复 seek）
         super().mouseReleaseEvent(event)
         self._boxing = False
         self._press_pos = None
@@ -459,14 +542,14 @@ class WallView(QListView):
         self._press_seek = None
         self._last_frame = None
         self._press_lane = False
+        self._lane_bucket = None
+        self._lane_rects = []
         if had and start is not None and end is not None:
-            # 最后再发一次精确区间：按下点 → 松手点，覆盖原生「整格」多选
             self.rangeSelected.emit(start, end)
             event.accept()
             return
         if seek is not None and not (
                 event.modifiers() & (Qt.ControlModifier | Qt.ShiftModifier)):
-            # 单击（缩略图或时间轴）：把当前帧精确落到鼠标那一帧 → 预览显示这一帧
             self.seekRequested.emit(int(seek))
             event.accept()
             return
@@ -491,12 +574,24 @@ class WallView(QListView):
     def _paint_row(self, painter: QPainter, bucket: list[int]):
         rects = [self._row_rect(i) for i in bucket]
         rects = [r for r in rects if r is not None]
-        if len(rects) < 2:
+        if not rects:
             return
         left = min(r.left() for r in rects)
         right = max(r.right() for r in rects)
         bottom = max(r.bottom() for r in rects)
-        y = bottom - LANE_H // 2        # 窄带中线
+        top = bottom - LANE_H
+        y = top + LANE_H - 5        # 窄带中线
+
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(LANE_BG)
+        painter.drawRect(QRectF(left, top, right - left, bottom - top + 1))
+        painter.setPen(QPen(LANE_TOP, 1))
+        painter.drawLine(QPointF(left, top + 0.5), QPointF(right, top + 0.5))
+
+        # 每帧一根细竖线
+        painter.setPen(QPen(FRAME_TICK, 1))
+        for fx in self._frame_lines(bucket, rects, left, right):
+            painter.drawLine(QPointF(fx, y + 1), QPointF(fx, y + 1 + FRAME_TICK_H))
 
         painter.setPen(QPen(LINE_COLOR, 1))
         painter.drawLine(left, y, right, y)
@@ -562,22 +657,18 @@ class WallView(QListView):
                 hot = self._hover == "out" or self._drag == "out"
                 self._paint_flag(painter, x, y, "out", hot, active_color)
 
-        # 当前帧：精确位置的小三角
+        # 当前帧：精确位置的小三角（和点击/刻录用同一套映射）
         if self.cursor_frame is not None:
-            index, frac = self.timeline.index_of(self.cursor_frame)
-            offsets = {idx: rects[n] for n, idx in enumerate(bucket) if n < len(rects)}
-            if index in offsets:
-                x = offsets[index].center().x()
-                nxt = offsets.get(index + 1)
-                if nxt is not None:
-                    x += frac * (nxt.center().x() - x)
+            x = self._x_for_frame(bucket, rects, self.cursor_frame)
+            if x is not None and left - 6 <= x <= right + 6:
+                xi = int(round(x))
                 painter.setPen(QPen(CURSOR_COLOR, 1))
-                painter.drawLine(int(x), y + 2, int(x), y - 2)
+                painter.drawLine(xi, y + 2, xi, y - 2)
                 painter.setBrush(CURSOR_COLOR)
                 painter.setPen(Qt.NoPen)
-                painter.drawPolygon(QPolygon([QPoint(int(x) - 4, y + 2),
-                                              QPoint(int(x) + 4, y + 2),
-                                              QPoint(int(x), y + 7)]))
+                painter.drawPolygon(QPolygon([QPoint(xi - 4, y + 2),
+                                              QPoint(xi + 4, y + 2),
+                                              QPoint(xi, y + 7)]))
 
     @staticmethod
     def _paint_flag(painter: QPainter, x: float, y: int, kind: str,

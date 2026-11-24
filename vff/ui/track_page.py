@@ -97,6 +97,9 @@ class TrackPage(QWidget):
         self._new_range_pending = False
         self._active_segment = -1        # 片段列表里选中的那一条
         self._delete_target = "range"    # Delete/退格 先删谁：range / segment
+        self._undo_stack: list[dict] = []   # Ctrl+Z
+        self._redo_stack: list[dict] = []   # Ctrl+Shift+Z
+        self._drag_pushed = False           # 一次拖动只记一条撤销
         self.markers: list[int] = []       # M 键标记（单点，和入点/出点无关）
         self.segments: list[dict] = []
         self.exports: list[dict] = []      # 已导出的片段文件（打开 / 打开文件夹用）
@@ -210,31 +213,31 @@ class TrackPage(QWidget):
         self.side.openExportRequested.connect(self.open_export)
         self.side.folderExportRequested.connect(self.reveal_export)
 
-        # 图墙 | 右侧面板 之间可拖拽（宽度由 MainWindow 记住）
+        self.overview = OverviewBar()
+        self.overview.set_media(self.info.frames or 0, self.info.fps or 25.0)
+
+        # 左列：图墙（上） + 总进度条（下），中间可拖（**上边框可以拖高度**）
+        self.vsplit = QSplitter(Qt.Vertical)
+        self.vsplit.setChildrenCollapsible(False)
+        self.vsplit.setHandleWidth(6)
+        self.vsplit.addWidget(self.view)
+        self.vsplit.addWidget(self.overview)
+        self.vsplit.setStretchFactor(0, 1)
+        self.vsplit.setStretchFactor(1, 0)
+        self.vsplit.setMinimumHeight(180)
+        self.vsplit.setSizes([max(240, 720), int(self._overview_height)])
+
+        # 左列 | 右侧卡片：**卡片拉满整个高度**，进度条只到卡片左边为止
         self.split = QSplitter(Qt.Horizontal)
         self.split.setChildrenCollapsible(False)
         self.split.setHandleWidth(8)
-        self.split.addWidget(self.view)
+        self.split.addWidget(self.vsplit)
         self.split.addWidget(self.side)
         self.split.setStretchFactor(0, 1)
         self.split.setStretchFactor(1, 0)
         self.split.setSizes([900, 372])
+        root.addWidget(self.split, 1)
 
-        # 底部总进度条：整段视频一条，和墙上的时间轴共用同一份入点/出点/光标/片段
-        self.overview = OverviewBar()
-        self.overview.set_media(self.info.frames or 0, self.info.fps or 25.0)
-
-        # 图墙 / 侧栏 与 总进度条 之间也能拖：**拖上边框就能把这一整块拉高**
-        self.vsplit = QSplitter(Qt.Vertical)
-        self.vsplit.setChildrenCollapsible(False)
-        self.vsplit.setHandleWidth(6)
-        self.vsplit.addWidget(self.split)
-        self.vsplit.addWidget(self.overview)
-        self.vsplit.setStretchFactor(0, 1)
-        self.vsplit.setStretchFactor(1, 0)
-        self.split.setMinimumHeight(180)
-        self.vsplit.setSizes([max(240, 720), int(self._overview_height)])
-        root.addWidget(self.vsplit, 1)
         self.vsplit.splitterMoved.connect(self._on_overview_resized)
 
         self.overview.seekRequested.connect(self._seek_overview)
@@ -246,6 +249,10 @@ class TrackPage(QWidget):
         self.overview.clearRangeRequested.connect(self.clear_range)
         self.overview.addSegmentRequested.connect(self.add_segment)
         self.overview.segmentActivated.connect(self.select_segment)
+        self.overview.rangeActivated.connect(self._activate_range_from_bar)
+        self.overview.focusRequested.connect(self._focus_wall)
+        self.overview.bandsMoved.connect(self._on_bands_moved)
+        self.overview.segmentRemoveRequested.connect(self.remove_segment)
         self.overview.markerActivated.connect(self._goto_marker_frame)
         self.overview.addMarkerRequested.connect(self.add_marker)
         self.overview.removeMarkerRequested.connect(self.remove_marker)
@@ -278,7 +285,18 @@ class TrackPage(QWidget):
             sc.activated.connect(fn)
             return sc
 
-        self._sc = [
+        self._sc = []
+        # 撤销 / 重做：整页可用（QLineEdit 自己会拦下文字撤销）
+        for seq, fn in (("Ctrl+Z", self.undo),
+                        ("Ctrl+Shift+Z", self.redo),
+                        ("Ctrl+Y", self.redo),
+                        ("Ctrl+A", self._select_all_bands)):
+            sc = QShortcut(QKeySequence(seq), self)
+            sc.setContext(Qt.WidgetWithChildrenShortcut)
+            sc.activated.connect(fn)
+            self._sc.append(sc)
+
+        self._sc += [
             bind("Left", lambda: self.step_frames(-1)),
             bind("Right", lambda: self.step_frames(1)),
             bind("Shift+Left", lambda: self.step_seconds(-1)),
@@ -291,6 +309,8 @@ class TrackPage(QWidget):
             bind("O", lambda: self.set_out_point()),
             bind("A", self.add_segment),
             bind("M", self.add_marker),
+            bind("Return", self._add_selected_to_queue),
+            bind("Enter", self._add_selected_to_queue),
             bind("Shift+M", lambda: self.goto_marker(1)),
             bind("Ctrl+Shift+M", lambda: self.goto_marker(-1)),
             bind("=", lambda: self._on_wheel_zoom(1)),
@@ -996,6 +1016,10 @@ class TrackPage(QWidget):
     def _on_current(self, cur, _prev):
         if self._syncing or not (cur and cur.isValid()):
             return
+        # 正在按下的这一次点击自己会 seek（精确到点击位置）——
+        # 这里再拿「这一格的锚帧」跳一次就会看到当前帧乱跳
+        if self.view.pending_seek() is not None:
+            return
         if self.view.box_selecting():
             # 随意框选过程中，原生多选会把 current 挪来挪去；以按下点/当前点为准
             return
@@ -1316,6 +1340,84 @@ class TrackPage(QWidget):
                 self._update_card()
                 self._save_range_state()
 
+    def _on_bands_moved(self, moves):
+        """底部拖动结束：改横坐标（时间）+ 纵坐标（层）。"""
+        if not moves:
+            return
+        fps = self._fps()
+        self._push_undo()
+        changed = 0
+        for kind, item, lo, hi, lane in moves:
+            lo, hi = int(lo), int(hi)
+            if hi <= lo:
+                continue
+            item["lane"] = int(lane)
+            if kind == "range":
+                item["in"], item["out"] = lo, hi
+                if item is self._range_at(self.active_range):
+                    self.in_frame, self.out_frame = lo, hi
+            else:
+                item["t_in"], item["t_end"] = lo / fps, hi / fps
+            changed += 1
+        if changed:
+            self._refresh_segments()
+            self._refresh_range()
+            self._save_range_state()
+            self.side.set_export_text(f"已移动 {changed} 条")
+
+    def _focus_wall(self):
+        """底部面板被点了一下：把键盘焦点还给图墙，别让快捷键失灵。"""
+        try:
+            self.view.setFocus(Qt.MouseFocusReason)
+        except (AttributeError, RuntimeError):
+            pass
+
+    def _select_all_bands(self):
+        """Ctrl+A：选中底部片段层里的所有条（不是「全选帧」）。"""
+        count = self.overview.select_all()
+        self._focus_wall()
+        self.side.set_export_text(
+            f"已全选底部 {count} 条（回车加入导出队列，Delete 删除选中的区间）")
+
+    def _add_selected_to_queue(self):
+        """回车：把底部选中的条加入片段列表（= 导出队列）。"""
+        picked = self.overview.selected_bands()
+        spans = sorted({(int(b["lo"]), int(b["hi"])) for b in picked
+                        if b["kind"] == "range"
+                        and int(b["hi"]) > int(b["lo"])})
+        if not spans:
+            if picked:
+                self.side.set_export_text(
+                    "选中的是队列里的片段（已在队列中，Delete 也删不掉）")
+            else:
+                self.side.set_export_text(
+                    "现在底部片段层没选中的条：先选要加入队列的，再按回车")
+            return 0
+        added = 0
+        for lo, hi in spans:
+            if self._queue_span(lo, hi):
+                added += 1
+        self._refresh_segments()
+        if added:
+            self._delete_target = "segment"
+            self.side.set_active_segment(self._active_segment)
+            self.side.set_export_text(
+                f"已把 {added} 段加入片段列表（导出队列，共 {len(self.segments)} 段）")
+        else:
+            self.side.set_export_text("选中的段已经在队列里了（没有重复添加）")
+        self.save_state()
+        return added
+
+    def _activate_range_from_bar(self, index: int):
+        """点底部彩色区间条：切当前段并跳到那一段开头。"""
+        rng = self._range_at(index)
+        if rng is None:
+            return
+        self._activate_range(index)
+        lo = rng.get("in")
+        if lo is not None:
+            self._set_cursor(int(lo), sync_wall=True)
+
     def _seek_overview(self, frame: int):
         """底部总进度条：点/拖只移动光标，不碰入点出点。"""
         self._stop_playback_if_playing()
@@ -1327,6 +1429,9 @@ class TrackPage(QWidget):
         if self._syncing:
             return
         self._stop_playback_if_playing()
+        if not self._drag_pushed:
+            self._push_undo()
+            self._drag_pushed = True
         self._ensure_range()
         lo, hi = sorted((int(start_frame), int(end_frame)))
         self.in_frame, self.out_frame = lo, hi
@@ -1341,6 +1446,7 @@ class TrackPage(QWidget):
 
     def _on_wall_range_selected(self, start_frame: int, end_frame: int):
         """随意框选松手：用两端精确帧定稿，覆盖原生「整格多选」的结果。"""
+        self._drag_pushed = False
         self._drag_tick.stop()
         self._drag_settle.stop()
         self._drag_frame = None
@@ -1366,10 +1472,8 @@ class TrackPage(QWidget):
             bar.set_media(int(self.info.frames or 0),
                           float(self.info.fps or 25.0))
             bar.set_state(self.cursor_frame, self.in_frame, self.out_frame)
-            bar.set_ranges(self.range_spans())
-            bar.set_segments([(float(s["t_in"]), float(s["t_end"]),
-                               str(s.get("name") or ""))
-                              for s in self.segments])
+            bar.set_ranges(self.ranges, active=self.active_range)
+            bar.set_segments(self.segments)
         except (RuntimeError, KeyError, TypeError, ValueError):
             pass
 
@@ -1401,12 +1505,14 @@ class TrackPage(QWidget):
         frame = max(0, min(total - 1, int(frame)))
         if frame in self.markers:
             # 同一个点再按一下 M = 取消这个标记
+            self._push_undo()
             self.markers.remove(frame)
             self._refresh_markers()
             self.side.set_export_text(
                 f"已取消第 {frame} 帧的标记（剩 {len(self.markers)} 个）")
             self._save_range_state()
             return
+        self._push_undo()
         self.markers.append(frame)
         self.markers.sort()
         self._refresh_markers()
@@ -1423,6 +1529,7 @@ class TrackPage(QWidget):
         if frame not in self.markers:
             self.side.set_export_text(f"第 {frame} 帧没有标记")
             return
+        self._push_undo()
         self.markers.remove(frame)
         self._refresh_markers()
         self.side.set_export_text(f"已删除第 {frame} 帧的标记")
@@ -1431,6 +1538,7 @@ class TrackPage(QWidget):
     def clear_markers(self):
         if not self.markers:
             return
+        self._push_undo()
         self.markers.clear()
         self._refresh_markers()
         self.side.set_export_text("已清除全部标记")
@@ -1460,6 +1568,65 @@ class TrackPage(QWidget):
         self._set_cursor(int(frame), sync_wall=True)
         self.side.set_export_text(
             f"标记：第 {int(frame)} 帧 · {fmt_tc(int(frame) / self._fps())}")
+
+    # ------------------------------------------------------- 撤销 / 重做
+    def _edit_snapshot(self) -> dict:
+        """这一刻可编辑的东西：区间、当前段、入出点、片段、标记。"""
+        return {
+            "ranges": [dict(r) for r in self.ranges],
+            "active_range": int(self.active_range),
+            "in_frame": self.in_frame,
+            "out_frame": self.out_frame,
+            "segments": [dict(x) for x in self.segments],
+            "markers": sorted(int(m) for m in self.markers),
+        }
+
+    def _push_undo(self):
+        """改动之前先记一笔（内容没变就不重复记）。"""
+        snap = self._edit_snapshot()
+        if self._undo_stack and self._undo_stack[-1] == snap:
+            return
+        self._undo_stack.append(snap)
+        if len(self._undo_stack) > 100:
+            self._undo_stack.pop(0)
+        self._redo_stack.clear()
+
+    def _restore_edit(self, snap: dict):
+        self.ranges = [dict(r) for r in snap.get("ranges") or []]
+        self.active_range = int(snap.get("active_range", -1))
+        if self.ranges and not (0 <= self.active_range < len(self.ranges)):
+            self.active_range = len(self.ranges) - 1
+        self.in_frame = snap.get("in_frame")
+        self.out_frame = snap.get("out_frame")
+        self.segments = [dict(x) for x in snap.get("segments") or []]
+        self.markers = sorted(int(m) for m in snap.get("markers") or [])
+        self._active_segment = min(self._active_segment, len(self.segments) - 1)
+        self._refresh_segments()
+        self._refresh_markers()
+        self._refresh_range()
+        self._save_range_state()
+
+    def undo(self) -> bool:
+        """Ctrl+Z"""
+        if not self._undo_stack:
+            self.side.set_export_text("没有可以撤回的改动")
+            return False
+        self._redo_stack.append(self._edit_snapshot())
+        self._restore_edit(self._undo_stack.pop())
+        self.overview.clear_selection()
+        self.side.set_export_text("已撤回（Ctrl+Shift+Z 重做）")
+        return True
+
+    def redo(self) -> bool:
+        """Ctrl+Shift+Z"""
+        if not self._redo_stack:
+            self.side.set_export_text("没有可以重做的改动")
+            return False
+        self._undo_stack.append(self._edit_snapshot())
+        self._restore_edit(self._redo_stack.pop())
+        self.overview.clear_selection()
+        self.side.set_export_text("已重做（Ctrl+Z 再撤回）")
+        return True
 
     # ------------------------------------------------------- 多段区间
     def _range_at(self, index: int) -> dict | None:
@@ -1531,6 +1698,7 @@ class TrackPage(QWidget):
         """删掉当前这一段（其它段保留）。返回是否真的删了。"""
         if self._range_at(self.active_range) is None:
             return False
+        self._push_undo()
         self.ranges.pop(self.active_range)
         if self.ranges:
             self.active_range = min(self.active_range, len(self.ranges) - 1)
@@ -1562,6 +1730,7 @@ class TrackPage(QWidget):
         self._set_cursor(int(frame), sync_wall=True)
 
     def set_in_point(self, frame: int | None = None):
+        self._push_undo()
         self._stop_playback_if_playing()
         frame = self.cursor_frame if frame is None else frame
         if frame is None:
@@ -1578,6 +1747,7 @@ class TrackPage(QWidget):
         self._save_range_state()
 
     def set_out_point(self, frame: int | None = None):
+        self._push_undo()
         self._stop_playback_if_playing()
         frame = self.cursor_frame if frame is None else frame
         if frame is None:
@@ -1604,6 +1774,7 @@ class TrackPage(QWidget):
 
     def clear_range(self):
         """清掉所有区间（老的「清除入点/出点」语义）。"""
+        self._push_undo()
         self.in_frame = None
         self.out_frame = None
         self.ranges = []
@@ -1619,6 +1790,9 @@ class TrackPage(QWidget):
         移动时先出墙上的缩略图（毫秒级），停手 140ms 再补精确帧。
         """
         self._stop_playback_if_playing()
+        if not self._drag_pushed:
+            self._push_undo()
+            self._drag_pushed = True
         total = max(1, int(self.info.frames or 0))
         frame = max(0, min(total - 1, int(frame)))
         if kind == "in":
@@ -1640,6 +1814,7 @@ class TrackPage(QWidget):
 
     def _end_range_drag(self, kind: str):
         """松手后把光标落到刚拖的那一端，让预览变成精确帧。"""
+        self._drag_pushed = False
         self._drag_tick.stop()
         self._drag_settle.stop()
         self._drag_frame = None
@@ -1676,6 +1851,7 @@ class TrackPage(QWidget):
     def clear_segments(self):
         if not self.segments:
             return
+        self._push_undo()
         self.segments.clear()
         self._refresh_segments()
         self.side.set_export_text("已清空片段列表")
@@ -1772,6 +1948,7 @@ class TrackPage(QWidget):
 
     def _collect_ranges_to_segments(self):
         """把画好的每一段都收进片段列表（重复的跳过，不导出文件）。"""
+        self._push_undo()
         fps = self._fps()
         added = 0
         for lo, hi, *_rest in self.range_spans():
@@ -1795,31 +1972,67 @@ class TrackPage(QWidget):
         self.save_state()
         return added
 
+    def _queue_span(self, lo: int, hi: int) -> bool:
+        """把 [lo, hi] 帧加入片段队列；已经在队列里就不再重复加（返回是否新增）。"""
+        fps = self._fps()
+        t_in, t_end = int(lo) / fps, int(hi) / fps
+        for index, seg in enumerate(self.segments):
+            if (abs(seg["t_in"] - t_in) < 1e-6
+                    and abs(seg["t_end"] - t_end) < 1e-6):
+                self._active_segment = index
+                self.side.set_active_segment(index)
+                return False
+        self.segments.append({"t_in": t_in, "t_end": t_end, "name": ""})
+        self._active_segment = len(self.segments) - 1
+        return True
+
     def add_segment(self):
+        """「＋ 加入 A」：优先加**选中的条**；没选才用当前入点/出点。
+
+        * 选中的是区间 → 就把它加入队列（已经在队列里则不重复加）；
+        * 选中的是队列里的片段 → 什么都不复制，只把它选中；
+        * 什么都没选 → 用当前入点/出点。
+        """
+        picked = self.overview.selected_bands()
+        spans = sorted({(int(b["lo"]), int(b["hi"])) for b in picked
+                        if b["kind"] == "range"
+                        and int(b["hi"]) > int(b["lo"])})
+        if spans:
+            self._push_undo()
+            added = 0
+            for lo, hi in spans:
+                if self._queue_span(lo, hi):
+                    added += 1
+            self._delete_target = "segment"
+            self._refresh_segments()
+            self.side.set_export_text(
+                f"已把选中的 {added} 段加入队列（共 {len(self.segments)} 段）"
+                if added else "选中的段已经在队列里了（没有重复添加）")
+            self.save_state()
+            return
+        if picked:
+            band = picked[0]
+            self._active_segment = int(band["index"])
+            self.side.set_active_segment(self._active_segment)
+            self.side.set_export_text("选中的片段已经在队列里了（不会复制）")
+            return
         if self.in_frame is None or self.out_frame is None \
                 or self.out_frame <= self.in_frame:
-            self.side.set_export_text("先设好入点/出点（I/O 或拖一段），再加入片段")
+            self.side.set_export_text("先设入点/出点（I/O 各按一次），再加片段")
             return
-        fps = self._fps()
-        item = {"t_in": self.in_frame / fps, "t_end": self.out_frame / fps,
-                "name": ""}
-        for existing in self.segments:
-            if (abs(existing["t_in"] - item["t_in"]) < 1e-6
-                    and abs(existing["t_end"] - item["t_end"]) < 1e-6):
-                self.side.set_export_text("这一段已经在列表里了")
-                return
-        self.segments.append(item)
-        self._active_segment = len(self.segments) - 1
+        self._push_undo()
+        added = self._queue_span(self.in_frame, self.out_frame)
         self._delete_target = "segment"
         self._refresh_segments()
-        self.side.set_active_segment(self._active_segment)
-        self.side.set_export_text(f"已加入片段 #{len(self.segments)}"
-                                f"（共 {len(self.segments)} 段）")
+        self.side.set_export_text(
+            f"已加入片段 #{len(self.segments)}（共 {len(self.segments)} 段）"
+            if added else "这一段已经在队列里了（已帮你选中它）")
         self.save_state()
 
     def remove_segment(self, index: int):
         if not (0 <= index < len(self.segments)):
             return
+        self._push_undo()
         self.segments.pop(index)
         if index < self._active_segment:
             self._active_segment -= 1
@@ -1837,13 +2050,54 @@ class TrackPage(QWidget):
         self.remove_segment(self._active_segment)
         return True
 
-    def _delete_selected(self):
-        """Delete / 退格：删上次点中的片段，或当前这一段区间。"""
-        if self._delete_target == "segment" and self.remove_active_segment():
-            return
-        if self.remove_active_range():
-            return
-        self.remove_active_segment()
+    def _delete_selected(self) -> int:
+        """Delete / 退格：删掉底部**选中的那些条**；没选中就什么都不删。"""
+        picked = set(self.overview.selection)
+        if not picked:
+            self.side.set_export_text(
+                "先在底部片段层点选（或框选）要删的区间，再按 Delete / 退格")
+            return 0
+        fps = self._fps()
+        range_keys = {(int(lo), int(hi)) for kind, lo, hi in picked
+                      if kind == "range"}
+        seg_keys = {(int(lo), int(hi)) for kind, lo, hi in picked
+                    if kind == "segment"}
+        if seg_keys:
+            # 队列里的片段是**锁定的**：Delete / 退格永远不删，
+            # 只能在片段条上右键「从导出队列删除」或去右侧片段列表删
+            self.side.set_export_text(
+                "选中的片段已锁定（Delete 删不掉），请右键片段条或到右侧片段列表删除")
+        if not range_keys:
+            return 0
+        removed = 0
+        self._push_undo()
+        if range_keys:
+            kept = []
+            for rng in self.ranges:
+                lo, hi = rng.get("in"), rng.get("out")
+                if lo is None or hi is None:
+                    kept.append(rng)
+                    continue
+                key = (int(min(lo, hi)), int(max(lo, hi)))
+                if key in range_keys:
+                    removed += 1
+                    continue
+                kept.append(rng)
+            self.ranges = kept
+            if self.ranges:
+                self.active_range = len(self.ranges) - 1
+                rng = self.ranges[self.active_range]
+                self.in_frame, self.out_frame = rng.get("in"), rng.get("out")
+            else:
+                self.active_range = -1
+                self.in_frame = self.out_frame = None
+        if removed:
+            self._refresh_segments()
+            self._refresh_range()
+            self.overview.clear_selection()
+            self._save_range_state()
+            self.side.set_export_text(f"已删除选中的 {removed} 条")
+        return removed
 
     def select_segment(self, index: int):
         if not (0 <= index < len(self.segments)):

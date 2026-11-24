@@ -495,6 +495,24 @@ def main() -> int:
               isinstance(page.vsplit, QSplitter)
               and page.vsplit.orientation() == Qt.Vertical,
               type(page.vsplit).__name__)
+        app.processEvents()
+        geo_bar, geo_side = bar.geometry(), page.side.geometry()
+        check("bottom bar stops at the side card",
+              geo_bar.right() <= geo_side.left(), f"{geo_bar} vs {geo_side}")
+        check("side card spans the full page height",
+              abs(geo_side.height() - page.split.height()) <= 2,
+              f"card={geo_side.height()} split={page.split.height()}")
+        img = page.side.image
+        inner = (page.side.p_preview.width()
+                 - page.side.p_preview.layout().contentsMargins().left()
+                 - page.side.p_preview.layout().contentsMargins().right())
+        check("preview fills the card inner width",
+              abs(img.width() - inner) <= 6, f"{img.width()} vs {inner}")
+        check("preview height follows the clip aspect",
+              abs(img.width() / max(1, img.height()) - page.info.width
+                  / max(1, page.info.height)) < 0.06,
+              f"{img.width()}x{img.height()} clip="
+              f"{page.info.width}x{page.info.height}")
         before_h = bar.height()
         page.set_overview_height(before_h + 40)
         app.processEvents()
@@ -607,12 +625,13 @@ def main() -> int:
         page.set_display_side(before_side)
         check("bottom bar starts fit", bar.zoom == 1.0, str(bar.zoom))
         side_now = page.display_side
-        event = QWheelEvent(QPointF(20, 20), QPointF(20, 20),
+        event = QWheelEvent(QPointF(20, bar.track_y()),
+                            QPointF(20, bar.track_y()),
                             QPoint(0, 0), QPoint(0, 120), Qt.NoButton,
-                            Qt.ControlModifier, Qt.NoScrollPhase, False)
+                            Qt.AltModifier, Qt.NoScrollPhase, False)
         bar.wheelEvent(event)
         app.processEvents()
-        check("ctrl+wheel on bottom bar stretches timeline", bar.zoom > 1.0,
+        check("alt+wheel on the bar zooms the timeline", bar.zoom > 1.0,
               f"zoom={bar.zoom}")
         check("bottom bar zoom leaves thumbnails alone",
               page.display_side == side_now,
@@ -625,23 +644,15 @@ def main() -> int:
         x_anchor = bar.width() * 0.25
         frame_before = bar.frame_at(x_anchor)
         for _ in range(2):
-            event = QWheelEvent(QPointF(x_anchor, 24), QPointF(x_anchor, 24),
+            event = QWheelEvent(QPointF(x_anchor, bar.track_y()),
+                                QPointF(x_anchor, bar.track_y()),
                                 QPoint(0, 0), QPoint(0, 120), Qt.NoButton,
-                                Qt.ControlModifier, Qt.NoScrollPhase, False)
+                                Qt.AltModifier, Qt.NoScrollPhase, False)
             bar.wheelEvent(event)
             app.processEvents()
         check("bar zoom keeps the frame under the cursor",
               abs(bar.frame_at(x_anchor) - frame_before) <= 2,
               f"{frame_before} -> {bar.frame_at(x_anchor)} zoom={bar.zoom:.2f}")
-        start_before = bar._view_start
-        event = QWheelEvent(QPointF(100, bar.track_y()),
-                            QPointF(100, bar.track_y()),
-                            QPoint(0, 0), QPoint(0, 120), Qt.NoButton,
-                            Qt.NoModifier, Qt.NoScrollPhase, False)
-        bar.wheelEvent(event)
-        app.processEvents()
-        check("plain wheel pans a zoomed bar", bar._view_start != start_before,
-              f"{start_before:.1f} -> {bar._view_start:.1f}")
         bar.reset_zoom()
         check("bar zoom resets to fit",
               bar.zoom == 1.0 and bar._view_start == 0.0,
@@ -662,36 +673,90 @@ def main() -> int:
         check("stack starts at bottom lane", bar.band_scroll == 0,
               str(bar.band_scroll))
         check("bands have real height",
-              bar.band_height() >= 8 and bar.band_gap() == 4,
+              bar.band_height() >= 8 and bar.band_gap() == 2,
               f"band={bar.band_height()} gap={bar.band_gap()}")
         h_before = bar.band_height()
         gap_before = bar.band_gap()
         panel_before = bar.height()
-        event = QWheelEvent(QPointF(bar.width() * 0.5, 20),
-                            QPointF(bar.width() * 0.5, 20),
+        # Shift+滚轮：所有条一起加高（缝隙固定 2px、面板高度不动）
+        event = QWheelEvent(QPointF(bar.width() * 0.5, bar.track_y()),
+                            QPointF(bar.width() * 0.5, bar.track_y()),
                             QPoint(0, 0), QPoint(0, 120), Qt.NoButton,
-                            Qt.AltModifier, Qt.NoScrollPhase, False)
+                            Qt.ShiftModifier, Qt.NoScrollPhase, False)
         bar.wheelEvent(event)
         app.processEvents()
-        check("alt+wheel makes segment bars taller",
+        check("shift+wheel makes all bars taller",
               bar.band_height() > h_before,
               f"{h_before} -> {bar.band_height()}")
-        check("gap stays fixed at 4px", bar.band_gap() == gap_before == 4,
+        check("gap stays fixed at 2px", bar.band_gap() == gap_before == 2,
               f"{gap_before} -> {bar.band_gap()}")
-        check("alt+wheel leaves the panel height alone",
+        check("shift+wheel leaves the panel height alone",
               bar.height() == panel_before,
               f"{panel_before} -> {bar.height()}")
-        check("alt+wheel does not zoom the bar", bar.zoom == 1.0, str(bar.zoom))
+        check("shift+wheel does not zoom the bar", bar.zoom == 1.0, str(bar.zoom))
         bar.scale_bands(-1)
         check("lanes scale back", bar.band_height() == h_before,
               f"{h_before} -> {bar.band_height()}")
-        check("plain wheel scrolls lanes", bar.scroll_bands(1)
+
+        # Alt+滚轮压在具体某一条上：只调那一条的高度（单轨垂直伸缩）
+        first_band = next((b for b in bar._bands
+                       if b.get("kind") == "segment"), None)
+        if first_band is not None:
+            rect = bar._band_rect(first_band)
+            spot = QPointF(rect.center().x(), rect.center().y())
+            others = [bar._band_h(b) for b in bar._bands
+                      if b is not first_band]
+            before_h = bar._band_h(first_band)
+            alt_event = QWheelEvent(spot, spot, QPoint(0, 0), QPoint(0, 120),
+                                    Qt.NoButton, Qt.AltModifier,
+                                    Qt.NoScrollPhase, False)
+            bar.wheelEvent(alt_event)
+            app.processEvents()
+            check("alt+wheel over one block resizes just that track",
+                  bar._band_h(first_band) > before_h
+                  and [bar._band_h(b) for b in bar._bands
+                       if b is not first_band] == others,
+                  f"{before_h} -> {bar._band_h(first_band)} "
+                  f"rect={rect.getRect()} spot=({spot.x():.1f},{spot.y():.1f}) "
+                  f"hit={bar._band_at(spot.toPoint()) is not None} "
+                  f"lane={first_band.get('lane')} vis={bar._lane_visible(int(first_band.get('lane', 0)))} "
+                  f"scroll={bar.band_scroll} width={bar.width()} h={bar.height()}")
+            check("single-track resize does not zoom the timeline",
+                  bar.zoom == 1.0, str(bar.zoom))
+            bar.scale_band(first_band, -1)
+        else:
+            print("SKIP  single-track resize  (没有片段条)")
+
+        check("plain wheel scrolls lanes", bar.scroll_bands(-1)
               and bar.band_scroll == 1, str(bar.band_scroll))
-        bar.scroll_bands(-1)
+        bar.scroll_bands(1)
         check("lanes scroll back", bar.band_scroll == 0, str(bar.band_scroll))
 
-        # 放大后：滚轮在「片段条区域」只翻层、进度条纹丝不动；
-        # 只有鼠标在「进度条区域」才水平平移
+        # 左侧竖滚动条（PR 同款小端点 + 圆滑块）
+        geo = bar._scroll_geometry()
+        check("left scrollbar appears when lanes overflow", geo is not None,
+              f"lanes={bar.lane_count()} visible={bar.visible_lanes()} geo={geo}")
+        if geo:
+            sx, stop, sheight, sty, sth = geo
+            cursor_before = page.cursor_frame
+            before_scroll = bar.band_scroll
+            QTest.mousePress(bar, Qt.LeftButton,
+                             pos=QPoint(sx + 3, sty + sth // 2))
+            QTest.mouseMove(bar, QPoint(sx + 3, stop + sheight - sth // 2))
+            QTest.mouseRelease(bar, Qt.LeftButton,
+                               pos=QPoint(sx + 3, stop + sheight - sth // 2))
+            app.processEvents()
+            check("dragging the left scrollbar scrolls the lanes",
+                  bar.band_scroll > before_scroll,
+                  f"{before_scroll} -> {bar.band_scroll}")
+            check("dragging the left scrollbar keeps the playhead",
+                  page.cursor_frame == cursor_before,
+                  f"{cursor_before} -> {page.cursor_frame}")
+            bar.band_scroll = 0
+            bar.update()
+            app.processEvents()
+
+        # 普通滚轮 = 时间轴左右滚动；Ctrl+滚轮 = 上下翻层
         bar.set_zoom(4.0)
         start_before = bar._view_start
         stack_y = max(2, bar.stack_bottom() - bar.band_height() - 2)
@@ -701,17 +766,18 @@ def main() -> int:
                             Qt.NoModifier, Qt.NoScrollPhase, False)
         bar.wheelEvent(event)
         app.processEvents()
-        check("wheel over segment area never pans the timeline",
-              bar._view_start == start_before,
-              f"{start_before:.1f} -> {bar._view_start:.1f}")
-        track_event = QWheelEvent(QPointF(bar.width() * 0.5, bar.track_y()),
-                                  QPointF(bar.width() * 0.5, bar.track_y()),
-                                  QPoint(0, 0), QPoint(0, 120), Qt.NoButton,
-                                  Qt.NoModifier, Qt.NoScrollPhase, False)
-        bar.wheelEvent(track_event)
-        app.processEvents()
-        check("wheel over the track pans when zoomed",
+        check("plain wheel scrolls the timeline sideways",
               bar._view_start != start_before,
+              f"{start_before:.1f} -> {bar._view_start:.1f}")
+        start_before = bar._view_start
+        ctrl_event = QWheelEvent(QPointF(bar.width() * 0.5, bar.track_y()),
+                                 QPointF(bar.width() * 0.5, bar.track_y()),
+                                 QPoint(0, 0), QPoint(0, 120), Qt.NoButton,
+                                 Qt.ControlModifier, Qt.NoScrollPhase, False)
+        bar.wheelEvent(ctrl_event)
+        app.processEvents()
+        check("ctrl+wheel scrolls lanes, not the timeline",
+              bar._view_start == start_before,
               f"{start_before:.1f} -> {bar._view_start:.1f}")
         bar.reset_zoom()
         page.clear_segments()
@@ -769,19 +835,55 @@ def main() -> int:
                   page.cursor_frame is not None and page.cursor_frame > 0,
                   f"cursor={page.cursor_frame}")
 
-            def drag(a, b):
+            def drag(a, b, y=None):
+                yy = lane_y if y is None else y
                 QTest.mousePress(page.view.viewport(), Qt.LeftButton,
-                                 pos=QPoint(a, lane_y))
-                QTest.mouseMove(page.view.viewport(), QPoint((a + b) // 2, lane_y))
-                QTest.mouseMove(page.view.viewport(), QPoint(b, lane_y))
+                                 pos=QPoint(a, yy))
+                QTest.mouseMove(page.view.viewport(), QPoint((a + b) // 2, yy))
+                QTest.mouseMove(page.view.viewport(), QPoint(b, yy))
                 QTest.mouseRelease(page.view.viewport(), Qt.LeftButton,
-                                   pos=QPoint(b, lane_y))
+                                   pos=QPoint(b, yy))
                 app.processEvents()
 
-            drag(x - 60, x - 20)
+            # 工具带上拖动 = 直接拖播放头（不再拉区间）
+            before_cursor = page.cursor_frame
+            drag(x - 60, x + 60)
+            check("dragging the thumbnail ladder scrubs the playhead",
+                  page.cursor_frame is not None
+                  and page.cursor_frame != before_cursor
+                  and page.in_frame is None and page.out_frame is None,
+                  f"cursor {before_cursor} -> {page.cursor_frame} "
+                  f"in={page.in_frame} out={page.out_frame}")
+
+            # 点缩略图：第一下就落到点击那一帧（先跳锚帧 = 之前的「乱跳」）
+            calls = []
+            orig_cursor_fn = page._set_cursor
+
+            def spy(frame, sync_wall=True):
+                calls.append(int(frame))
+                return orig_cursor_fn(frame, sync_wall)
+
+            page._set_cursor = spy
+            try:
+                item_index = page.model.index(bucket[-1], 0)
+                item_rect = page.view.visualRect(item_index)
+                click_x = item_rect.left() + item_rect.width() // 4
+                expect = page.view._frame_in_item(item_index, click_x)
+                QTest.mouseClick(page.view.viewport(), Qt.LeftButton,
+                                 pos=QPoint(click_x, item_rect.top() + 30))
+                app.processEvents()
+            finally:
+                page._set_cursor = orig_cursor_fn
+            check("clicking a thumbnail seeks straight to the clicked frame",
+                  bool(calls) and calls[0] == int(expect),
+                  f"calls={calls} expect={expect}")
+
+            # 在缩略图上拖 = 框选区间
+            thumb_y = rects[0].top() + 40
+            drag(x - 60, x - 20, thumb_y)
             first_span = (page.in_frame, page.out_frame)
-            drag(x + 20, x + 60)
-            check("dragging the lane adds a second range",
+            drag(x + 20, x + 60, thumb_y)
+            check("dragging the thumbnails adds a second range",
                   len(page.range_spans()) == 2,
                   f"ranges={page.range_spans()}")
             check("first range kept",
@@ -810,36 +912,527 @@ def main() -> int:
         page.clear_segments()
         app.processEvents()
 
-        # ---- B1.6c: Delete / 退格 删片段；Alt+滚轮 同时放大层高和整块 ----
+        # ---- B1.6b2: 片段层选择（点选 / 框选 / 回车加入导出队列） ----
+        page.clear_segments()
+        page.clear_range()
+        total_frames = max(1, int(page.info.frames or 0))
+        for i in range(3):
+            if i:
+                page._begin_wall_range()
+            lo = max(0, min(total_frames - 2, int(total_frames * (0.2 + i * 0.2))))
+            page.set_in_point(lo)
+            page.set_out_point(min(total_frames - 1, lo + max(2, total_frames // 10)))
+        bar.band_scroll = 0
+        bar.selection.clear()
+        app.processEvents()
+        check("three range bands on the bar",
+              len([b for b in bar._bands if b["kind"] == "range"]) == 3,
+              str([(b["kind"], b["lo"], b["hi"]) for b in bar._bands]))
+        band = bar._bands[0]
+        rect = bar._band_rect(band)
+        cursor_before = page.cursor_frame
+        QTest.mouseClick(bar, Qt.LeftButton,
+                         pos=QPoint(int(rect.center().x()),
+                                    int(rect.center().y())))
+        app.processEvents()
+        check("clicking a band selects it", bar.is_selected(band),
+              str(bar.selection))
+        check("clicking a band does not move the playhead",
+              page.cursor_frame == cursor_before,
+              f"{cursor_before} -> {page.cursor_frame}")
+        QTest.mouseClick(bar, Qt.LeftButton,
+                         pos=QPoint(int(rect.center().x()),
+                                    int(rect.center().y())))
+        app.processEvents()
+        check("plain click keeps only that band selected",
+              bar.selection == {bar._band_key(band)}, str(bar.selection))
+        QTest.mouseClick(bar, Qt.LeftButton, Qt.ShiftModifier,
+                         pos=QPoint(int(rect.center().x()),
+                                    int(rect.center().y())))
+        app.processEvents()
+        check("shift+click toggles the band off",
+              not bar.is_selected(band), str(bar.selection))
+
+        # 空白处拖一个框，把三条都框进来
+        start = QPoint(6, bar.track_y() - 20)
+        end = QPoint(bar.width() - 6, 2)
+        QTest.mousePress(bar, Qt.LeftButton, pos=start)
+        QTest.mouseMove(bar, QPoint((start.x() + end.x()) // 2, 10))
+        QTest.mouseMove(bar, end)
+        QTest.mouseRelease(bar, Qt.LeftButton, pos=end)
+        app.processEvents()
+        check("rubber band selects every band in the box",
+              len(bar.selection) == 3, str(bar.selection))
+
+        win.activateWindow()
+        page.view.setFocus(Qt.OtherFocusReason)
+        app.processEvents()
+        QTest.keyClick(page.view, Qt.Key_Return)
+        app.processEvents()
+        check("Enter adds the selected bands to the export queue",
+              len(page.segments) == 3,
+              f"segments={len(page.segments)} sel={bar.selection} "
+              f"picked={bar.selected_ranges()} "
+              f"status={page.side.lbl_status.text()!r} "
+              f"focus={type(QApplication.focusWidget()).__name__}")
+        page.clear_segments()
+        page.clear_range()
+        bar.clear_selection()
+        app.processEvents()
+
+        # ---- B1.6b3: 点空白不动光标；Ctrl+Z / Ctrl+Shift+Z ----
+        page.clear_segments()
+        page.clear_range()
+        page.clear_markers()
+        bar.clear_selection()
+        page.set_in_point(10)
+        page.set_out_point(20)
+        app.processEvents()
+        cursor_before = page.cursor_frame
+        empty_y = max(2, bar.track_y() - 22)
+        QTest.mouseClick(bar, Qt.LeftButton,
+                         pos=QPoint(bar.width() // 2, empty_y))
+        app.processEvents()
+        check("clicking empty segment area keeps the playhead",
+              page.cursor_frame == cursor_before,
+              f"{cursor_before} -> {page.cursor_frame} y={empty_y}")
+        QTest.mouseClick(bar, Qt.LeftButton,
+                         pos=QPoint(int(bar.width() * 0.6), bar.track_y()))
+        app.processEvents()
+        check("clicking the timeline moves the playhead",
+              page.cursor_frame != cursor_before,
+              f"{cursor_before} -> {page.cursor_frame}")
+
+        # 撤销 / 重做：标记
+        page.clear_markers()
+        page.add_marker(30)
+        app.processEvents()
+        check("marker added before undo", page.markers == [30], str(page.markers))
+        win.activateWindow()
+        page.view.setFocus(Qt.OtherFocusReason)
+        app.processEvents()
+        QTest.keyClick(page.view, Qt.Key_Z, Qt.ControlModifier)
+        app.processEvents()
+        check("Ctrl+Z undoes the marker", page.markers == [], str(page.markers))
+        QTest.keyClick(page.view, Qt.Key_Z,
+                       Qt.ControlModifier | Qt.ShiftModifier)
+        app.processEvents()
+        check("Ctrl+Shift+Z redoes the marker", page.markers == [30],
+              str(page.markers))
+
+        # 撤销 / 重做：清空区间
+        page.clear_markers()
+        page.clear_range()
+        page.set_in_point(5)
+        page.set_out_point(15)
+        app.processEvents()
+        ranges_before = len(page.range_spans())
+        page.clear_range()
+        app.processEvents()
+        check("range cleared before undo", page.range_spans() == [],
+              str(page.range_spans()))
+        page.undo()
+        app.processEvents()
+        check("undo restores the cleared range",
+              len(page.range_spans()) == ranges_before,
+              f"{ranges_before} -> {len(page.range_spans())}")
+        page.redo()
+        app.processEvents()
+        check("redo clears it again", page.range_spans() == [],
+              str(page.range_spans()))
+        page.clear_range()
+        page.clear_markers()
+        app.processEvents()
+
+        # ---- B1.6b4: 拖动片段（50px 死区 / 横向 / 纵向 / 虚影） ----
+        page.clear_segments()
+        page.clear_range()
+        bar.band_scroll = 0
+        page.segments = [{"t_in": 0.3, "t_end": 1.3, "name": "A"},
+                         {"t_in": 2.0, "t_end": 3.0, "name": "B"}]
+        page._refresh_segments()
+        app.processEvents()
+        band = next(b for b in bar._bands
+                    if b["kind"] == "segment" and b["item"].get("name") == "A")
+        rect = bar._band_rect(band)
+        cx, cy = int(rect.center().x()), int(rect.center().y())
+        t_in0 = page.segments[0]["t_in"]
+
+        # 死区：拖 40px 不动
+        QTest.mousePress(bar, Qt.LeftButton, pos=QPoint(cx, cy))
+        QTest.mouseMove(bar, QPoint(cx + 20, cy))
+        QTest.mouseMove(bar, QPoint(cx + 40, cy))
+        QTest.mouseRelease(bar, Qt.LeftButton, pos=QPoint(cx + 40, cy))
+        app.processEvents()
+        check("dragging <50px keeps the clip in place",
+              abs(page.segments[0]["t_in"] - t_in0) < 1e-6,
+              f"{t_in0} -> {page.segments[0]['t_in']}")
+
+        # 超过 50px：横向移动 + 落点压在 B 上 → 只能去上下新轨
+        band = next(b for b in bar._bands
+                    if b["kind"] == "segment" and b["item"].get("name") == "A")
+        rect = bar._band_rect(band)
+        cx, cy = int(rect.center().x()), int(rect.center().y())
+        lane0 = int(band["lane"])
+        QTest.mousePress(bar, Qt.LeftButton, pos=QPoint(cx, cy))
+        QTest.mouseMove(bar, QPoint(cx + 120, cy))
+        QTest.mouseMove(bar, QPoint(cx + 200, cy))
+        app.processEvents()
+        check("drag shows a ghost preview", bool(bar.drag_preview()),
+              str(bar.drag_preview()))
+        snap = dict(bar._drag_snap or {})
+        check("occupied target lane snaps to a new lane instead",
+              bool(snap.get("insert")) and int(snap.get("lane", -1)) == lane0 + 1,
+              str(snap))
+        QTest.mouseRelease(bar, Qt.LeftButton, pos=QPoint(cx + 200, cy))
+        app.processEvents()
+        check("dragging >100px moves the clip",
+              page.segments[0]["t_in"] > t_in0 + 0.05,
+              f"{t_in0} -> {page.segments[0]['t_in']}")
+        check("dropping on an occupied lane lands in another lane",
+              page.segments[0].get("lane") != page.segments[1].get("lane"),
+              str([s.get("lane") for s in page.segments]))
+
+        # 两条轨道之间新建一层：虚影 = 半条 + 缝隙 + 半条
+        page.clear_segments()
+        page.segments = [{"t_in": 0.3, "t_end": 1.3, "name": "A", "lane": 0},
+                         {"t_in": 1.5, "t_end": 2.5, "name": "B", "lane": 1}]
+        page._refresh_segments()
+        app.processEvents()
+        gap_cand = next(c for c in bar._vertical_candidates(0)
+                        if c["insert"] and c["lane"] == 1)
+        check("gap ghost is one band + one gap tall",
+              abs(gap_cand["height"] - (bar.band_height()
+                                        + bar.band_gap())) < 0.01,
+              str(gap_cand["height"]))
+        check("lane ghost is exactly one band tall",
+              abs((bar._vertical_candidates(0)[0])["height"]
+                  - bar.band_height()) < 0.01,
+              str(bar._vertical_candidates(0)[0]["height"]))
+
+        # 纵向：往下一层
+        band = next(b for b in bar._bands
+                    if b["kind"] == "segment" and b["item"].get("name") == "A")
+        rect = bar._band_rect(band)
+        cx, cy = int(rect.center().x()), int(rect.center().y())
+        lane_before = int(band["lane"])
+        QTest.mousePress(bar, Qt.LeftButton, pos=QPoint(cx, cy))
+        QTest.mouseMove(bar, QPoint(cx, cy + 30))
+        QTest.mouseMove(bar, QPoint(cx, cy + 60))
+        QTest.mouseRelease(bar, Qt.LeftButton, pos=QPoint(cx, cy + 60))
+        app.processEvents()
+        check("vertical drag moves the clip to another lane",
+              page.segments[0].get("lane") not in (None, lane_before),
+              f"lane {lane_before} -> {page.segments[0].get('lane')}")
+
+        # Alt 只关横向吸附，纵向照样吸轨道
+        page.clear_segments()
+        page.segments = [{"t_in": 0.3, "t_end": 1.3, "name": "A", "lane": 0},
+                         {"t_in": 2.0, "t_end": 3.0, "name": "B", "lane": 1}]
+        page._refresh_segments()
+        app.processEvents()
+        band = next(b for b in bar._bands
+                    if b["kind"] == "segment" and b["item"].get("name") == "B")
+        rect = bar._band_rect(band)
+        cx, cy = int(rect.center().x()), int(rect.center().y())
+        lane_before = int(band["lane"])
+        QTest.mousePress(bar, Qt.LeftButton, pos=QPoint(cx, cy))
+        QTest.mouseMove(bar, QPoint(cx, cy + 3))         # 进入拖动状态
+        bar._update_drag(QPoint(cx, cy - 60), True)      # Alt 按住 + 往上拖
+        app.processEvents()
+        check("alt does not disable vertical snapping",
+              bar._drag_alt and bar._drag_lane != lane_before,
+              f"alt={bar._drag_alt} lane={bar._drag_lane} (was {lane_before})")
+        QTest.mouseRelease(bar, Qt.LeftButton, pos=QPoint(cx, cy - 60))
+        app.processEvents()
+        page.clear_segments()
+        app.processEvents()
+
+        # 贴边：首尾紧贴（共用一帧）不算重叠，同层可以前后紧贴
+        page.segments = [{"t_in": 0.3, "t_end": 1.3, "name": "A"},
+                         {"t_in": 1.3, "t_end": 2.3, "name": "B"}]
+        page._refresh_segments()
+        bar.band_scroll = 0
+        app.processEvents()
+        lanes = sorted({int(b["lane"]) for b in bar._bands
+                        if b["kind"] == "segment"})
+        check("touching clips share one lane", lanes == [0], str(lanes))
+        band_a = next(b for b in bar._bands if b["item"].get("name") == "A")
+        r_ = bar._band_rect(band_a)
+        cx, cy = int(r_.center().x()), int(r_.center().y())
+        bar._begin_drag(band_a, QPoint(cx, cy))
+        bar._dragging = True
+        snap_flush = bar._vertical_snap(cy, 0)
+        snap_overlap = bar._vertical_snap(cy, 2)
+        check("flush edge still allows the same lane",
+              snap_flush is not None and snap_flush["insert"] is False,
+              str(snap_flush))
+        check("real 1-frame overlap still forces a new lane",
+              snap_overlap is not None and snap_overlap["insert"] is True,
+              str(snap_overlap))
+        bar._press_band = None
+        bar._dragging = False
+        bar._drag_origins = []
+        bar._drag_snap = None
+        app.processEvents()
+
+        # Shift 多选 → 多条一起拖
+        page.segments = [{"t_in": 0.3, "t_end": 1.3, "name": "A"},
+                         {"t_in": 2.0, "t_end": 3.0, "name": "B"}]
+        page._refresh_segments()
+        bar.band_scroll = 0
+        app.processEvents()
+        band_a = next(b for b in bar._bands if b["item"].get("name") == "A")
+        band_b = next(b for b in bar._bands if b["item"].get("name") == "B")
+        for item in (band_a, band_b):
+            r_ = bar._band_rect(item)
+            QTest.mouseClick(bar, Qt.LeftButton, Qt.ShiftModifier,
+                             pos=QPoint(int(r_.center().x()),
+                                        int(r_.center().y())))
+        app.processEvents()
+        check("shift click selects two bands", len(bar.selection) == 2,
+              str(bar.selection))
+        before = [seg["t_in"] for seg in page.segments]
+        r_ = bar._band_rect(band_a)
+        cx, cy = int(r_.center().x()), int(r_.center().y())
+        QTest.mousePress(bar, Qt.LeftButton, pos=QPoint(cx, cy))
+        QTest.mouseMove(bar, QPoint(cx + 120, cy))
+        QTest.mouseMove(bar, QPoint(cx + 200, cy))
+        QTest.mouseRelease(bar, Qt.LeftButton, pos=QPoint(cx + 200, cy))
+        app.processEvents()
+        after = [seg["t_in"] for seg in page.segments]
+        check("multi selection drags together",
+              all(a > b + 0.05 for a, b in zip(after, before)),
+              f"{before} -> {after}")
+
+
+        # ---- 底栏帧刻度尺：越放大越密，间距不低于 4px ----
+        bar = page.overview
+        bar.set_zoom(1.0)
+        bar._pan_to(0)
+        app.processEvents()
+        step_wide = bar.ruler_step()
+        bar.set_zoom(min(bar._max_zoom(), 12.0))
+        bar._pan_to(0)
+        app.processEvents()
+        step_zoom = bar.ruler_step()
+        ppf = bar._usable() / max(1e-9, bar._visible())
+        check("frame ruler never coarsens when zoomed in",
+              step_zoom <= step_wide, f"{step_wide} -> {step_zoom}")
+        check("frame ruler keeps >= 4px between ticks",
+              step_zoom * ppf >= 4.0 - 1e-9,
+              f"{step_zoom} x {ppf:.4f} = {step_zoom * ppf:.2f}px")
+        bar.set_zoom(bar._max_zoom())
+        bar._pan_to(0)
+        app.processEvents()
+        px_per_frame = bar._usable() / max(1e-9, bar._visible())
+        check("max zoom gives one frame per 20px",
+              abs(px_per_frame - 20.0) <= 0.6 or bar._max_zoom() <= 1.001,
+              f"{px_per_frame:.2f}px/frame zoom={bar.zoom:.1f}")
+        check("max zoom shows per-frame ruler ticks",
+              bar.ruler_step() == 1, str(bar.ruler_step()))
+        bar.set_zoom(1.0)
+        bar._pan_to(0)
+        app.processEvents()
+
+        # ---- 工具带：每帧一根细竖线 + 上界标记 ----
+        vis2 = page.view._visible_rows()
+        if vis2:
+            top2, bucket2 = vis2[0]
+            rects2 = [page.view._row_rect(i) for i in bucket2]
+            rects2 = [r for r in rects2 if r is not None]
+            lane_top2, lane_bottom2, base2 = page.view._lane_band(rects2)
+            check("thumbnail ladder band is tall enough to hit",
+                  lane_bottom2 - lane_top2 >= 12,
+                  f"{lane_bottom2 - lane_top2}px")
+            lines2 = page.view._frame_lines(bucket2, rects2,
+                                            rects2[0].left(), rects2[-1].right())
+            frames2 = (page.view.timeline.span(bucket2[-1])[1]
+                       - page.view.timeline.frame_at(bucket2[0]))
+            check("thumbnail ladder draws one line per frame",
+                  len(lines2) >= int(frames2 * 0.8),
+                  f"{len(lines2)} lines / {frames2:.0f} frames")
+            check("thumbnail ladder lines start at the row edge",
+                  bool(lines2) and lines2[0] <= rects2[0].left() + 2,
+                  f"first={lines2[0] if lines2 else None} "
+                  f"left={rects2[0].left()}")
+
+        # 刻度 / 点击 / 拖拽必须是同一帧（点哪儿就是哪一帧）
+        vis3 = [r for r in page.view._visible_rows() if r[0] >= 0] \
+            or page.view._visible_rows()
+        if vis3:
+            _t3, bucket3 = vis3[0]
+            rects3 = [page.view._row_rect(i) for i in bucket3]
+            rects3 = [r for r in rects3 if r is not None]
+            lo3, hi3, xa, xb = page.view._row_span(bucket3, rects3)
+            lines3 = page.view._frame_lines(bucket3, rects3, xa, xb)
+            mism = 0
+            f3 = int(round(lo3))
+            for xl in lines3:
+                if page.view._frame_at_x(bucket3, rects3, xl) != f3:
+                    mism += 1
+                back = page.view._x_for_frame(bucket3, rects3, f3)
+                if back is None or abs(back - xl) > 0.51:
+                    mism += 1
+                f3 += 1
+            check("frame ruler ticks match frames exactly", mism == 0,
+                  f"mismatches={mism}")
+            check("frame ruler covers every frame in the row",
+                  len(lines3) == int(hi3 - lo3) + 1,
+                  f"{len(lines3)} vs {int(hi3 - lo3) + 1}")
+            idx3 = page.model.index(bucket3[min(1, len(bucket3) - 1)], 0)
+            r3 = page.view.visualRect(idx3)
+            if r3.isValid() and r3.height() > 60:
+                xq = int(r3.left() + r3.width() * 0.4)
+                yq = int(r3.top() + 40)
+                seen = set()
+                for _ in range(4):
+                    QTest.mouseClick(page.view.viewport(), Qt.LeftButton,
+                                     pos=QPoint(xq, yq))
+                    app.processEvents()
+                    seen.add(page.cursor_frame)
+                check("clicking one spot always picks the same frame",
+                      len(seen) == 1
+                      and seen == {page.view._frame_in_item(idx3, xq)},
+                      f"{sorted(seen)}")
+            else:
+                check("clicking one spot always picks the same frame", False,
+                      str(r3.getRect()))
+
+        # ---- B1.6c: Delete / 退格 只删「选中的区间」；队列里的片段受保护 ----
+        page.clear_segments()
+        page.clear_range()
+        bar.clear_selection()
+        app.processEvents()
         for i in range(3):
             page.set_in_point(10 + i * 30)
             page.set_out_point(20 + i * 30)
             page.add_segment()
         app.processEvents()
+        page.clear_range()
+        app.processEvents()
         check("three segments added", len(page.segments) == 3,
               str(len(page.segments)))
-        check("last segment is the active one", page._active_segment == 2,
-              str(page._active_segment))
-        page.select_segment(0)
-        check("selecting a segment marks it as delete target",
-              page._delete_target == "segment", page._delete_target)
+        bands = [b for b in bar._bands if b["kind"] == "segment"]
+        check("three segment bands", len(bands) == 3, str(len(bands)))
+        before = len(page.segments)
         page._delete_selected()
         app.processEvents()
-        check("delete removes the selected segment", len(page.segments) == 2,
-              str(len(page.segments)))
+        check("Delete with nothing selected deletes nothing",
+              len(page.segments) == before, str(len(page.segments)))
+        bar.selection = {bar._band_key(bands[0])}
+        page._delete_selected()
+        app.processEvents()
+        check("segments in the export queue survive bottom Delete",
+              len(page.segments) == 3, str(len(page.segments)))
+
+        # 多选（区间 + 片段）：只删区间，队列里的片段照样锁定
+        page.clear_range()
+        page.set_in_point(5)
+        page.set_out_point(15)
+        app.processEvents()
+        rng_band = next((b for b in bar._bands if b["kind"] == "range"), None)
+        seg_band = next((b for b in bar._bands if b["kind"] == "segment"), None)
+        if rng_band is not None and seg_band is not None:
+            bar.selection = {bar._band_key(rng_band), bar._band_key(seg_band)}
+            page._delete_selected()
+            app.processEvents()
+            check("mixed selection delete keeps queued segments",
+                  len(page.segments) == 3
+                  and not any(b["kind"] == "range" for b in bar._bands),
+                  f"segments={len(page.segments)} "
+                  f"ranges={len([b for b in bar._bands if b['kind'] == 'range'])}")
+        else:
+            check("mixed selection delete keeps queued segments", False,
+                  f"rng={rng_band} seg={seg_band}")
+
+        # 加入队列：加的是「选中的那条」，且重复加不产生副本
+        page.clear_segments()
+        page.ranges = [{"in": 24, "out": 36, "color": 0},
+                       {"in": 100, "out": 120, "color": 1}]
+        page.active_range = 0
+        page.in_frame, page.out_frame = 24, 36
+        page._refresh_range()
+        app.processEvents()
+        bar.clear_selection()
+        second = next((b for b in bar._bands
+                       if b["kind"] == "range" and int(b["lo"]) == 100), None)
+        if second is not None:
+            bar.selection = {bar._band_key(second)}
+            page.add_segment()
+            app.processEvents()
+            fps = page._fps()
+            want = (round(100 / fps, 4), round(120 / fps, 4))
+            got = [(round(seg["t_in"], 4), round(seg["t_end"], 4))
+                   for seg in page.segments]
+            check("adding a selected range queues that range",
+                  got == [want], f"{got} want {want}")
+            second = next(b for b in bar._bands
+                          if b["kind"] == "range" and int(b["lo"]) == 100)
+            check("queued range band is marked",
+                  bool(second.get("queued")), str(second.get("queued")))
+            # 再点一次（选中的还是这条区间）→ 不重复
+            page.add_segment()
+            app.processEvents()
+            check("adding the same range twice does not duplicate",
+                  len(page.segments) == 1, str(len(page.segments)))
+            # 选中队列里的片段再点加入 → 什么都不加
+            seg_band = next((b for b in bar._bands
+                             if b["kind"] == "segment"), None)
+            if seg_band is not None:
+                bar.selection = {bar._band_key(seg_band)}
+                page.add_segment()
+                app.processEvents()
+                check("adding a queued segment does not copy it",
+                      len(page.segments) == 1, str(len(page.segments)))
+            else:
+                check("adding a queued segment does not copy it", False)
+            bar.clear_selection()
+            page.clear_segments()
+            page.clear_range()
+            app.processEvents()
+            for i in range(3):
+                page.set_in_point(10 + i * 30)
+                page.set_out_point(20 + i * 30)
+                page.add_segment()
+            app.processEvents()
+        else:
+            for label in ("adding a selected range queues that range",
+                          "queued range band is marked",
+                          "adding the same range twice does not duplicate",
+                          "adding a queued segment does not copy it"):
+                check(label, False)
+
+        # 右键删片段（信号已接线；Delete 已经删不掉了）
+        if page.segments:
+            count = len(page.segments)
+            bar.clear_selection()
+            bar.segmentRemoveRequested.emit(0)
+            app.processEvents()
+            check("right-click removes a queued segment",
+                  len(page.segments) == count - 1,
+                  f"{count} -> {len(page.segments)}")
+            # 把刚删掉的那一段补回来（同一时间段不会加出第二条）
+            page.set_in_point(10)
+            page.set_out_point(20)
+            page.add_segment()
+            app.processEvents()
+        bar.clear_selection()
         if page.side._rows:
             QTest.keyClick(page.side._rows[0], Qt.Key_Delete)
             app.processEvents()
             check("Delete key on a segment row removes it",
-                  len(page.segments) == 1, str(len(page.segments)))
+                  len(page.segments) == 2, str(len(page.segments)))
         else:
             print("SKIP  Delete key on a segment row  (没有行)")
+
+        bar.clear_selection()
         page.view.setFocus()
         app.processEvents()
         QTest.keyClick(page.view, Qt.Key_Backspace)
         app.processEvents()
-        check("Backspace on the wall deletes the active segment",
-              len(page.segments) == 0, str(len(page.segments)))
+        check("Backspace without a selection keeps the segments",
+              len(page.segments) == 2, str(len(page.segments)))
 
         page.clear_range()
         page.set_in_point(5)
@@ -847,19 +1440,42 @@ def main() -> int:
         app.processEvents()
         check("one range ready to delete", len(page.range_spans()) == 1,
               str(page.range_spans()))
+        bar.clear_selection()
         page._delete_selected()
         app.processEvents()
-        check("Delete removes the active range", page.range_spans() == [],
-              str(page.range_spans()))
+        check("Delete without a selection keeps the range",
+              len(page.range_spans()) == 1, str(page.range_spans()))
+        range_bands = [b for b in bar._bands if b["kind"] == "range"]
+        if range_bands:
+            bar.selection = {bar._band_key(range_bands[0])}
+            page._delete_selected()
+            app.processEvents()
+            check("Delete removes the selected range",
+                  page.range_spans() == [], str(page.range_spans()))
+        else:
+            print("SKIP  Delete removes the selected range")
+
+        # Ctrl+A：选中底部所有条（不是「全选帧」）
+        bar.clear_selection()
+        win.activateWindow()
+        page.view.setFocus(Qt.OtherFocusReason)
+        app.processEvents()
+        QTest.keyClick(page.view, Qt.Key_A, Qt.ControlModifier)
+        app.processEvents()
+        check("Ctrl+A selects every band, not every frame",
+              len(bar.selection) == len(bar._bands) and bar.selection,
+              f"sel={len(bar.selection)} bands={len(bar._bands)}")
+        bar.clear_selection()
+        app.processEvents()
 
         band0, panel0 = bar.band_height(), bar.height()
         event = QWheelEvent(QPointF(bar.width() * 0.5, bar.track_y()),
                             QPointF(bar.width() * 0.5, bar.track_y()),
                             QPoint(0, 0), QPoint(0, 120), Qt.NoButton,
-                            Qt.AltModifier, Qt.NoScrollPhase, False)
+                            Qt.ShiftModifier, Qt.NoScrollPhase, False)
         bar.wheelEvent(event)
         app.processEvents()
-        check("alt+wheel only changes bar height, not the panel",
+        check("shift+wheel only changes bar height, not the panel",
               bar.band_height() > band0 and bar.height() == panel0,
               f"band {band0}->{bar.band_height()} h {panel0}->{bar.height()}")
         bar.scale_bands(-1)
@@ -1038,8 +1654,11 @@ def main() -> int:
                     QTest.mouseRelease(view.viewport(), Qt.LeftButton,
                                        pos=QPoint(int(rects2[1].center().x()), lane2))
                     app.processEvents()
+                    expect = view._frame_at_x(two[1], rects2,
+                                              rects2[1].center().x())
                     check("horizontal drag still works",
-                          horiz == two[1][1] * page.step, f"in={horiz}")
+                          horiz is not None and abs(horiz - expect) <= 1,
+                          f"in={horiz} expect={expect}")
                 else:
                     check("horizontal drag still works", False)
             else:
@@ -1125,12 +1744,11 @@ def main() -> int:
             mid = 80                      # 落在镜头 75 与 90 之间
             x_mid = view2._x_for_frame(bucket2, rects2, mid)
             back = view2._frame_at_x(bucket2, rects2, x_mid) if x_mid is not None else None
-            centers2 = [r.center().x() for r in rects2]
-            i1, i2 = bucket2.index(1), bucket2.index(2)
+            _lo2, _hi2, xa2, xb2 = view2._row_span(bucket2, rects2)
             check("scene timeline interpolates",
-                  x_mid is not None and centers2[i1] < x_mid < centers2[i2]
+                  x_mid is not None and xa2 - 1 <= x_mid <= xb2 + 1
                   and back is not None and abs(back - mid) <= 1,
-                  f"x={x_mid} back={back}")
+                  f"x={x_mid} row={xa2}..{xb2} back={back}")
             far = view2._frame_in_row(bucket2, rects2, 10 ** 6)
             check("scene drag clamps to shot span",
                   far == int(timeline2.span(bucket2[-1])[1]), str(far))

@@ -382,13 +382,9 @@ class EditSidebar(QWidget):
         self.image.setStyleSheet(
             "background:#0B0D11; border:1px solid #262B35; border-radius:5px;"
             "color:#5B6270; font-size:9pt;")
-        self.image.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        holder = QHBoxLayout()
-        holder.setContentsMargins(0, 0, 0, 0)
-        holder.addStretch(1)
-        holder.addWidget(self.image)
-        holder.addStretch(1)
-        lay.addLayout(holder)
+        # 宽度跟着卡片走（Expanding），高度由 _apply_preview_height 按比例定
+        self.image.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        lay.addWidget(self.image)
 
         bar = QHBoxLayout()
         bar.setSpacing(4)
@@ -898,9 +894,13 @@ class EditSidebar(QWidget):
         except RuntimeError:
             return
         target = max(PREVIEW_MIN, target)
-        avail_w = max(120, self.p_preview.width() - 14)
-        width = max(120, min(avail_w, int(round(target * (self._aspect or 1.78)))))
-        if (abs(self.image.height() - target) > 2
-                or abs(self.image.width() - width) > 2):
-            self.image.setFixedSize(width, target)
-            self._fit()
+        # 宽度交给布局（= 卡片内容宽度），这里只按画面比例算高度
+        box = self.p_preview.layout()
+        margins = box.contentsMargins() if box is not None else lay.contentsMargins()
+        avail_w = max(120, self.p_preview.width() - margins.left()
+                      - margins.right())
+        target = int(round(avail_w / max(0.2, self._aspect or 1.78)))
+        target = max(PREVIEW_MIN, min(480, target))
+        if abs(self.image.height() - target) > 2:
+            self.image.setFixedHeight(target)
+        self._fit()

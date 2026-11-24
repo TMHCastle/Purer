@@ -30,6 +30,7 @@ from vff.update import (CheckResult, asset_from_json, curl_path,  # noqa: E402
 from vff.selfupdate import (apply_update, backup_path, cleanup_old,  # noqa: E402
                             digest_of, download_path, parse_digest, verify_file)
 from vff.timeline import SceneTimeline, StepTimeline  # noqa: E402
+from vff.ui.range_palette import assign_lanes, color_for  # noqa: E402
 from vff.config import SCENE_DEFAULT, extract_mode_items, parse_extract_mode  # noqa: E402
 from vff.scenedetect import (BINS, SAMPLE_BYTES, build_sample_args,  # noqa: E402
                              cut_frames, detect_cuts, frames_to_times,
@@ -840,6 +841,36 @@ class TestFfmpegGuide(unittest.TestCase):
         new_items = {p.strip().lower().rstrip("\\")
                      for p in after.split(os.pathsep) if p.strip()}
         self.assertTrue(old_items <= new_items)
+
+
+class TestRangeLanes(unittest.TestCase):
+    """多段区间/片段条的叠层分配。"""
+
+    def test_no_overlap_shares_lane(self):
+        self.assertEqual(assign_lanes([(0, 10), (11, 20), (21, 30)]),
+                         [0, 0, 0])
+
+    def test_overlap_goes_to_next_lane(self):
+        # 10..20 与 30..40 互不重叠 → 都排在第二层
+        self.assertEqual(assign_lanes([(0, 100), (10, 20), (30, 40)]),
+                         [0, 1, 1])
+        # 真正三条都重叠 → 三层
+        self.assertEqual(assign_lanes([(0, 100), (10, 90), (20, 80)]),
+                         [0, 1, 2])
+
+    def test_result_follows_input_order(self):
+        spans = [(50, 60), (0, 100), (70, 80)]
+        lanes = assign_lanes(spans)
+        self.assertEqual(len(lanes), 3)
+        self.assertNotEqual(lanes[1], lanes[2])     # 50..80 落在 (0,100) 里
+        self.assertEqual(lanes[0], lanes[2])        # 两段互不重叠 → 同层
+
+    def test_empty(self):
+        self.assertEqual(assign_lanes([]), [])
+
+    def test_colors_cycle(self):
+        self.assertEqual(color_for(0), color_for(6))
+        self.assertNotEqual(color_for(0), color_for(1))
 
 
 if __name__ == "__main__":

@@ -36,6 +36,7 @@ MAX_TABS = 50
 MAX_SEGMENTS = 200
 MAX_EXPORTS = 100
 MAX_MARKERS = 500
+MAX_RANGES = 100
 MAX_NAME = 200
 
 
@@ -147,6 +148,17 @@ def sanitize_tab(raw) -> dict | None:
                 markers.append(frame)
     markers.sort()
 
+    ranges: list[dict] = []
+    for item in (raw.get("ranges") or [])[:MAX_RANGES]:
+        if not isinstance(item, dict):
+            continue
+        lo = _int_or_none(item.get("in"))
+        hi = _int_or_none(item.get("out"))
+        if lo is None and hi is None:
+            continue
+        ranges.append({"in": lo, "out": hi,
+                       "color": int(_int_or_none(item.get("color"), 0) or 0) % 6})
+
     return {
         "path": path,
         "step": step,
@@ -157,6 +169,8 @@ def sanitize_tab(raw) -> dict | None:
         "cursor_frame": _int_or_none(raw.get("cursor_frame")),
         "in_frame": _int_or_none(raw.get("in_frame")),
         "out_frame": _int_or_none(raw.get("out_frame")),
+        "ranges": ranges,
+        "active_range": _int_or_none(raw.get("active_range"), -1),
         "scroll_row": scroll_row,
         "segments": segments,
         "exports": exports,

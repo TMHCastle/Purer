@@ -489,7 +489,7 @@ def main() -> int:
         bar = page.overview
         total = max(1, int(page.info.frames or 0))
         check("overview bar exists", bar is not None and not bar.isHidden()
-              and bar.height() == 46, f"h={bar.height() if bar else '?'}")
+              and bar.height() == 62, f"h={bar.height() if bar else '?'}")
         check("overview mirrors in/out", bar.in_frame == 25 and bar.out_frame == 30,
               f"{bar.in_frame},{bar.out_frame}")
         check("overview roundtrips frame", all(
@@ -499,7 +499,7 @@ def main() -> int:
         page.clear_range()
         midpoint = total // 2
         QTest.mouseClick(bar, Qt.LeftButton,
-                         pos=QPoint(int(bar._x_for_frame(midpoint)), 24))
+                         pos=QPoint(int(bar._x_for_frame(midpoint)), 44))
         app.processEvents()
         check("overview click seeks", abs((page.cursor_frame or -1) - midpoint) <= 1,
               f"cursor={page.cursor_frame} want={midpoint}")
@@ -549,10 +549,19 @@ def main() -> int:
               page.side.lbl_markers.text())
         page._set_cursor(90, sync_wall=True)
         QTest.mouseClick(bar, Qt.LeftButton,
-                         pos=QPoint(int(bar._x_for_frame(30)), 20))
+                         pos=QPoint(int(bar._x_for_frame(30)), 38))
         app.processEvents()
         check("click overview marker jumps", page.cursor_frame == 30,
               str(page.cursor_frame))
+        # M 再按一下 = 取消同一个点上的标记
+        page._set_cursor(30, sync_wall=True)
+        QTest.keyClick(page.view, Qt.Key_M)
+        app.processEvents()
+        check("M toggles marker off", page.markers == [90], str(page.markers))
+        check("overview drops toggled marker", bar.markers == [90], str(bar.markers))
+        QTest.keyClick(page.view, Qt.Key_M)
+        app.processEvents()
+        check("M adds it back", page.markers == [30, 90], str(page.markers))
         page._set_cursor(0, sync_wall=True)
         QTest.keyClick(page.view, Qt.Key_M, Qt.ShiftModifier)
         app.processEvents()
@@ -586,10 +595,10 @@ def main() -> int:
         side_now = page.display_side
         event = QWheelEvent(QPointF(20, 20), QPointF(20, 20),
                             QPoint(0, 0), QPoint(0, 120), Qt.NoButton,
-                            Qt.AltModifier, Qt.NoScrollPhase, False)
+                            Qt.ControlModifier, Qt.NoScrollPhase, False)
         bar.wheelEvent(event)
         app.processEvents()
-        check("alt+wheel on bottom bar stretches timeline", bar.zoom > 1.0,
+        check("ctrl+wheel on bottom bar stretches timeline", bar.zoom > 1.0,
               f"zoom={bar.zoom}")
         check("bottom bar zoom leaves thumbnails alone",
               page.display_side == side_now,
@@ -604,7 +613,7 @@ def main() -> int:
         for _ in range(2):
             event = QWheelEvent(QPointF(x_anchor, 24), QPointF(x_anchor, 24),
                                 QPoint(0, 0), QPoint(0, 120), Qt.NoButton,
-                                Qt.AltModifier, Qt.NoScrollPhase, False)
+                                Qt.ControlModifier, Qt.NoScrollPhase, False)
             bar.wheelEvent(event)
             app.processEvents()
         check("bar zoom keeps the frame under the cursor",
@@ -623,6 +632,34 @@ def main() -> int:
               bar.zoom == 1.0 and bar._view_start == 0.0,
               f"{bar.zoom} @ {bar._view_start}")
         page.set_display_side(before_side)
+
+        # 叠在一起的片段：按层错开，Alt+滚轮翻层
+        page.clear_segments()
+        page.clear_range()
+        for i in range(6):
+            lo = midpoint + i
+            page.set_in_point(lo)
+            page.set_out_point(lo + 12)
+            page.add_segment()
+        app.processEvents()
+        check("segments stack into lanes", bar.lane_count() >= 5,
+              f"lanes={bar.lane_count()} n={len(bar._segments)}")
+        check("stack starts at bottom lane", bar.band_scroll == 0,
+              str(bar.band_scroll))
+        event = QWheelEvent(QPointF(bar.width() * 0.5, 20),
+                            QPointF(bar.width() * 0.5, 20),
+                            QPoint(0, 0), QPoint(0, 120), Qt.NoButton,
+                            Qt.AltModifier, Qt.NoScrollPhase, False)
+        bar.wheelEvent(event)
+        app.processEvents()
+        check("alt+wheel scrolls segment lanes", bar.band_scroll == 1,
+              f"scroll={bar.band_scroll} zoom={bar.zoom}")
+        check("alt+wheel does not zoom the bar", bar.zoom == 1.0, str(bar.zoom))
+        bar.scroll_bands(-1)
+        check("lanes scroll back", bar.band_scroll == 0, str(bar.band_scroll))
+        page.clear_segments()
+        page.clear_range()
+        app.processEvents()
 
         # 可滚动的大图墙：Alt+滚轮不要把位置甩走（锚点钉在鼠标那一行）
         page.set_display_side(320)
@@ -646,11 +683,74 @@ def main() -> int:
         else:
             print("SKIP  alt+wheel keeps the wall in place  (内容不足一屏)")
         page.set_display_side(before_side)
+
+        # ---- B1.6b: 行内时间轴：点=移帧、拖=多段、导出全部收进片段表 ----
+        page.clear_range()
+        page.clear_segments()
         page.save_state()
         saved = page._read_state()
         check("markers saved with cache", saved.get("markers") == [30, 90],
               str(saved.get("markers")))
         page.clear_markers()
+        page.set_display_side(160)
+        app.processEvents()
+        vis = page.view._visible_rows()
+        if vis:
+            bucket = vis[0][1]
+            rects = [page.view.visualRect(page.model.index(i, 0))
+                     for i in bucket]
+            lane_y = max(r.bottom() for r in rects) - 6
+            x = int((rects[0].left() + rects[-1].right()) / 2)
+            before_in = page.in_frame
+            QTest.mouseClick(page.view.viewport(), Qt.LeftButton,
+                             pos=QPoint(x, lane_y))
+            app.processEvents()
+            check("click on the lane only moves the cursor",
+                  page.in_frame is None and page.out_frame is None,
+                  f"in={page.in_frame} out={page.out_frame}")
+            check("lane click seeks to that frame",
+                  page.cursor_frame is not None and page.cursor_frame > 0,
+                  f"cursor={page.cursor_frame}")
+
+            def drag(a, b):
+                QTest.mousePress(page.view.viewport(), Qt.LeftButton,
+                                 pos=QPoint(a, lane_y))
+                QTest.mouseMove(page.view.viewport(), QPoint((a + b) // 2, lane_y))
+                QTest.mouseMove(page.view.viewport(), QPoint(b, lane_y))
+                QTest.mouseRelease(page.view.viewport(), Qt.LeftButton,
+                                   pos=QPoint(b, lane_y))
+                app.processEvents()
+
+            drag(x - 60, x - 20)
+            first_span = (page.in_frame, page.out_frame)
+            drag(x + 20, x + 60)
+            check("dragging the lane adds a second range",
+                  len(page.range_spans()) == 2,
+                  f"ranges={page.range_spans()}")
+            check("first range kept",
+                  (first_span[0], first_span[1])
+                  in [(lo, hi) for lo, hi, *_ in page.range_spans()],
+                  f"{first_span} vs {page.range_spans()}")
+            check("ranges get different colors",
+                  len({c for _lo, _hi, c, _l, _a in page.range_spans()}) == 2,
+                  str([(lo, hi, c) for lo, hi, c, _l, _a in page.range_spans()]))
+
+            page.export_segment()
+            app.processEvents()
+            check("export collects every range into segments",
+                  len(page.segments) == 2,
+                  f"segments={len(page.segments)}")
+
+            # 删掉当前段，另一段还在
+            page.remove_active_range()
+            app.processEvents()
+            check("remove active range keeps the others",
+                  len(page.range_spans()) == 1,
+                  str(page.range_spans()))
+        else:
+            print("SKIP  lane drag tests  (没有可见行)")
+        page.clear_range()
+        page.clear_segments()
         app.processEvents()
 
         # ---- B1.7: 侧栏两块卡片 + 外层滚动 ----

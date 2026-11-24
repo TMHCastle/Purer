@@ -129,6 +129,23 @@ class TestSessionFile(unittest.TestCase):
         self.assertEqual(len(tab["exports"]), 1)
         self.assertEqual(tab["exports"][0]["path"], "D:/out/b.mp4")
 
+    def test_ranges_roundtrip(self):
+        tab = session.sanitize({"tabs": [_tab(
+            ranges=[{"in": 10, "out": 20, "color": 3},
+                    {"in": None, "out": None},          # 空段丢掉
+                    {"in": 30, "out": 40, "color": 99}],  # 颜色收敛
+            active_range=1)]})["tabs"][0]
+        self.assertEqual([(r["in"], r["out"]) for r in tab["ranges"]],
+                         [(10, 20), (30, 40)])
+        self.assertEqual([r["color"] for r in tab["ranges"]], [3, 99 % 6])
+        self.assertEqual(tab["active_range"], 1)
+
+    def test_ranges_missing_keeps_old_tabs(self):
+        tab = session.sanitize({"tabs": [_tab()]})["tabs"][0]
+        self.assertEqual(tab["ranges"], [])
+        self.assertEqual(tab["in_frame"], 100)      # 老字段照旧
+        self.assertEqual(tab["out_frame"], 200)
+
     def test_markers_are_sorted_and_limited(self):
         tab = session.sanitize({"tabs": [_tab(
             markers=[300, -5, "x", 120, 300, 4.7])]})["tabs"][0]

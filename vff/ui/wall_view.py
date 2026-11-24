@@ -34,9 +34,11 @@ class WallView(QListView):
     zoomRequested = Signal(int)          # Alt+滚轮：+1 放大 / -1 缩小
     rangeMoved = Signal(str, int)        # 拖动入/出点："in"/"out", 帧号
     rangeEdited = Signal(str)            # 拖动结束
+    rangeStarted = Signal()              # 开始拖一段新区间（框选刚过阈值）
     rangeDragged = Signal(int, int)      # 随意框选进行中：(按下点, 当前点)
     rangeSelected = Signal(int, int)     # 随意框选松手：按下点 → 松手点
     markerActivated = Signal(int)        # 点了绿色标记：跳到该帧
+    seekRequested = Signal(int)          # 点行内时间轴：只移动当前帧
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -44,6 +46,8 @@ class WallView(QListView):
         self.out_frame: int | None = None
         self.cursor_frame: int | None = None
         self.range_markers: list[int] = []   # M 键加的标记（和入点/出点无关）
+        # 多段区间：[(起帧, 止帧, 颜色, 层, 是否当前段), …]
+        self.ranges: list[tuple[int, int, str, int, bool]] = []
         self.timeline: Timeline = StepTimeline(24)
         self._drag: str | None = None
         self._drag_bucket: list[int] | None = None
@@ -52,8 +56,10 @@ class WallView(QListView):
         # 随意框选：按「鼠标按下点 / 当前点」换算帧，而不是格子的左右边界
         self._press_pos: QPoint | None = None
         self._press_frame: int | None = None
+        self._press_lane = False
         self._last_frame: int | None = None
         self._boxing = False
+        self._started = False
         # Alt+滚轮缩放时记住「鼠标下那一帧 + 屏幕位置」，缩放后把它钉在原地
         self._zoom_anchor: tuple[int | None, QPoint] | None = None
 
@@ -79,6 +85,15 @@ class WallView(QListView):
         cleaned = sorted({int(m) for m in (markers or ()) if int(m) >= 0})
         if cleaned != self.range_markers:
             self.range_markers = cleaned
+            self.viewport().update()
+
+    def set_ranges(self, spans):
+        """多段区间：``[(起帧, 止帧, 颜色, 层, 是否当前段), …]``。"""
+        cleaned = [(int(lo), int(hi), str(color), int(lane), bool(active))
+                   for lo, hi, color, lane, active in (spans or ())
+                   if int(hi) >= int(lo)]
+        if cleaned != self.ranges:
+            self.ranges = cleaned
             self.viewport().update()
 
     # ---------------- 滚轮 ----------------
@@ -324,6 +339,8 @@ class WallView(QListView):
         self._press_frame = None
         self._last_frame = None
         self._boxing = False
+        self._started = False
+        self._press_lane = False
         if event.button() == Qt.LeftButton:
             kind = self._handle_at(event.position().toPoint())
             if kind:
@@ -345,6 +362,8 @@ class WallView(QListView):
                 return
             self._press_pos = pos
             self._press_frame = self._frame_at_pos(pos)
+            # 按在「行内时间轴」这条窄带上：松手时只移动当前帧，不立刻设入出点
+            self._press_lane = self._row_at_y(pos.y()) is not None
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
@@ -366,6 +385,9 @@ class WallView(QListView):
             if (not self._boxing
                     and (pos - self._press_pos).manhattanLength() >= 4):
                 self._boxing = True
+                if not self._started:
+                    self._started = True
+                    self.rangeStarted.emit()      # 让 TrackPage 新开一段
             if self._boxing:
                 frame = self._frame_at_pos(pos)
                 if frame is not None:
@@ -391,15 +413,22 @@ class WallView(QListView):
             event.accept()
             return
         had, start, end = self._boxing, self._press_frame, self._last_frame
+        lane = self._press_lane
         # 先让 QListView 收尾（此时 _boxing 仍为 True，TrackPage 会忽略它的多选信号）
         super().mouseReleaseEvent(event)
         self._boxing = False
         self._press_pos = None
         self._press_frame = None
         self._last_frame = None
+        self._press_lane = False
         if had and start is not None and end is not None:
             # 最后再发一次精确区间：按下点 → 松手点，覆盖原生「整格」多选
             self.rangeSelected.emit(start, end)
+            event.accept()
+            return
+        if lane and start is not None:
+            # 只点了一下行内时间轴：移动当前帧（精确到帧），不设入点/出点
+            self.seekRequested.emit(int(start))
             event.accept()
             return
 
@@ -442,20 +471,28 @@ class WallView(QListView):
             painter.setPen(QPen(MAJOR_COLOR if major else TICK_COLOR, 1))
             painter.drawLine(x, y, x, y - (5 if major else 3))
 
-        # 范围条：严格按入点/出点的精确位置
-        if self.in_frame is not None and self.out_frame is not None:
-            lo = min(self.in_frame, self.out_frame)
-            hi = max(self.in_frame, self.out_frame)
-            row_start = self.timeline.frame_at(bucket[0])
-            row_end = self.timeline.span(bucket[-1])[1]
-            if hi >= row_start and lo <= row_end:
-                x1 = self._x_for_frame(bucket, rects, lo)
-                x2 = self._x_for_frame(bucket, rects, hi)
-                x1 = left if x1 is None else min(max(x1, left), right)
-                x2 = left if x2 is None else min(max(x2, left), right)
-                if x2 > x1:
-                    painter.setPen(QPen(RANGE_COLOR, 3))
-                    painter.drawLine(int(x1), y, int(x2), y)
+        # 多段区间：每段一条彩色带。**跨行也要连续**：中间的行从最左填到最右，
+        # 起点行从 x(lo) 到行尾，终点行从行首到 x(hi)。
+        row_start = self.timeline.frame_at(bucket[0])
+        row_end = self.timeline.span(bucket[-1])[1]
+        active_color = None
+        for lo, hi, color, lane, active in self.ranges:
+            if active:
+                active_color = color
+            if hi < row_start or lo > row_end:
+                continue
+            x1 = left if lo <= row_start else self._x_for_frame(bucket, rects, lo)
+            x2 = right if hi >= row_end else self._x_for_frame(bucket, rects, hi)
+            x1 = left if x1 is None else min(max(x1, left), right)
+            x2 = right if x2 is None else min(max(x2, left), right)
+            if x2 <= x1:
+                continue
+            off = min(3, int(lane)) * 2
+            band = QColor(color)
+            if not active:
+                band.setAlpha(170)
+            painter.setPen(QPen(band, 4 if active else 3))
+            painter.drawLine(int(x1), y - off, int(x2), y - off)
 
         # M 键标记：绿色小菱形（单点，不参与入点/出点）
         row_start = self.timeline.frame_at(bucket[0])
@@ -474,17 +511,17 @@ class WallView(QListView):
             painter.drawPolygon(QPolygon([QPoint(xi, y - 7), QPoint(xi + 3, y - 4),
                                           QPoint(xi, y - 1), QPoint(xi - 3, y - 4)]))
 
-        # 入点 / 出点手柄（可拖）
+        # 入点 / 出点手柄（可拖；颜色跟当前段一致）
         if self.in_frame is not None:
             x = self._x_for_frame(bucket, rects, self.in_frame)
             if x is not None and left - HANDLE_HALF_W <= x <= right + HANDLE_HALF_W:
                 hot = self._hover == "in" or self._drag == "in"
-                self._paint_flag(painter, x, y, "in", hot)
+                self._paint_flag(painter, x, y, "in", hot, active_color)
         if self.out_frame is not None:
             x = self._x_for_frame(bucket, rects, self.out_frame)
             if x is not None and left - HANDLE_HALF_W <= x <= right + HANDLE_HALF_W:
                 hot = self._hover == "out" or self._drag == "out"
-                self._paint_flag(painter, x, y, "out", hot)
+                self._paint_flag(painter, x, y, "out", hot, active_color)
 
         # 当前帧：精确位置的小三角
         if self.cursor_frame is not None:
@@ -504,10 +541,11 @@ class WallView(QListView):
                                               QPoint(int(x), y + 7)]))
 
     @staticmethod
-    def _paint_flag(painter: QPainter, x: float, y: int, kind: str, hot: bool = False):
+    def _paint_flag(painter: QPainter, x: float, y: int, kind: str,
+                    hot: bool = False, color: str | None = None):
         """入点=右侧小旗，出点=左侧小旗（都画在时间轴窄带里）。"""
         xi = int(round(x))
-        color = QColor("#9DB4FF") if hot else RANGE_COLOR
+        color = QColor("#9DB4FF") if hot else QColor(color or RANGE_COLOR)
         span = 8 if hot else 7
         # 精确帧位置的竖线（同时把可拖区域画清楚）
         painter.setPen(QPen(color, 2 if hot else 1))

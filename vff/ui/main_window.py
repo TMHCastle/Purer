@@ -3,9 +3,12 @@
 
 from __future__ import annotations
 
+import ctypes
 import os
 import shutil
+import sys
 import time
+from ctypes import wintypes
 from pathlib import Path
 
 from PySide6.QtCore import (QByteArray, QEvent, QProcess, QSettings, QSize,
@@ -56,6 +59,19 @@ from .widgets import ArrowCombo, EmptyState, StepCombo
 
 CUSTOM_INDEX = len(DISPLAY_PRESETS)
 USAGE_TICK_MS = 5000        # 每 5 秒给「当前页签」记一次使用时长
+
+# ---- Windows 消息（只为吞掉 Alt 唤起的系统菜单，其它平台用不到）
+_WM_SYSCOMMAND = 0x0112
+_SC_KEYMENU = 0xF100
+
+
+class _WinMsg(ctypes.Structure):
+    _fields_ = [("hwnd", wintypes.HWND),
+                ("message", wintypes.UINT),
+                ("wParam", ctypes.c_size_t),
+                ("lParam", ctypes.c_ssize_t),
+                ("time", wintypes.DWORD),
+                ("pt", wintypes.POINT)]
 
 
 def update_checks_enabled() -> bool:
@@ -167,6 +183,19 @@ class TabStrip(QTabWidget):
 
 
 class MainWindow(FramelessWindow):
+    # ---- Alt 键：吞掉 Windows 的「系统菜单」唤起（无边框窗口会像卡死一下）
+    def nativeEvent(self, event_type, message):      # noqa: N802
+        if sys.platform == "win32":
+            try:
+                msg = ctypes.cast(int(message),
+                                  ctypes.POINTER(_WinMsg)).contents
+                if msg.message == _WM_SYSCOMMAND \
+                        and (msg.wParam & 0xFFF0) == _SC_KEYMENU:
+                    return True, 0
+            except (TypeError, ValueError, AttributeError, OSError):
+                pass
+        return super().nativeEvent(event_type, message)
+
     def __init__(self):
         # 新版本第一次启动（含热补丁重建窗口）时，把旧 C 盘缓存搬到 Purer 同盘。
         # 失败不影响启动；下次启动会重试（成功才写 marker）。

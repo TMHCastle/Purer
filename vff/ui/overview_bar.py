@@ -1,17 +1,22 @@
 # -*- coding: utf-8 -*-
-"""底部「总进度条」：整段视频缩成一条，光标 / 入点 / 出点 / 片段标记都能直接操作。
+"""底部「总进度条」：整段视频缩成一条，光标 / 多段区间 / 片段 / 标记都能直接操作。
 
-这里不存任何状态 —— ``TrackPage._sync_overview()`` 每次都把同一份
-``cursor_frame`` / ``in_frame`` / ``out_frame`` / ``segments`` / ``markers`` 推过来；
-用户在这里点/拖只发信号，回去走的仍是墙上时间轴那套回调
+这里不存「视频状态」—— ``TrackPage._sync_overview()`` 每次都把同一份
+``cursor_frame`` / ``in_frame`` / ``out_frame`` / ``ranges`` / ``segments`` /
+``markers`` 推过来；用户在这里点/拖只发信号，回去走的仍是墙上时间轴那套回调
 （``_set_cursor`` / ``_on_range_drag`` / ``_end_range_drag``），所以两边永远一致。
 
 操作：
   * 点 / 拖轨道 = 移动光标（精确到帧）；
-  * 拖两端的旗子 = 改入点 / 出点；
-  * 点琥珀色的片段标记 = 选中并跳到该片段；
-  * 点轨道下方的绿色短线 = 跳到 M 标记；
-  * 右键 = 设入点 / 设出点 / 清除区间 / 用当前选区新建片段 / 加删标记。
+  * 拖两端的旗子 = 改当前段的入点 / 出点；
+  * 点片段条 = 选中并跳到该片段；
+  * 点绿色标记 = 跳到 M 标记；
+  * **Ctrl+滚轮** = 进度条整体横向缩放；**Alt+滚轮** = 片段层上下翻；
+  * **普通滚轮** = 放大后左右平移（没放大且片段叠了很多层时也能翻层）；
+  * 双击 = 回到「整段」；右键 = 设入出点 / 清除 / 加删标记 / 缩放。
+
+片段标记**按重叠分层**（同一位置叠了很多段时按高度错开），
+放大后还会自动跟着光标走。
 """
 
 from __future__ import annotations
@@ -21,19 +26,25 @@ from PySide6.QtGui import QColor, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import QMenu, QWidget
 
 from ..util import fmt_tc
+from .range_palette import assign_lanes
 from .style import ACCENT, DIM, PANEL2, WARN
 from .wheel_util import wheel_direction
 
-BAR_H = 46              # 控件总高（轨道 + 下面一行时间）
+BAR_H = 62              # 控件总高（片段层 + 轨道 + 下面一行时间）
 MARGIN = 16             # 左右留白（贴边不好点）
-TRACK_Y = 25            # 轨道中线
+TRACK_Y = 44            # 轨道中线
 TRACK_H = 6             # 轨道粗细
-FLAG_TOP = 9            # 小旗旗面顶端
 HANDLE_HIT = 9          # 小旗命中宽度（左右各 9px）
-MIN_WIDTH = 240
+MIN_WIDTH = 260
+
+# 片段层：从 STACK_BOTTOM 往上叠，一层 6px、间隔 1px
+LANE_H = 6
+LANE_GAP = 1
+STACK_BOTTOM = 26       # 第 0 层带的底边
+VISIBLE_LANES = 4       # 一屏能看到的层数（多的靠 Alt+滚轮翻）
 
 SEG_COLOR = QColor(WARN)
-SEG_COLOR.setAlpha(190)
+SEG_COLOR.setAlpha(205)
 MARKER_COLOR = QColor("#45C995")
 RANGE_COLOR = QColor(ACCENT)
 RANGE_FILL = QColor(ACCENT)
@@ -58,7 +69,6 @@ class OverviewBar(QWidget):
     markerActivated = Signal(int)        # 点绿色标记：跳到该帧
     addMarkerRequested = Signal(int)     # 右键：在这一帧加标记
     removeMarkerRequested = Signal(int)  # 右键：删掉这个标记
-    # 时间轴伸缩是这条控件自己的事（Alt+滚轮 / 双击 / 右键），不再动缩略图尺寸
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -67,8 +77,8 @@ class OverviewBar(QWidget):
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.NoFocus)
         self.setCursor(Qt.ArrowCursor)
-        self.setToolTip("点/拖：移动光标 · 拖两端小旗：改入点/出点 · "
-                        "Alt+滚轮：伸缩时间轴 · 滚轮：左右平移 · 右键：更多")
+        self.setToolTip("点/拖：移动光标 · 拖小旗：改入出点 · "
+                        "Ctrl+滚轮：伸缩 · Alt+滚轮：翻片段层 · 右键：更多")
 
         self.fps = 25.0
         self.total = 0
@@ -76,6 +86,8 @@ class OverviewBar(QWidget):
         self.in_frame: int | None = None
         self.out_frame: int | None = None
         self._segments: list[tuple[float, float, str]] = []
+        self._segment_lanes: list[int] = []
+        self._ranges: list[tuple[int, int, str, int, bool]] = []
         self.markers: list[int] = []
         self._drag: str | None = None
         self._scrubbing = False
@@ -83,8 +95,7 @@ class OverviewBar(QWidget):
         # 时间轴伸缩：1.0 = 整段铺满（默认），越大窗口越窄
         self.zoom = 1.0
         self._view_start = 0.0          # 可见窗口左边缘（帧，浮点）
-        self._wheel_accum = 0           # 高精度滚轮 / 横向滚动累计
-        self._wheel_unit = 120          # 一个「格」的增量，按事件类型调整
+        self.band_scroll = 0            # 片段层上下翻到第几层
 
     # ------------------------------------------------------------------ 数据
     def set_media(self, total_frames: int, fps: float = 25.0):
@@ -124,9 +135,13 @@ class OverviewBar(QWidget):
             except (TypeError, ValueError, IndexError):
                 continue
             name = str(item[2]) if len(item) > 2 and item[2] else ""
-            cleaned.append((max(0.0, start), max(0.0, end), name))
+            cleaned.append((max(0.0, min(start, end)), max(start, end), name))
         if cleaned != self._segments:
             self._segments = cleaned
+            self._segment_lanes = assign_lanes(
+                [(int(round(a * self.fps)), int(round(b * self.fps)))
+                 for a, b, _n in cleaned])
+            self._clamp_band_scroll()
             self.update()
 
     def set_markers(self, markers):
@@ -134,6 +149,15 @@ class OverviewBar(QWidget):
         cleaned = sorted({int(m) for m in (markers or ()) if int(m) >= 0})
         if cleaned != self.markers:
             self.markers = cleaned
+            self.update()
+
+    def set_ranges(self, spans):
+        """多段区间：``[(起帧, 止帧, 颜色, 层, 是否当前段), …]``。"""
+        cleaned = [(int(lo), int(hi), str(color), int(lane), bool(active))
+                   for lo, hi, color, lane, active in (spans or ())
+                   if int(hi) >= int(lo)]
+        if cleaned != self._ranges:
+            self._ranges = cleaned
             self.update()
 
     # ------------------------------------------------------------------ 几何
@@ -210,7 +234,7 @@ class OverviewBar(QWidget):
         self.update()
 
     def _zoom_notches(self, notches: int, x: float):
-        """Alt+滚轮：以鼠标所在帧为锚点伸缩（每格 ×1.25 / ÷1.25）。"""
+        """Ctrl+滚轮：以鼠标所在帧为锚点伸缩（每格 ×1.25 / ÷1.25）。"""
         if not notches:
             return
         frac = (float(x) - self._track_left()) / self._usable()
@@ -222,6 +246,34 @@ class OverviewBar(QWidget):
             return
         self.set_zoom(self.zoom * factor, anchor)
 
+    # ------------------------------------------------------------------ 片段层
+    def lane_count(self) -> int:
+        return max((lane + 1 for lane in self._segment_lanes), default=0)
+
+    def _clamp_band_scroll(self):
+        limit = max(0, self.lane_count() - VISIBLE_LANES)
+        self.band_scroll = max(0, min(limit, int(self.band_scroll)))
+
+    def scroll_bands(self, notches: int) -> bool:
+        """Alt+滚轮：上下翻片段层。返回是否真的动了。"""
+        before = self.band_scroll
+        self.band_scroll = int(self.band_scroll) + int(notches)
+        self._clamp_band_scroll()
+        if self.band_scroll != before:
+            self.update()
+            return True
+        return False
+
+    def _lane_y(self, lane: int) -> int:
+        """第 lane 层带的**底边** y（随 band_scroll 上下移动）。"""
+        row = int(lane) - int(self.band_scroll)
+        return STACK_BOTTOM - row * (LANE_H + LANE_GAP)
+
+    def _lane_visible(self, lane: int) -> bool:
+        row = int(lane) - int(self.band_scroll)
+        return 0 <= row < VISIBLE_LANES
+
+    # ------------------------------------------------------------------ 命中
     def _handle_at(self, pos) -> str | None:
         """鼠标在入/出点小旗上就返回 ``"in"`` / ``"out"``。"""
         if pos.y() > self.height() - 10:
@@ -237,15 +289,21 @@ class OverviewBar(QWidget):
         return best[1] if best else None
 
     def _segment_at(self, pos) -> int | None:
-        """点在片段标记（轨道上方那条琥珀色细带）上就返回片段序号。"""
-        if not self._segments or pos.y() > TRACK_Y - 3:
+        """点在片段条上就返回片段序号（按层判断，叠起来也能点中）。"""
+        if not self._segments:
             return None
         for index, (start, end, _name) in enumerate(self._segments):
+            lane = self._segment_lanes[index] if index < len(self._segment_lanes) else 0
+            if not self._lane_visible(lane):
+                continue
+            bottom = self._lane_y(lane)
+            if not (bottom - LANE_H - 1 <= pos.y() <= bottom + 1):
+                continue
             x1 = self._x_for_frame(start * self.fps)
             x2 = self._x_for_frame(end * self.fps)
             if x2 < x1:
                 x1, x2 = x2, x1
-            if x1 - 4 <= pos.x() <= x2 + 4:
+            if x1 - 3 <= pos.x() <= x2 + 3:
                 return index
         return None
 
@@ -267,6 +325,23 @@ class OverviewBar(QWidget):
         y = TRACK_Y
         painter.setPen(Qt.NoPen)
 
+        # 片段层：按重叠分层，叠得再多也有高度差；Alt+滚轮翻层
+        for index, (start, end, _name) in enumerate(self._segments):
+            lane = self._segment_lanes[index] if index < len(self._segment_lanes) else 0
+            if not self._lane_visible(lane):
+                continue
+            x1 = self._x_for_frame(start * self.fps)
+            x2 = self._x_for_frame(end * self.fps)
+            if x2 < x1:
+                x1, x2 = x2, x1
+            if x2 < left or x1 > right:
+                continue
+            x1, x2 = max(left, x1), min(right, x2)
+            bottom = self._lane_y(lane)
+            painter.setBrush(SEG_COLOR)
+            painter.drawRoundedRect(
+                QRectF(x1, bottom - LANE_H, max(3.0, x2 - x1), LANE_H), 1.6, 1.6)
+
         # 底轨
         painter.setBrush(QColor(PANEL2))
         painter.drawRoundedRect(
@@ -281,32 +356,20 @@ class OverviewBar(QWidget):
                     QRectF(left, y - TRACK_H / 2, max(2.0, cx - left),
                            TRACK_H), 3, 3)
 
-        # 入点/出点区间（只画可见那段）
-        if self.in_frame is not None and self.out_frame is not None:
-            lo, hi = sorted((self.in_frame, self.out_frame))
+        # 多段区间：每段一条彩色带（重叠的往上错开 2px）
+        for lo, hi, color, lane, active in self._ranges:
             x1 = max(left, self._x_for_frame(lo))
             x2 = min(right, self._x_for_frame(hi))
-            if x2 >= x1:
-                painter.setBrush(RANGE_FILL)
-                painter.drawRoundedRect(
-                    QRectF(x1, y - TRACK_H / 2, max(2.0, x2 - x1), TRACK_H), 3, 3)
-
-        # 片段标记（轨道上方一条细带，两端各一个小刻度）
-        for start, end, _name in self._segments:
-            x1 = self._x_for_frame(start * self.fps)
-            x2 = self._x_for_frame(end * self.fps)
             if x2 < x1:
-                x1, x2 = x2, x1
-            if x2 < left or x1 > right:
                 continue
-            x1, x2 = max(left, x1), min(right, x2)
-            painter.setBrush(SEG_COLOR)
-            painter.drawRoundedRect(
-                QRectF(x1, y - 11, max(3.0, x2 - x1), 3), 1.5, 1.5)
-            painter.drawRect(QRectF(x1, y - 11, 1, 5))
-            painter.drawRect(QRectF(max(x1, x2 - 1), y - 11, 1, 5))
+            band = QColor(color)
+            if not active:
+                band.setAlpha(170)
+            painter.setPen(QPen(band, 5 if active else 3))
+            painter.drawLine(QPointF(x1, y - min(2, int(lane)) * 2),
+                             QPointF(x2, y - min(2, int(lane)) * 2))
 
-        # M 键标记：轨道上方绿色短竖线（单点，不和片段/入出点混）
+        # M 键标记：轨道上方绿色短竖线
         for frame in self.markers:
             x = self._x_for_frame(frame)
             if not (left - 1 <= x <= right + 1):
@@ -326,7 +389,7 @@ class OverviewBar(QWidget):
                 self._paint_flag(painter, x, "out",
                                  self._hover == "out" or self._drag == "out")
 
-        # 放大后：窗口两端的小箭头，提示「两边还有内容（滚轮平移）」
+        # 放大后：窗口两端的小箭头，提示「两边还有内容」
         if self.zoom > 1.0:
             painter.setPen(QPen(QColor(DIM), 1.5))
             start, end = self.visible_range()
@@ -349,7 +412,7 @@ class OverviewBar(QWidget):
                 painter.setBrush(CURSOR_COLOR)
                 painter.drawEllipse(QPointF(cx, y), 4.0, 4.0)
 
-        # 底部时间：左「总进度」，右「当前 / 总长」
+        # 底部时间：左「总进度 / 片段层」，右「当前 / 总长」
         font = painter.font()
         font.setPointSizeF(8.0)
         painter.setFont(font)
@@ -357,8 +420,11 @@ class OverviewBar(QWidget):
         label = "总进度"
         if self.zoom > 1.0:
             label = f"总进度 ×{self.zoom:.1f}"
+        lanes = self.lane_count()
+        if lanes > VISIBLE_LANES:
+            label += f" · 片段 {lanes} 层（Alt+滚轮）"
         if self.width() >= 520:
-            painter.drawText(QRectF(left, self.height() - 13, 120, 12),
+            painter.drawText(QRectF(left, self.height() - 12, 240, 12),
                              Qt.AlignLeft | Qt.AlignVCenter, label)
         if self.total > 0:
             current = (self.cursor_frame or 0) / self.fps
@@ -366,7 +432,7 @@ class OverviewBar(QWidget):
             text = f"{fmt_tc(current)} / 总长 {fmt_tc(total_s)}"
         else:
             text = "没有视频"
-        painter.drawText(QRectF(left, self.height() - 13, right - left, 12),
+        painter.drawText(QRectF(left, self.height() - 12, right - left, 12),
                          Qt.AlignRight | Qt.AlignVCenter, text)
         painter.end()
 
@@ -374,14 +440,15 @@ class OverviewBar(QWidget):
     def _paint_flag(painter: QPainter, x: float, kind: str, hot: bool):
         color = FLAG_HOT if hot else RANGE_COLOR
         painter.setPen(QPen(color, 2 if hot else 1))
-        painter.drawLine(QPointF(x, TRACK_Y + 3), QPointF(x, FLAG_TOP + 2))
+        painter.drawLine(QPointF(x, TRACK_Y + 3), QPointF(x, TRACK_Y - 12))
         span = 9 if hot else 8
+        top = TRACK_Y - 12
         if kind == "in":
-            points = [QPointF(x, FLAG_TOP), QPointF(x + span, FLAG_TOP + 5),
-                      QPointF(x, FLAG_TOP + 10)]
+            points = [QPointF(x, top), QPointF(x + span, top + 5),
+                      QPointF(x, top + 10)]
         else:
-            points = [QPointF(x, FLAG_TOP), QPointF(x - span, FLAG_TOP + 5),
-                      QPointF(x, FLAG_TOP + 10)]
+            points = [QPointF(x, top), QPointF(x - span, top + 5),
+                      QPointF(x, top + 10)]
         painter.setPen(Qt.NoPen)
         painter.setBrush(color)
         painter.drawPolygon(QPolygonF(points))
@@ -405,26 +472,36 @@ class OverviewBar(QWidget):
         return count if amount > 0 else -count
 
     def wheelEvent(self, event):              # noqa: N802
-        """Alt+滚轮伸缩时间轴；放大后用普通滚轮左右平移。"""
-        if not self._notches(event):
+        """Ctrl+滚轮 = 进度条横向伸缩；Alt+滚轮 = 片段层上下翻。"""
+        notches = self._notches(event)
+        if not notches:
             super().wheelEvent(event)
             return
-        notches = self._notches(event)
-        if event.modifiers() & Qt.AltModifier:
+        mods = event.modifiers()
+        if mods & Qt.ControlModifier:
             self._zoom_notches(notches, event.position().x())
             event.accept()
             return
+        if mods & Qt.AltModifier:
+            self.scroll_bands(notches)
+            event.accept()
+            return
         if self.zoom > 1.0:
-            # 放大后：滚轮左右平移（向上 = 往左），不用去够滚动条
+            # 放大后：滚轮左右平移（向上 = 往左）
             self._pan_to(self._view_start - notches * self._visible() * 0.1)
+            event.accept()
+            return
+        if self.lane_count() > VISIBLE_LANES and self.scroll_bands(notches):
             event.accept()
             return
         super().wheelEvent(event)
 
     def mouseDoubleClickEvent(self, event):   # noqa: N802
-        """双击总进度条 = 缩放到整段。"""
-        if event.button() == Qt.LeftButton and self.zoom > 1.0:
+        """双击总进度条 = 缩放到整段（片段层也回到最下面）。"""
+        if event.button() == Qt.LeftButton:
             self.reset_zoom()
+            self.band_scroll = 0
+            self.update()
             event.accept()
             return
         super().mouseDoubleClickEvent(event)
@@ -477,8 +554,12 @@ class OverviewBar(QWidget):
             self.update()
         if kind is None:
             marker = self._marker_at(pos)
-            self.setCursor(Qt.PointingHandCursor if marker is not None
-                           else Qt.ArrowCursor)
+            if marker is not None:
+                self.setCursor(Qt.PointingHandCursor)
+            elif self._segment_at(pos) is not None:
+                self.setCursor(Qt.PointingHandCursor)
+            else:
+                self.setCursor(Qt.ArrowCursor)
         self._update_tooltip(pos)
         super().mouseMoveEvent(event)
 
@@ -516,22 +597,29 @@ class OverviewBar(QWidget):
             start, end = self.visible_range()
             lines.append(f"时间轴 ×{self.zoom:.1f}：{fmt_tc(start / self.fps)} → "
                          f"{fmt_tc(end / self.fps)}")
-            lines.append("滚轮左右平移 · 双击回到整段")
+            lines.append("Ctrl+滚轮伸缩 · 普通滚轮平移 · 双击回到整段")
+        if self.lane_count() > VISIBLE_LANES:
+            lines.append(f"片段 {self.lane_count()} 层，当前从第 "
+                         f"{self.band_scroll + 1} 层起（Alt+滚轮翻层）")
         if self.in_frame is not None and self.out_frame is not None:
             lo, hi = sorted((self.in_frame, self.out_frame))
             if lo <= frame <= hi:
-                lines.append(f"在选区里（{hi - lo + 1} 帧）")
+                lines.append(f"在当前段里（{hi - lo + 1} 帧）")
         if self.in_frame is not None:
             lines.append(f"入点 #{self.in_frame} {fmt_tc(self.in_frame / self.fps)}")
         if self.out_frame is not None:
             lines.append(f"出点 #{self.out_frame} {fmt_tc(self.out_frame / self.fps)}")
-        for start, end, name in self._segments:
-            x1 = self._x_for_frame(start * self.fps)
-            x2 = self._x_for_frame(end * self.fps)
-            if min(x1, x2) - 4 <= pos.x() <= max(x1, x2) + 4:
-                label = f"片段「{name}」" if name else "片段"
-                lines.append(f"{label}：{fmt_tc(start)} → {fmt_tc(end)}")
+        for lo, hi, _color, _lane, active in self._ranges:
+            if min(lo, hi) <= frame <= max(lo, hi):
+                tag = "（当前段）" if active else ""
+                lines.append(f"区间 {fmt_tc(lo / self.fps)} → "
+                             f"{fmt_tc(hi / self.fps)}{tag}")
                 break
+        index = self._segment_at(pos)
+        if index is not None and 0 <= index < len(self._segments):
+            start, end, name = self._segments[index]
+            label = f"片段「{name}」" if name else f"片段 #{index + 1}"
+            lines.append(f"{label}：{fmt_tc(start)} → {fmt_tc(end)}")
         for frame in self.markers:
             if abs(pos.x() - self._x_for_frame(frame)) <= 5:
                 lines.append(f"标记：第 {frame} 帧 · {fmt_tc(frame / self.fps)}")
@@ -567,10 +655,14 @@ class OverviewBar(QWidget):
         menu.addSeparator()
         act_seek = menu.addAction("光标跳到这里")
         menu.addSeparator()
-        act_zin = menu.addAction("时间轴放大（也可以 Alt+滚轮向上）")
-        act_zout = menu.addAction("时间轴缩小（也可以 Alt+滚轮向下）")
+        act_zin = menu.addAction("时间轴放大（也可以 Ctrl+滚轮向上）")
+        act_zout = menu.addAction("时间轴缩小（也可以 Ctrl+滚轮向下）")
         act_zfit = menu.addAction("显示整段（双击时间轴）")
-        act_zfit.setEnabled(self.zoom > 1.0)
+        act_zfit.setEnabled(self.zoom > 1.0 or self.band_scroll > 0)
+        act_lane_up = menu.addAction("片段层往上看（Alt+滚轮向上）")
+        act_lane_down = menu.addAction("片段层往下看（Alt+滚轮向下）")
+        act_lane_up.setEnabled(self.band_scroll < self.lane_count() - VISIBLE_LANES)
+        act_lane_down.setEnabled(self.band_scroll > 0)
         chosen = menu.exec(event.globalPos())
         if chosen is act_in:
             self.setInRequested.emit(frame)
@@ -594,6 +686,12 @@ class OverviewBar(QWidget):
             self._zoom_notches(-1, pos.x())
         elif chosen is act_zfit:
             self.reset_zoom()
+            self.band_scroll = 0
+            self.update()
+        elif chosen is act_lane_up:
+            self.scroll_bands(1)
+        elif chosen is act_lane_down:
+            self.scroll_bands(-1)
 
     # ------------------------------------------------------------------ 其它
     def sizeHint(self) -> QSize:              # noqa: N802

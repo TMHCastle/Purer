@@ -74,10 +74,11 @@ class SegmentRow(QFrame):
         self.setFixedHeight(SEG_ROW_H)
         self.setProperty("active", "false")
         self.setCursor(Qt.PointingHandCursor)
+        self.setFocusPolicy(Qt.ClickFocus)      # 点一下选中，Delete/退格可删
         self.setToolTip(f"第 {index + 1} 段 · {_time(t1)} → {_time(t2)}"
                         f"（{max(0.0, t2 - t1):.2f} 秒）"
                         + (f"\n素材名：{name}" if name else "")
-                        + "\n点击跳到这一段")
+                        + "\n点击跳到这一段 · Delete / 退格 删除")
 
         lay = QHBoxLayout(self)
         lay.setContentsMargins(6, 4, 5, 4)
@@ -130,8 +131,17 @@ class SegmentRow(QFrame):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
+            self.setFocus(Qt.MouseFocusReason)
             self.clicked.emit(self.index)
         super().mousePressEvent(event)
+
+    def keyPressEvent(self, event):
+        """Delete / 退格：删掉这一条片段。"""
+        if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
+            self.removed.emit(self.index)
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def set_active(self, active: bool):
         self.setProperty("active", "true" if active else "false")

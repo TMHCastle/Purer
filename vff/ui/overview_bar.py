@@ -70,11 +70,14 @@ class OverviewBar(QWidget):
     markerActivated = Signal(int)        # 点绿色标记：跳到该帧
     addMarkerRequested = Signal(int)     # 右键：在这一帧加标记
     removeMarkerRequested = Signal(int)  # 右键：删掉这个标记
+    deleteActiveRequested = Signal()     # Delete / 退格：删掉选中的片段或区间
+    heightScaleRequested = Signal(int)   # Alt+滚轮：整块跟着长高/变矮（格数）
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumHeight(MIN_BAR_H)
         self.setMouseTracking(True)
+        # 不抢焦点：页面里的 M / I / O / 空格 等快捷键要留给墙上
         self.setFocusPolicy(Qt.NoFocus)
         self.setCursor(Qt.ArrowCursor)
         self.setToolTip("点/拖：移动光标 · 拖小旗：改入出点 · "
@@ -401,7 +404,12 @@ class OverviewBar(QWidget):
                     QRectF(left, y - TRACK_H / 2, max(2.0, cx - left),
                            TRACK_H), 3, 3)
 
-        # 多段区间：每段一条彩色带（重叠的往上错开 2px）
+        # 多段区间：每段一条彩色带（重叠的往上错开；厚度也跟「层高」一起缩放，
+        # 这样就算还没有片段，Alt+滚轮也有看得见的变化）
+        scale = max(0.5, float(self.band_step) / BAND_STEP_DEFAULT)
+        thick_active = max(3, int(round(5 * scale)))
+        thick_other = max(2, int(round(3 * scale)))
+        offset = max(1, int(round(2 * scale)))
         for lo, hi, color, lane, active in self._ranges:
             x1 = max(left, self._x_for_frame(lo))
             x2 = min(right, self._x_for_frame(hi))
@@ -410,9 +418,9 @@ class OverviewBar(QWidget):
             band = QColor(color)
             if not active:
                 band.setAlpha(170)
-            painter.setPen(QPen(band, 5 if active else 3))
-            painter.drawLine(QPointF(x1, y - min(2, int(lane)) * 2),
-                             QPointF(x2, y - min(2, int(lane)) * 2))
+            yy = y - min(2, int(lane)) * offset
+            painter.setPen(QPen(band, thick_active if active else thick_other))
+            painter.drawLine(QPointF(x1, yy), QPointF(x2, yy))
 
         # M 键标记：轨道上方绿色短竖线
         for frame in self.markers:
@@ -466,8 +474,10 @@ class OverviewBar(QWidget):
         if self.zoom > 1.0:
             label = f"总进度 ×{self.zoom:.1f}"
         lanes = self.lane_count()
+        if lanes or self._ranges:
+            label += f" · 层高 {self.band_step}px"
         if lanes > self.visible_lanes():
-            label += f" · 片段 {lanes} 层（Alt+滚轮调高度）"
+            label += f" · 片段 {lanes} 层"
         if self.width() >= 520:
             painter.drawText(QRectF(left, self.height() - 12, 240, 12),
                              Qt.AlignLeft | Qt.AlignVCenter, label)
@@ -529,6 +539,8 @@ class OverviewBar(QWidget):
             return
         if mods & Qt.AltModifier:
             self.scale_bands(notches)
+            # 整块也跟着长高/变矮：没有片段时也有明显反应，且放大的层数不会白丢
+            self.heightScaleRequested.emit(int(notches))
             event.accept()
             return
         if self.zoom > 1.0:
@@ -540,6 +552,14 @@ class OverviewBar(QWidget):
             event.accept()
             return
         super().wheelEvent(event)
+
+    def keyPressEvent(self, event):           # noqa: N802
+        """选中片段/区间后按 Delete 或退格就能删。"""
+        if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
+            self.deleteActiveRequested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def mouseDoubleClickEvent(self, event):   # noqa: N802
         """双击总进度条 = 缩放到整段（片段层也回到最下面）。"""

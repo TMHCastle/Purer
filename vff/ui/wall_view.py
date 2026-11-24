@@ -39,6 +39,7 @@ class WallView(QListView):
     rangeSelected = Signal(int, int)     # 随意框选松手：按下点 → 松手点
     markerActivated = Signal(int)        # 点了绿色标记：跳到该帧
     seekRequested = Signal(int)          # 点行内时间轴：只移动当前帧
+    deleteRequested = Signal()           # Delete / 退格：删掉选中的片段或区间
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -96,6 +97,16 @@ class WallView(QListView):
         if cleaned != self.ranges:
             self.ranges = cleaned
             self.viewport().update()
+
+    # ---------------- 键盘 ----------------
+    def keyPressEvent(self, event):
+        # 退格在 QListView 里被「键盘搜索」吃掉，快捷键也可能抢不过它，
+        # 所以直接在这里处理：两个键都是「删掉当前选中的片段/区间」。
+        if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
+            self.deleteRequested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     # ---------------- 滚轮 ----------------
     def wheelEvent(self, event):

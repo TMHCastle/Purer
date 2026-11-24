@@ -779,6 +779,64 @@ def main() -> int:
         page.clear_segments()
         app.processEvents()
 
+        # ---- B1.6c: Delete / 退格 删片段；Alt+滚轮 同时放大层高和整块 ----
+        for i in range(3):
+            page.set_in_point(10 + i * 30)
+            page.set_out_point(20 + i * 30)
+            page.add_segment()
+        app.processEvents()
+        check("three segments added", len(page.segments) == 3,
+              str(len(page.segments)))
+        check("last segment is the active one", page._active_segment == 2,
+              str(page._active_segment))
+        page.select_segment(0)
+        check("selecting a segment marks it as delete target",
+              page._delete_target == "segment", page._delete_target)
+        page._delete_selected()
+        app.processEvents()
+        check("delete removes the selected segment", len(page.segments) == 2,
+              str(len(page.segments)))
+        if page.side._rows:
+            QTest.keyClick(page.side._rows[0], Qt.Key_Delete)
+            app.processEvents()
+            check("Delete key on a segment row removes it",
+                  len(page.segments) == 1, str(len(page.segments)))
+        else:
+            print("SKIP  Delete key on a segment row  (没有行)")
+        page.view.setFocus()
+        app.processEvents()
+        QTest.keyClick(page.view, Qt.Key_Backspace)
+        app.processEvents()
+        check("Backspace on the wall deletes the active segment",
+              len(page.segments) == 0, str(len(page.segments)))
+
+        page.clear_range()
+        page.set_in_point(5)
+        page.set_out_point(15)
+        app.processEvents()
+        check("one range ready to delete", len(page.range_spans()) == 1,
+              str(page.range_spans()))
+        page._delete_selected()
+        app.processEvents()
+        check("Delete removes the active range", page.range_spans() == [],
+              str(page.range_spans()))
+
+        step0, height0 = bar.band_step, bar.height()
+        event = QWheelEvent(QPointF(bar.width() * 0.5, bar.track_y()),
+                            QPointF(bar.width() * 0.5, bar.track_y()),
+                            QPoint(0, 0), QPoint(0, 120), Qt.NoButton,
+                            Qt.AltModifier, Qt.NoScrollPhase, False)
+        bar.wheelEvent(event)
+        app.processEvents()
+        check("alt+wheel scales bands and the whole panel",
+              bar.band_step > step0 and bar.height() > height0,
+              f"step {step0}->{bar.band_step} h {height0}->{bar.height()}")
+        bar.scale_bands(-1)
+        page.set_overview_height(height0)
+        page.clear_segments()
+        page.clear_range()
+        app.processEvents()
+
         # ---- B1.7: 侧栏两块卡片 + 外层滚动 ----
         side = page.side
         check("sidebar has two cards",

@@ -661,24 +661,29 @@ def main() -> int:
         check("stack starts at bottom lane", bar.band_scroll == 0,
               str(bar.band_scroll))
         check("bands have real height",
-              bar.band_height() >= 8 and bar.band_gap() >= 3,
+              bar.band_height() >= 8 and bar.band_gap() == 4,
               f"band={bar.band_height()} gap={bar.band_gap()}")
-        step_before = bar.band_step
+        h_before = bar.band_height()
+        gap_before = bar.band_gap()
+        panel_before = bar.height()
         event = QWheelEvent(QPointF(bar.width() * 0.5, 20),
                             QPointF(bar.width() * 0.5, 20),
                             QPoint(0, 0), QPoint(0, 120), Qt.NoButton,
                             Qt.AltModifier, Qt.NoScrollPhase, False)
         bar.wheelEvent(event)
         app.processEvents()
-        check("alt+wheel scales the segment lanes", bar.band_step > step_before,
-              f"{step_before} -> {bar.band_step}")
-        check("alt+wheel grows height and gap together",
-              bar.band_height() > 8 and bar.band_gap() >= 4,
-              f"band={bar.band_height()} gap={bar.band_gap()}")
+        check("alt+wheel makes segment bars taller",
+              bar.band_height() > h_before,
+              f"{h_before} -> {bar.band_height()}")
+        check("gap stays fixed at 4px", bar.band_gap() == gap_before == 4,
+              f"{gap_before} -> {bar.band_gap()}")
+        check("alt+wheel leaves the panel height alone",
+              bar.height() == panel_before,
+              f"{panel_before} -> {bar.height()}")
         check("alt+wheel does not zoom the bar", bar.zoom == 1.0, str(bar.zoom))
         bar.scale_bands(-1)
-        check("lanes scale back", bar.band_step == step_before,
-              f"{step_before} -> {bar.band_step}")
+        check("lanes scale back", bar.band_height() == h_before,
+              f"{h_before} -> {bar.band_height()}")
         check("plain wheel scrolls lanes", bar.scroll_bands(1)
               and bar.band_scroll == 1, str(bar.band_scroll))
         bar.scroll_bands(-1)
@@ -821,18 +826,17 @@ def main() -> int:
         check("Delete removes the active range", page.range_spans() == [],
               str(page.range_spans()))
 
-        step0, height0 = bar.band_step, bar.height()
+        band0, panel0 = bar.band_height(), bar.height()
         event = QWheelEvent(QPointF(bar.width() * 0.5, bar.track_y()),
                             QPointF(bar.width() * 0.5, bar.track_y()),
                             QPoint(0, 0), QPoint(0, 120), Qt.NoButton,
                             Qt.AltModifier, Qt.NoScrollPhase, False)
         bar.wheelEvent(event)
         app.processEvents()
-        check("alt+wheel scales bands and the whole panel",
-              bar.band_step > step0 and bar.height() > height0,
-              f"step {step0}->{bar.band_step} h {height0}->{bar.height()}")
+        check("alt+wheel only changes bar height, not the panel",
+              bar.band_height() > band0 and bar.height() == panel0,
+              f"band {band0}->{bar.band_height()} h {panel0}->{bar.height()}")
         bar.scale_bands(-1)
-        page.set_overview_height(height0)
         page.clear_segments()
         page.clear_range()
         app.processEvents()

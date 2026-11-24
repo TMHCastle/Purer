@@ -37,12 +37,11 @@ TRACK_H = 6             # 轨道粗细
 HANDLE_HIT = 9          # 小旗命中宽度（左右各 9px）
 MIN_WIDTH = 260
 
-# 片段层：高度随控件高度和 band_step 自动算
-# band_step = 一条带 + 它与上一条之间的空隙；Alt+滚轮按同比例放大/缩小这两项
-BAND_STEP_MIN = 6
-BAND_STEP_MAX = 40
-BAND_STEP_DEFAULT = 14
-BAND_RATIO = 0.72       # 带本身占 step 的比例（剩下的就是缝）
+# 片段条：只改条本身的高度，缝隙永远是 4px（PR 里加高轨道不会加宽间距）
+BAND_H_MIN = 6
+BAND_H_MAX = 40
+BAND_H_DEFAULT = 10
+BAND_GAP = 4            # 固定缝隙
 
 SEG_COLOR = QColor(WARN)
 SEG_COLOR.setAlpha(205)
@@ -71,7 +70,6 @@ class OverviewBar(QWidget):
     addMarkerRequested = Signal(int)     # 右键：在这一帧加标记
     removeMarkerRequested = Signal(int)  # 右键：删掉这个标记
     deleteActiveRequested = Signal()     # Delete / 退格：删掉选中的片段或区间
-    heightScaleRequested = Signal(int)   # Alt+滚轮：整块跟着长高/变矮（格数）
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -99,7 +97,7 @@ class OverviewBar(QWidget):
         self.zoom = 1.0
         self._view_start = 0.0          # 可见窗口左边缘（帧，浮点）
         self.band_scroll = 0            # 片段层上下翻到第几层
-        self.band_step = BAND_STEP_DEFAULT   # 一条带 + 缝的总高度（Alt+滚轮改）
+        self.band_h = BAND_H_DEFAULT     # 一条片段条的高度（Alt+滚轮改，缝隙固定 4px）
 
     # ------------------------------------------------------------------ 数据
     def set_media(self, total_frames: int, fps: float = 25.0):
@@ -252,22 +250,26 @@ class OverviewBar(QWidget):
 
     # ------------------------------------------------------------------ 片段层
     def band_height(self) -> int:
-        return max(3, int(round(self.band_step * BAND_RATIO)))
+        return max(BAND_H_MIN, min(BAND_H_MAX, int(self.band_h)))
 
     def band_gap(self) -> int:
-        return max(1, int(self.band_step) - self.band_height())
+        """相邻两条之间的缝隙：固定 4px（Alt+滚轮只改条高，不改缝）。"""
+        return BAND_GAP
+
+    def band_step(self) -> int:
+        return self.band_height() + self.band_gap()
 
     def track_y(self) -> int:
         """轨道中线（跟着控件高度走：下面还有一行时间）。"""
         return max(20, self.height() - 18)
 
     def stack_bottom(self) -> int:
-        """第 0 层带的底边（在小旗上方）。"""
-        return max(8, self.track_y() - 13)
+        """第 0 层片段条的底边：**浮在**时间轴小旗上方（留 6px 空隙）。"""
+        return max(8, self.track_y() - 18)
 
     def visible_lanes(self) -> int:
         stack = max(0, self.stack_bottom() - 3)
-        return max(1, stack // max(1, int(self.band_step)))
+        return max(1, stack // max(1, self.band_step()))
 
     def lane_count(self) -> int:
         return max((lane + 1 for lane in self._segment_lanes), default=0)
@@ -287,12 +289,12 @@ class OverviewBar(QWidget):
         return False
 
     def scale_bands(self, notches: int) -> bool:
-        """Alt+滚轮：把「带高 + 缝隙」按同比例放大 / 缩小。"""
-        before = self.band_step
-        self.band_step = int(self.band_step) + int(notches) * 2
-        self.band_step = max(BAND_STEP_MIN, min(BAND_STEP_MAX, self.band_step))
+        """Alt+滚轮：只把片段条加高 / 压低（缝隙保持 4px 不变）。"""
+        before = self.band_height()
+        self.band_h = int(self.band_h) + int(notches) * 2
+        self.band_h = max(BAND_H_MIN, min(BAND_H_MAX, self.band_h))
         self._clamp_band_scroll()
-        if self.band_step != before:
+        if self.band_height() != before:
             self.update()
             return True
         return False
@@ -300,7 +302,7 @@ class OverviewBar(QWidget):
     def _lane_y(self, lane: int) -> int:
         """第 lane 层带的**底边** y（随 band_scroll 上下移动）。"""
         row = int(lane) - int(self.band_scroll)
-        return self.stack_bottom() - row * max(1, int(self.band_step))
+        return self.stack_bottom() - row * max(1, self.band_step())
 
     def _lane_visible(self, lane: int) -> bool:
         row = int(lane) - int(self.band_scroll)
@@ -385,10 +387,21 @@ class OverviewBar(QWidget):
                 continue
             x1, x2 = max(left, x1), min(right, x2)
             bottom = self._lane_y(lane)
+            height = self.band_height()
             painter.setBrush(SEG_COLOR)
             painter.drawRoundedRect(
-                QRectF(x1, bottom - self.band_height(),
-                       max(3.0, x2 - x1), self.band_height()), 2.0, 2.0)
+                QRectF(x1, bottom - height, max(3.0, x2 - x1), height),
+                2.0, 2.0)
+            if height >= 16 and (x2 - x1) >= 46:
+                font = painter.font()
+                font.setPointSizeF(7.5)
+                painter.setFont(font)
+                painter.setPen(QColor("#20180A"))
+                text = f"#{index + 1}" + (f" {_name}" if _name else "")
+                painter.drawText(
+                    QRectF(x1 + 5, bottom - height, x2 - x1 - 10, height),
+                    Qt.AlignVCenter | Qt.AlignLeft, text)
+                painter.setPen(Qt.NoPen)
 
         # 底轨
         painter.setBrush(QColor(PANEL2))
@@ -406,7 +419,7 @@ class OverviewBar(QWidget):
 
         # 多段区间：每段一条彩色带（重叠的往上错开；厚度也跟「层高」一起缩放，
         # 这样就算还没有片段，Alt+滚轮也有看得见的变化）
-        scale = max(0.5, float(self.band_step) / BAND_STEP_DEFAULT)
+        scale = max(0.5, float(self.band_height()) / BAND_H_DEFAULT)
         thick_active = max(3, int(round(5 * scale)))
         thick_other = max(2, int(round(3 * scale)))
         offset = max(1, int(round(2 * scale)))
@@ -475,9 +488,12 @@ class OverviewBar(QWidget):
             label = f"总进度 ×{self.zoom:.1f}"
         lanes = self.lane_count()
         if lanes or self._ranges:
-            label += f" · 层高 {self.band_step}px"
-        if lanes > self.visible_lanes():
-            label += f" · 片段 {lanes} 层"
+            label += f" · 条高 {self.band_height()}px"
+        visible = self.visible_lanes()
+        if lanes > visible:
+            first = self.band_scroll + 1
+            last = min(lanes, self.band_scroll + visible)
+            label += f" · 片段 {lanes} 层（看第 {first}-{last} 层，滚轮翻）"
         if self.width() >= 520:
             painter.drawText(QRectF(left, self.height() - 12, 240, 12),
                              Qt.AlignLeft | Qt.AlignVCenter, label)
@@ -539,8 +555,6 @@ class OverviewBar(QWidget):
             return
         if mods & Qt.AltModifier:
             self.scale_bands(notches)
-            # 整块也跟着长高/变矮：没有片段时也有明显反应，且放大的层数不会白丢
-            self.heightScaleRequested.emit(int(notches))
             event.accept()
             return
         if self.zoom > 1.0:
@@ -725,10 +739,10 @@ class OverviewBar(QWidget):
         act_zout = menu.addAction("时间轴缩小（也可以 Ctrl+滚轮向下）")
         act_zfit = menu.addAction("显示整段（双击时间轴）")
         act_zfit.setEnabled(self.zoom > 1.0 or self.band_scroll > 0)
-        act_band_big = menu.addAction("片段层加高（Alt+滚轮向上）")
-        act_band_small = menu.addAction("片段层减小（Alt+滚轮向下）")
-        act_band_big.setEnabled(self.band_step < BAND_STEP_MAX)
-        act_band_small.setEnabled(self.band_step > BAND_STEP_MIN)
+        act_band_big = menu.addAction("片段条加高（Alt+滚轮向上）")
+        act_band_small = menu.addAction("片段条压低（Alt+滚轮向下）")
+        act_band_big.setEnabled(self.band_height() < BAND_H_MAX)
+        act_band_small.setEnabled(self.band_height() > BAND_H_MIN)
         act_lane_up = menu.addAction("片段层往上看（普通滚轮向上）")
         act_lane_down = menu.addAction("片段层往下看（普通滚轮向下）")
         act_lane_up.setEnabled(

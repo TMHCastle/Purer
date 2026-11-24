@@ -250,7 +250,6 @@ class TrackPage(QWidget):
         self.overview.addMarkerRequested.connect(self.add_marker)
         self.overview.removeMarkerRequested.connect(self.remove_marker)
         self.overview.deleteActiveRequested.connect(self._delete_selected)
-        self.overview.heightScaleRequested.connect(self._scale_overview_height)
         self._refresh_markers()
 
         # 兼容别名：导出/批处理等既有逻辑继续用原来的控件名
@@ -1766,10 +1765,6 @@ class TrackPage(QWidget):
         total = max(1, sum(sizes))
         self.vsplit.setSizes([max(180, total - px), px])
         self.overview_height_changed.emit(self.overview_height())
-
-    def _scale_overview_height(self, notches: int):
-        """Alt+滚轮：整块按格数长高 / 变矮（和层高同步，效果看得见）。"""
-        self.set_overview_height(self.overview_height() + int(notches) * 6)
 
     def _on_overview_resized(self, _pos: int, _index: int):
         self.overview._clamp_band_scroll()

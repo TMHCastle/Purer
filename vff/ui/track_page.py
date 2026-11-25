@@ -1396,16 +1396,14 @@ class TrackPage(QWidget):
                 self.side.set_export_text(
                     "现在底部片段层没选中的条：先选要加入队列的，再按回车")
             return 0
-        added = 0
-        for lo, hi in spans:
-            if self._queue_span(lo, hi):
-                added += 1
+        added = self._move_ranges_to_queue(spans)
         self._refresh_segments()
+        self._refresh_range()
         if added:
             self._delete_target = "segment"
             self.side.set_active_segment(self._active_segment)
             self.side.set_export_text(
-                f"已把 {added} 段加入片段列表（导出队列，共 {len(self.segments)} 段）")
+                f"已把 {added} 段搬进片段列表（导出队列，共 {len(self.segments)} 段）")
         else:
             self.side.set_export_text("选中的段已经在队列里了（没有重复添加）")
         self.save_state()
@@ -1952,21 +1950,11 @@ class TrackPage(QWidget):
     def _collect_ranges_to_segments(self):
         """把画好的每一段都收进片段列表（重复的跳过，不导出文件）。"""
         self._push_undo()
-        fps = self._fps()
-        added = 0
-        for lo, hi, *_rest in self.range_spans():
-            if hi <= lo:
-                continue
-            t_in, t_end = lo / fps, hi / fps
-            if any(abs(s["t_in"] - t_in) < 1e-6
-                   and abs(s["t_end"] - t_end) < 1e-6
-                   for s in self.segments):
-                continue
-            self.segments.append({"t_in": t_in, "t_end": t_end, "name": ""})
-            added += 1
+        spans = [(lo, hi) for lo, hi, *_rest in self.range_spans() if hi > lo]
+        added = self._move_ranges_to_queue(spans)
         self._refresh_segments()
+        self._refresh_range()
         if added:
-            self._active_segment = len(self.segments) - 1
             self._delete_target = "segment"
             self.side.set_active_segment(self._active_segment)
         self.side.set_export_text(
@@ -1989,10 +1977,41 @@ class TrackPage(QWidget):
         self._active_segment = len(self.segments) - 1
         return True
 
-    def add_segment(self):
-        """「＋ 加入 A」：优先加**选中的条**；没选才用当前入点/出点。
+    def _move_ranges_to_queue(self, spans) -> int:
+        """把给定区间**搬**进片段队列：加片段 + 从区间列表里删掉（不并排留一条一样的）。"""
+        keys = {(int(lo), int(hi)) for lo, hi in spans if int(hi) > int(lo)}
+        if not keys:
+            return 0
+        added = 0
+        for lo, hi in sorted(keys):
+            if self._queue_span(lo, hi):
+                added += 1
+        kept = []
+        dropped = 0
+        for rng in self.ranges:
+            lo, hi = rng.get("in"), rng.get("out")
+            if lo is not None and hi is not None:
+                key = (int(min(lo, hi)), int(max(lo, hi)))
+                if key in keys:
+                    dropped += 1
+                    continue
+            kept.append(rng)
+        if dropped:
+            self.ranges = kept
+            if self.ranges:
+                self.active_range = max(0, min(len(self.ranges) - 1,
+                                               self.active_range))
+                rng = self.ranges[self.active_range]
+                self.in_frame, self.out_frame = rng.get("in"), rng.get("out")
+            else:
+                self.active_range = -1
+                self.in_frame = self.out_frame = None
+        return added
 
-        * 选中的是区间 → 就把它加入队列（已经在队列里则不重复加）；
+    def add_segment(self):
+        """「＋ 加入 A」：优先把**选中的条**搬进队列；没选才用当前入点/出点。
+
+        * 选中的是区间 → **搬**进队列（区间本身消失，只留琥珀片段块）；
         * 选中的是队列里的片段 → 什么都不复制，只把它选中；
         * 什么都没选 → 用当前入点/出点。
         """
@@ -2002,14 +2021,12 @@ class TrackPage(QWidget):
                         and int(b["hi"]) > int(b["lo"])})
         if spans:
             self._push_undo()
-            added = 0
-            for lo, hi in spans:
-                if self._queue_span(lo, hi):
-                    added += 1
+            added = self._move_ranges_to_queue(spans)
             self._delete_target = "segment"
             self._refresh_segments()
+            self._refresh_range()
             self.side.set_export_text(
-                f"已把选中的 {added} 段加入队列（共 {len(self.segments)} 段）"
+                f"已把选中的 {added} 段搬进片段队列（共 {len(self.segments)} 段）"
                 if added else "选中的段已经在队列里了（没有重复添加）")
             self.save_state()
             return
@@ -2024,11 +2041,13 @@ class TrackPage(QWidget):
             self.side.set_export_text("先设入点/出点（I/O 各按一次），再加片段")
             return
         self._push_undo()
-        added = self._queue_span(self.in_frame, self.out_frame)
+        span = (int(self.in_frame), int(self.out_frame))
+        added = self._move_ranges_to_queue([span])
         self._delete_target = "segment"
         self._refresh_segments()
+        self._refresh_range()
         self.side.set_export_text(
-            f"已加入片段 #{len(self.segments)}（共 {len(self.segments)} 段）"
+            f"已把这一段搬进片段队列（共 {len(self.segments)} 段）"
             if added else "这一段已经在队列里了（已帮你选中它）")
         self.save_state()
 

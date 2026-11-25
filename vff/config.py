@@ -11,7 +11,7 @@ from pathlib import Path
 APP_NAME = "Purer"
 APP_TAGLINE = "视频抽帧浏览 / 帧精确切片"
 APP_ID = "Purer"
-APP_VERSION = "1.2.15"
+APP_VERSION = "1.2.16"
 # 热补丁包的兼容基线：以后打的代码包只支持 **>= 这个版本** 的 exe。
 # 动了引导层 / 打包数据 / 依赖（这些热补丁改不了的东西）才需要往上抬。
 CODE_BASE_VERSION = "1.2.0"

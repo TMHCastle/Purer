@@ -896,11 +896,17 @@ def main() -> int:
 
             page.export_segment()
             app.processEvents()
-            check("export collects every range into segments",
-                  len(page.segments) == 2,
-                  f"segments={len(page.segments)}")
+            check("export moves the ranges into the queue",
+                  len(page.segments) == 2 and page.range_spans() == [],
+                  f"segments={len(page.segments)} ranges={page.range_spans()}")
 
-            # 删掉当前段，另一段还在
+            # 删掉当前段，另一段还在（重新造两段区间）
+            page.ranges = [{"in": 10, "out": 20, "color": 0},
+                           {"in": 30, "out": 40, "color": 1}]
+            page.active_range = 0
+            page.in_frame, page.out_frame = 10, 20
+            page._refresh_range()
+            app.processEvents()
             page.remove_active_range()
             app.processEvents()
             check("remove active range keeps the others",
@@ -1395,6 +1401,34 @@ def main() -> int:
             check("mixed selection delete keeps queued segments", False,
                   f"rng={rng_band} seg={seg_band}")
 
+        # 区间 → 队列：搬过去（区间从底栏消失，不并排留一条一样的）
+        page.clear_segments()
+        page.clear_range()
+        page.ranges = [{"in": 24, "out": 36, "color": 0}]
+        page.active_range = 0
+        page.in_frame, page.out_frame = 24, 36
+        page._refresh_range()
+        app.processEvents()
+        check("one range band before adding",
+              len([b for b in bar._bands if b["kind"] == "range"]) == 1,
+              str([(b["kind"], b["lo"], b["hi"]) for b in bar._bands]))
+        page.add_segment()
+        app.processEvents()
+        kinds = [(b["kind"], int(b["lo"]), int(b["hi"])) for b in bar._bands]
+        check("adding a range moves it into the queue",
+              len(page.segments) == 1 and page.range_spans() == []
+              and len([k for k in kinds if k[0] == "segment"]) == 1
+              and not [k for k in kinds if k[0] == "range"],
+              f"segments={len(page.segments)} ranges={page.range_spans()} "
+              f"bands={kinds}")
+        check("moved band keeps the same place",
+              bool([k for k in kinds if k[0] == "segment"
+                    and k[1] == 24 and k[2] == 36]),
+              str(kinds))
+        page.clear_segments()
+        page.clear_range()
+        app.processEvents()
+
         # 加入队列：加的是「选中的那条」，且重复加不产生副本
         page.clear_segments()
         page.ranges = [{"in": 24, "out": 36, "color": 0},
@@ -1416,15 +1450,12 @@ def main() -> int:
                    for seg in page.segments]
             check("adding a selected range queues that range",
                   got == [want], f"{got} want {want}")
-            second = next(b for b in bar._bands
-                          if b["kind"] == "range" and int(b["lo"]) == 100)
-            check("queued range band is marked",
-                  bool(second.get("queued")), str(second.get("queued")))
-            # 再点一次（选中的还是这条区间）→ 不重复
-            page.add_segment()
-            app.processEvents()
-            check("adding the same range twice does not duplicate",
-                  len(page.segments) == 1, str(len(page.segments)))
+            rest = [b for b in bar._bands if b["kind"] == "range"]
+            check("the other range stays on the bar",
+                  [int(b["lo"]) for b in rest] == [24], str(rest))
+            check("queued span leaves no duplicate range",
+                  not [b for b in rest if int(b["lo"]) == 100],
+                  str([(int(b["lo"]), int(b["hi"])) for b in rest]))
             # 选中队列里的片段再点加入 → 什么都不加
             seg_band = next((b for b in bar._bands
                              if b["kind"] == "segment"), None)
@@ -1447,8 +1478,8 @@ def main() -> int:
             app.processEvents()
         else:
             for label in ("adding a selected range queues that range",
-                          "queued range band is marked",
-                          "adding the same range twice does not duplicate",
+                          "the other range stays on the bar",
+                          "queued span leaves no duplicate range",
                           "adding a queued segment does not copy it"):
                 check(label, False)
 
@@ -1993,6 +2024,10 @@ def main() -> int:
               f"{len(restored)} vs {page.model.rowCount()}")
 
         # ---- 2b2. 片段状态（片段 / 入点出点 / 导出记录）跟着缓存放，重开能恢复 ----
+        # 区间也要随缓存保存：先画一段（「加入片段」会把区间搬进队列，所以这里单独画）
+        page.set_in_point(72)
+        page.set_out_point(90)
+        app.processEvents()
         digest = page.cache_digest()
         page.save_state()
         state = win.cache_store.read_state(digest)

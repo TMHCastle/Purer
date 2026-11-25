@@ -1148,6 +1148,55 @@ def main() -> int:
         page.clear_segments()
         app.processEvents()
 
+        # Alt 关横向吸附：靠物理按键兜底（Qt 的修饰键可能被系统菜单吞掉）
+        import vff.ui.overview_bar as ob
+        page.clear_segments()
+        page.clear_range()
+        bar.clear_selection()
+        bar.band_scroll = 0
+        app.processEvents()
+        fps_d = bar.fps or 25.0
+        scale = bar._usable() / max(1e-9, bar._visible())    # 像素 / 帧
+        a_hi = 44
+        target = a_hi + max(3, int(round(57 / max(scale, 1e-6))) - 1)
+
+        def reset_bands():
+            page.segments = [
+                {"t_in": 20 / fps_d, "t_end": a_hi / fps_d, "name": "A"},
+                {"t_in": target / fps_d, "t_end": (target + 30) / fps_d,
+                 "name": "B"}]
+            page._refresh_segments()
+            app.processEvents()
+
+        def drag_to(dx_px: int):
+            band = next(b for b in bar._bands if b["item"].get("name") == "A")
+            r_ = bar._band_rect(band)
+            x_, y_ = int(r_.center().x()), int(r_.center().y())
+            raw = int(bar.frame_at(x_ + dx_px)) - int(bar.frame_at(x_))
+            QTest.mousePress(bar, Qt.LeftButton, pos=QPoint(x_, y_))
+            QTest.mouseMove(bar, QPoint(x_ + 20, y_))
+            QTest.mouseMove(bar, QPoint(x_ + dx_px, y_))
+            app.processEvents()
+            delta_ = bar._drag_delta
+            QTest.mouseRelease(bar, Qt.LeftButton, pos=QPoint(x_ + dx_px, y_))
+            app.processEvents()
+            return delta_, raw
+
+        saved_alt = ob.alt_down
+        reset_bands()
+        ob.alt_down = lambda: False
+        snap_delta, raw_delta = drag_to(57)
+        reset_bands()
+        ob.alt_down = lambda: True
+        free_delta, raw2 = drag_to(57)
+        ob.alt_down = saved_alt
+        app.processEvents()
+        check("alt releases horizontal snapping",
+              snap_delta != raw_delta and free_delta == raw2,
+              f"raw={raw_delta} snap={snap_delta} free={free_delta}")
+        page.clear_segments()
+        app.processEvents()
+
         # 贴边：首尾紧贴（共用一帧）不算重叠，同层可以前后紧贴
         page.segments = [{"t_in": 0.3, "t_end": 1.3, "name": "A"},
                          {"t_in": 1.3, "t_end": 2.3, "name": "B"}]
@@ -1417,6 +1466,56 @@ def main() -> int:
             page.set_out_point(20)
             page.add_segment()
             app.processEvents()
+        # 片段改名：右侧行双击/右键都走这条路；底栏也跟着显示
+        page.clear_segments()
+        page.clear_range()
+        page.set_in_point(24)
+        page.set_out_point(36)
+        page.add_segment()
+        app.processEvents()
+        row = page.side._rows[0] if page.side._rows else None
+        check("segment row falls back to the number",
+              row is not None and row.main.text() == "#1",
+              row.main.text() if row is not None else "no row")
+        if row is not None:
+            check("segment row puts span then duration on the second line",
+                  "→" in row.sub.text() and "秒" in row.sub.text()
+                  and row.sub.text().index("→") < row.sub.text().index("秒"),
+                  row.sub.text())
+            row.begin_rename()
+            row.edit.setText("开场镜头")
+            row.edit.returnPressed.emit()
+            app.processEvents()
+            check("inline rename updates the segment",
+                  bool(page.segments)
+                  and page.segments[0].get("name") == "开场镜头",
+                  str(page.segments[0].get("name") if page.segments else None))
+            row2 = page.side._rows[0] if page.side._rows else None
+            check("renamed row shows the name on top",
+                  row2 is not None and row2.main.text() == "开场镜头",
+                  row2.main.text() if row2 is not None else "no row")
+            check("bottom bar shows the segment name",
+                  any(b.get("label") == "开场镜头" for b in bar._bands
+                      if b["kind"] == "segment"),
+                  str([(b["kind"], b.get("label")) for b in bar._bands]))
+            page.rename_segment(0, "")
+            app.processEvents()
+            check("clearing the name goes back to the number",
+                  page.side._rows and page.side._rows[0].main.text() == "#1",
+                  page.side._rows[0].main.text() if page.side._rows else "no row")
+            page.rename_segment(0, "结尾")
+            app.processEvents()
+            check("rename_segment works from the bar's right-click path",
+                  page.segments[0].get("name") == "结尾",
+                  str(page.segments[0].get("name")))
+        page.clear_segments()
+        app.processEvents()
+        for i in range(3):
+            page.set_in_point(10 + i * 30)
+            page.set_out_point(20 + i * 30)
+            page.add_segment()
+        app.processEvents()
+
         bar.clear_selection()
         if page.side._rows:
             QTest.keyClick(page.side._rows[0], Qt.Key_Delete)

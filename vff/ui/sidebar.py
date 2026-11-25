@@ -12,10 +12,10 @@ from __future__ import annotations
 
 from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtGui import QPixmap
-from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QListWidget,
-                               QListWidgetItem, QProgressBar, QPushButton,
-                               QScrollArea, QSizePolicy, QToolButton,
-                               QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit,
+                               QListWidget, QListWidgetItem, QMenu,
+                               QProgressBar, QPushButton, QScrollArea,
+                               QSizePolicy, QToolButton, QVBoxLayout, QWidget)
 
 from ..util import human_size
 from .images import thumb_pixmap
@@ -60,11 +60,25 @@ def _time(t: float) -> str:
     return f"{int(t // 60)}:{t % 60:04.1f}"
 
 
+class _NameEdit(QLineEdit):
+    """行内改名输入框：Esc 放弃。"""
+
+    cancelled = Signal()
+
+    def keyPressEvent(self, event):           # noqa: N802
+        if event.key() == Qt.Key_Escape:
+            self.cancelled.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
 class SegmentRow(QFrame):
     """一条片段：缩略图 / 序号 / 起止（有自定义名就显示名字）/ 删除。"""
 
     clicked = Signal(int)
     removed = Signal(int)
+    renamed = Signal(int, str)          # (第几段, 新名字)
 
     def __init__(self, index: int, t1: float, t2: float, thumb: str | None = None,
                  name: str = "", parent=None):
@@ -78,7 +92,7 @@ class SegmentRow(QFrame):
         self.setToolTip(f"第 {index + 1} 段 · {_time(t1)} → {_time(t2)}"
                         f"（{max(0.0, t2 - t1):.2f} 秒）"
                         + (f"\n素材名：{name}" if name else "")
-                        + "\n点击跳到这一段 · Delete / 退格 删除")
+                        + "\n点击跳到这一段 · 双击 / 右键 改名 · Delete / 退格 删除")
 
         lay = QHBoxLayout(self)
         lay.setContentsMargins(6, 4, 5, 4)
@@ -103,20 +117,28 @@ class SegmentRow(QFrame):
         mid = QVBoxLayout()
         mid.setContentsMargins(0, 0, 0, 0)
         mid.setSpacing(0)
+        self._name = str(name or "")
+        self._renaming = False
         span = f"{_time(t1)} → {_time(t2)}"
-        if name:
-            main = QLabel(name)
-            main.setObjectName("segName")
-            sub = QLabel(span)
-        else:
-            main = QLabel(span)
-            main.setObjectName("segMain")
-            sub = QLabel(f"{max(0.0, t2 - t1):.2f} 秒")
-        main.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        main.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        dur = f"{max(0.0, t2 - t1):.2f} 秒"
+        # 上一行 = 名字（没名字就用 #编号），下一行 = 起止 · 时长（时长在起止右边）
+        self.main = QLabel(self._name or f"#{index + 1}")
+        self.main.setObjectName("segName" if self._name else "segMain")
+        self.main.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.main.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.edit = _NameEdit(self)
+        self.edit.setObjectName("segNameEdit")
+        self.edit.setMaxLength(60)
+        self.edit.hide()
+        self.edit.returnPressed.connect(self._commit_rename)
+        self.edit.editingFinished.connect(self._commit_rename)
+        self.edit.cancelled.connect(self._cancel_rename)
+        sub = QLabel(f"{span} · {dur}")
+        self.sub = sub
         sub.setObjectName("segDur")
         sub.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        mid.addWidget(main)
+        mid.addWidget(self.main)
+        mid.addWidget(self.edit)
         mid.addWidget(sub)
 
         rm = QPushButton("✕")
@@ -134,6 +156,57 @@ class SegmentRow(QFrame):
             self.setFocus(Qt.MouseFocusReason)
             self.clicked.emit(self.index)
         super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event):    # noqa: N802
+        if event.button() == Qt.LeftButton:
+            self.begin_rename()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def contextMenuEvent(self, event):        # noqa: N802
+        menu = QMenu(self)
+        act_rename = menu.addAction("重命名这一段…")
+        act_del = menu.addAction("删除这一段")
+        chosen = menu.exec(event.globalPos())
+        if chosen is act_rename:
+            self.begin_rename()
+        elif chosen is act_del:
+            self.removed.emit(self.index)
+
+    # ---------------- 行内改名 ----------------
+    def begin_rename(self):
+        """把这一行切成输入框（双击 / 右键菜单都走这里）。"""
+        if self._renaming:
+            return
+        self._renaming = True
+        self.edit.setText(self._name)
+        self.main.hide()
+        self.edit.show()
+        self.edit.setFocus(Qt.OtherFocusReason)
+        self.edit.selectAll()
+
+    def _finish_rename(self) -> str:
+        text = self.edit.text().strip()
+        self._renaming = False
+        self.edit.hide()
+        self.main.show()
+        return text
+
+    def _cancel_rename(self):
+        if not self._renaming:
+            return
+        self._renaming = False
+        self.edit.hide()
+        self.main.show()
+        self.setFocus(Qt.OtherFocusReason)
+
+    def _commit_rename(self):
+        if not self._renaming:
+            return
+        text = self._finish_rename()
+        if text != self._name:
+            self.renamed.emit(self.index, text)
 
     def keyPressEvent(self, event):
         """Delete / 退格：删掉这一条片段。"""
@@ -218,6 +291,7 @@ class EditSidebar(QWidget):
     playRequested = Signal()
     exportRequested = Signal()
     addSegmentRequested = Signal()
+    segmentRenamed = Signal(int, str)      # 片段改名（第几段, 新名字）
     clearSegmentsRequested = Signal()
     removeSegmentRequested = Signal(int)
     selectSegmentRequested = Signal(int)
@@ -726,6 +800,7 @@ class EditSidebar(QWidget):
             name = seg[3] if len(seg) > 3 else ""
             row = SegmentRow(i, t1, t2, thumb, name, self)
             row.clicked.connect(self.selectSegmentRequested)
+            row.renamed.connect(self.segmentRenamed)
             row.removed.connect(self.removeSegmentRequested)
             self.seg_lay.insertWidget(self.seg_lay.count() - 1, row)
             self._rows.append(row)

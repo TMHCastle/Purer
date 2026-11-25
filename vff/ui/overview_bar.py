@@ -53,6 +53,20 @@ RULER_STEPS = (1, 2, 5, 10, 15, 20, 25, 30, 50, 60, 100, 150, 300, 600, 900,
 SNAP_PX = 8             # 横向吸附半径（像素）
 GAP_GRAVITY = 4.0       # 竖直「轨道缝隙」吸附的引力半径（px）
 
+def alt_down() -> bool:
+    """物理 Alt 键是否按着。
+
+    本机 Alt 按下时会被窗口的「系统菜单」吞掉，Qt 缓存的修饰键和鼠标事件里的
+    AltModifier 都可能拿不到，所以再直接问一次 Windows 的键盘状态。
+    """
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        return bool(user32.GetAsyncKeyState(0x12) & 0x8000)
+    except Exception:      # noqa: BLE001  非 Windows / ctypes 不可用就当没按
+        return False
+
+
 SEG_COLOR = QColor(WARN)
 SEG_COLOR.setAlpha(205)
 MARKER_COLOR = QColor("#45C995")
@@ -78,7 +92,8 @@ class OverviewBar(QWidget):
     clearRangeRequested = Signal()       # 右键：清除区间
     addSegmentRequested = Signal()       # 右键：用当前选区新建片段
     segmentActivated = Signal(int)
-    segmentRemoveRequested = Signal(int)   # 右键删队列里的片段（Delete 删不掉）       # 点片段标记：选中该片段
+    segmentRemoveRequested = Signal(int)
+    segmentRenameRequested = Signal(int)   # 右键改队列里片段的名字   # 右键删队列里的片段（Delete 删不掉）       # 点片段标记：选中该片段
     rangeActivated = Signal(int)         # 双击区间条：切当前段
     focusRequested = Signal()            # 点了底栏 → 把键盘焦点还给图墙
     bandsMoved = Signal(list)            # 拖动结束：[(kind, item, lo, hi, lane), …]
@@ -817,6 +832,8 @@ class OverviewBar(QWidget):
             alt = alt or bool(QApplication.keyboardModifiers() & Qt.AltModifier)
         except (AttributeError, RuntimeError):
             pass
+        if not alt:
+            alt = alt_down()        # 物理按键兜底（Alt 会被系统菜单吞掉）
         # Alt 只关掉「横向」吸附；竖直永远只吸轨道 / 轨道缝隙
         self._drag_alt = bool(alt)
         self._drag_mouse_y = pos.y()
@@ -1458,10 +1475,12 @@ class OverviewBar(QWidget):
             act_unmark = menu.addAction(f"删除标记（第 {marker} 帧）")
         index = self._segment_at(pos)
         act_jump = None
+        act_segrename = None
         act_segdel = None
         if index is not None:
             menu.addSeparator()
             act_jump = menu.addAction(f"选中片段 #{index + 1}")
+            act_segrename = menu.addAction(f"重命名片段 #{index + 1}…")
             act_segdel = menu.addAction(
                 f"从导出队列删除片段 #{index + 1}（Delete 删不掉）")
         menu.addSeparator()
@@ -1495,6 +1514,8 @@ class OverviewBar(QWidget):
             self.removeMarkerRequested.emit(marker)
         elif act_jump is not None and chosen is act_jump:
             self.segmentActivated.emit(index)
+        elif act_segrename is not None and chosen is act_segrename:
+            self.segmentRenameRequested.emit(int(index))
         elif act_segdel is not None and chosen is act_segdel:
             self.segmentRemoveRequested.emit(int(index))
         elif chosen is act_seek:

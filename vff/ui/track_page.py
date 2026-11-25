@@ -17,8 +17,9 @@ from pathlib import Path
 from PySide6.QtCore import (QElapsedTimer, QItemSelectionModel, QPoint, QSize, Qt,
                             QTimer, QUrl, Signal)
 from PySide6.QtGui import QDesktopServices, QKeySequence, QPixmap, QShortcut
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QFileDialog, QMenu,
-                               QMessageBox, QSplitter, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QFileDialog,
+                               QInputDialog, QMenu, QMessageBox, QSplitter,
+                               QVBoxLayout, QWidget)
 
 from .. import ffmpeg, scenedetect, smartcut
 from ..cache import cache_dir_for, cache_digest
@@ -209,6 +210,7 @@ class TrackPage(QWidget):
         self.side.clearSegmentsRequested.connect(self.clear_segments)
         self.side.removeSegmentRequested.connect(self.remove_segment)
         self.side.selectSegmentRequested.connect(self.select_segment)
+        self.side.segmentRenamed.connect(self.rename_segment)
         self.side.exportAllSegmentsRequested.connect(self.export_all_segments)
         self.side.openExportRequested.connect(self.open_export)
         self.side.folderExportRequested.connect(self.reveal_export)
@@ -253,6 +255,7 @@ class TrackPage(QWidget):
         self.overview.focusRequested.connect(self._focus_wall)
         self.overview.bandsMoved.connect(self._on_bands_moved)
         self.overview.segmentRemoveRequested.connect(self.remove_segment)
+        self.overview.segmentRenameRequested.connect(self._rename_segment_dialog)
         self.overview.markerActivated.connect(self._goto_marker_frame)
         self.overview.addMarkerRequested.connect(self.add_marker)
         self.overview.removeMarkerRequested.connect(self.remove_marker)
@@ -2028,6 +2031,36 @@ class TrackPage(QWidget):
             f"已加入片段 #{len(self.segments)}（共 {len(self.segments)} 段）"
             if added else "这一段已经在队列里了（已帮你选中它）")
         self.save_state()
+
+    def rename_segment(self, index: int, name: str):
+        """给第 index 段改名字（空字符串 = 回到 #编号）。"""
+        if not (0 <= index < len(self.segments)):
+            return
+        name = str(name or "").strip()
+        old = str(self.segments[index].get("name") or "")
+        if name == old:
+            return
+        self._push_undo()
+        self.segments[index]["name"] = name
+        self._active_segment = index
+        self._delete_target = "segment"
+        self._refresh_segments()
+        self.side.set_active_segment(index)
+        self.side.set_export_text(
+            f"片段 #{index + 1} 已改名为「{name}」" if name
+            else f"片段 #{index + 1} 已清空名字（显示编号）")
+        self.save_state()
+
+    def _rename_segment_dialog(self, index: int):
+        """底部片段块右键 → 弹输入框改名。"""
+        if not (0 <= index < len(self.segments)):
+            return
+        current = str(self.segments[index].get("name") or "")
+        text, ok = QInputDialog.getText(
+            self, "重命名片段",
+            f"片段 #{index + 1} 的名字（留空 = 用编号）：", text=current)
+        if ok:
+            self.rename_segment(index, text)
 
     def remove_segment(self, index: int):
         if not (0 <= index < len(self.segments)):

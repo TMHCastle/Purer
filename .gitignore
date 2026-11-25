@@ -30,4 +30,6 @@ ffmpeg.ini
 .idea/
 
 # 窄热补丁包（构建产物：python build.py 会生成 Purer-code-<ver>.zip）
+# 本机开发约定（文案与发布规则），不进公开仓库
+AGENTS.md
 Purer-code-*.zip
